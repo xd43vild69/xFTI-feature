@@ -1,5 +1,5 @@
 """Step 4 · Export — page wrapper."""
 
-from components import export_modal
+from components import export_panel
 
-export_modal.render()
+export_panel.render()

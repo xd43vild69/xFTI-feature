@@ -10,3 +10,8 @@ data/processed/**
 # Local metadata DB produced during curation
 *.db
 *.sqlite3
+
+# Self-contained training environment: copied model weights (~46GB), a
+# dedicated venv, exported datasets, caches, and run logs/checkpoints. Never
+# code, never tracked — see scripts/setup_training_runtime.sh.
+training_runtime/

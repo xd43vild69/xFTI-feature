@@ -4,12 +4,14 @@ import pytest
 from PIL import Image
 
 from feature_pipeline.infrastructure.storage import (
+    clear_training_dataset_dir,
     delete_managed_folder,
     raw_data_dir,
     read_caption_for_image,
     run_upload_dir,
     save_uploaded_files,
     scan_raw_folder,
+    training_dataset_dir,
     write_caption_sidecar,
 )
 
@@ -172,3 +174,27 @@ def test_write_caption_sidecar_leaves_no_temp_file(tmp_path: Path):
     write_caption_sidecar(str(image_path), "ai caption")
 
     assert sorted(p.name for p in tmp_path.iterdir()) == ["a.png", "a.txt"]
+
+
+def test_training_dataset_dir_is_scoped_under_the_runtime_root(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("FTI_TRAINING_RUNTIME_DIR", str(tmp_path))
+
+    assert training_dataset_dir("my_concept") == tmp_path / "datasets" / "my_concept"
+
+
+def test_clear_training_dataset_dir_removes_existing_content(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("FTI_TRAINING_RUNTIME_DIR", str(tmp_path))
+    target = training_dataset_dir("my_concept")
+    target.mkdir(parents=True)
+    (target / "a.png").write_bytes(b"stale")
+    (target / "curation_report.json").write_text("{}")
+
+    clear_training_dataset_dir("my_concept")
+
+    assert not target.exists()
+
+
+def test_clear_training_dataset_dir_is_a_no_op_when_nothing_exists(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("FTI_TRAINING_RUNTIME_DIR", str(tmp_path))
+
+    clear_training_dataset_dir("never_exported")  # must not raise
