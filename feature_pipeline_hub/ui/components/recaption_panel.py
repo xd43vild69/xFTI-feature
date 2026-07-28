@@ -89,6 +89,12 @@ def _run_batch(run: IngestionRun, samples: list[DatasetSample]) -> None:
             label += f" · {failed} failed"
         status.update(label=label, state="complete", expanded=bool(failed))
 
+    # st.rerun() below refreshes the caption widgets (their keys are versioned by
+    # apply_recaption), but it also wipes whatever the status/progress widgets
+    # above just rendered — a plain rerun happens fast enough that the summary
+    # never gets read. st.toast is the one widget documented to survive exactly
+    # one rerun, so it's what carries the result across.
+    st.toast(label, icon=":material/auto_awesome:" if not failed else ":material/warning:")
     st.rerun()
 
 
