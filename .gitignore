@@ -80,3 +80,7 @@ secrets.toml
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# AppleDouble sidecars: macOS writes these next to real files when copying to
+# non-HFS volumes, so they show up shadowing source files (e.g. ._gallery.py).
+._*
