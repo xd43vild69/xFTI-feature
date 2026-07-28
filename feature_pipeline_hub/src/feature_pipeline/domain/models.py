@@ -31,6 +31,31 @@ class ConceptGroup(BaseModel):
     samples: list[DatasetSample] = Field(default_factory=list)
 
 
+class IngestionRun(BaseModel):
+    """One ingestion of a raw folder: what was imported, from where, and when.
+
+    Several runs can coexist (the same concept re-scanned, or different concepts),
+    so `run_id` is what the UI selects on, not `concept_id`.
+    """
+
+    run_id: str
+    source_path: str
+    source_kind: str  # "folder" | "upload"
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    concept: ConceptGroup
+
+
+class IngestionRunSummary(BaseModel):
+    """Listing row for the run selector: enough to label a run without loading its samples."""
+
+    run_id: str
+    concept_name: str
+    trigger_word: str
+    source_kind: str
+    created_at: datetime
+    sample_count: int
+
+
 class DatasetManifest(BaseModel):
     dataset_name: str
     version: str

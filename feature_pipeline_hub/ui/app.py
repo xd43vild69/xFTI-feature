@@ -1,7 +1,7 @@
 """Streamlit entry point: FTI Feature Pipeline Hub.
 
-Ingestion tab is wired to the real pipeline. Gallery, Quality, and
-Export tabs still delegate to placeholder components (Iteraciones 3-4).
+Ingestion and Gallery are wired to the real pipeline. Quality and Export
+tabs still delegate to placeholder components (Iteraciones 3-4).
 """
 
 import sys
@@ -10,11 +10,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+import state
 import streamlit as st
 from components import concept_selector, export_modal, gallery, quality_panel
 
-from feature_pipeline.application.dataset_service import ingest_concept_from_folder
-from feature_pipeline.infrastructure.storage import save_uploaded_files
+from feature_pipeline.application.dataset_service import create_ingestion_run
+from feature_pipeline.infrastructure.storage import run_upload_dir, save_uploaded_files
 
 st.set_page_config(page_title="FTI Feature Pipeline Hub", layout="wide")
 
@@ -65,9 +66,13 @@ with tab_ingest:
         concept_name = st.session_state.get("concept_name", "").strip()
         trigger_word = st.session_state.get("trigger_word", "").strip()
 
-        # Uploads are staged to a temp folder only on click, so reruns don't pile up copies.
+        # A fresh run per click: previous ingestions stay selectable instead of being
+        # overwritten. Uploads are copied into data/raw/<run_id>/ so they survive reloads.
+        run_id = str(uuid.uuid4())
         folder_path = typed_path if from_folder else (
-            save_uploaded_files(uploaded_files) if uploaded_files else None
+            save_uploaded_files(uploaded_files, destination=run_upload_dir(run_id))
+            if uploaded_files
+            else None
         )
 
         if not folder_path:
@@ -79,27 +84,38 @@ with tab_ingest:
         elif not concept_name or not trigger_word:
             st.warning("Set Concept Name and Trigger word in the sidebar first.")
         else:
-            if "concept_id" not in st.session_state:
-                st.session_state["concept_id"] = str(uuid.uuid4())
             try:
                 with st.spinner("Analyzing images..."):
-                    concept = ingest_concept_from_folder(
+                    run = create_ingestion_run(
                         folder_path=folder_path,
-                        concept_id=st.session_state["concept_id"],
                         concept_name=concept_name,
                         trigger_word=trigger_word,
+                        source_kind="folder" if from_folder else "upload",
+                        run_id=run_id,
                     )
             except NotADirectoryError as exc:
                 st.error(str(exc))
             else:
-                st.session_state["concept"] = concept
-                if concept.samples:
-                    st.success(f"Found {len(concept.samples)} image(s).")
+                if run.concept.samples:
+                    state.save_run(run)
+                    state.set_active_run(run.run_id)
+                    # Rerun so the sidebar selector picks up the new run right away.
+                    st.session_state["ingest_message"] = (
+                        f"Found {len(run.concept.samples)} image(s). "
+                        "Saved as a new ingestion — preview it in the Gallery tab."
+                    )
+                    st.rerun()
                 else:
                     st.warning("No PNG/JPG/WebP images found.")
 
-    concept = st.session_state.get("concept")
+    if message := st.session_state.pop("ingest_message", None):
+        st.success(message)
+
+    active_run = state.active_run()
+    concept = active_run.concept if active_run else None
     if concept is not None and concept.samples:
+        st.divider()
+        st.caption(f"Active ingestion: **{concept.concept_name}** · `{active_run.run_id}`")
         total = len(concept.samples)
         invalid = sum(1 for s in concept.samples if not s.is_valid)
         without_caption = sum(1 for s in concept.samples if not s.original_caption)
@@ -120,7 +136,7 @@ with tab_ingest:
                 }
                 for s in concept.samples
             ],
-            use_container_width=True,
+            width="stretch",
         )
     else:
         st.info("No dataset loaded yet.")
