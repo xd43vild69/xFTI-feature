@@ -56,6 +56,24 @@ CREATE TABLE IF NOT EXISTS dataset_versions (
     exported_path TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+
+-- One row per launched training_runner subprocess: pre-cache, train, progressive
+-- phase, or curation scoring. `pid` + `status` are how the GPU lock (only one
+-- heavy job at a time) and the live log/loss-chart panel find their process
+-- across reruns and browser reloads, without keeping anything in memory.
+CREATE TABLE IF NOT EXISTS training_runs (
+    training_run_id TEXT PRIMARY KEY,
+    dataset_run_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'running',
+    pid INTEGER NOT NULL,
+    log_path TEXT NOT NULL,
+    config_json TEXT NOT NULL DEFAULT '{}',
+    started_at TEXT NOT NULL,
+    finished_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_training_runs_status ON training_runs(status);
 """
 
 

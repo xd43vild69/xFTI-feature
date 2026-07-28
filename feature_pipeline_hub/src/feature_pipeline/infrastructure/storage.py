@@ -104,3 +104,38 @@ def delete_managed_folder(folder_path: str) -> bool:
 
     shutil.rmtree(folder)
     return True
+
+
+def training_runtime_dir() -> Path:
+    """Root for the self-contained training environment (model, venv, datasets).
+
+    Lives inside the project by default, gitignored — overridable via
+    FTI_TRAINING_RUNTIME_DIR for machines that keep it on another disk.
+    """
+    override = os.environ.get("FTI_TRAINING_RUNTIME_DIR")
+    base = Path(override) if override else Path(__file__).resolve().parents[3] / "training_runtime"
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+def training_dataset_dir(name: str) -> Path:
+    """Where an exported dataset lives, ready for the training scripts to consume."""
+    return training_runtime_dir() / "datasets" / name
+
+
+def clear_training_dataset_dir(name: str) -> None:
+    """Wipe a training dataset folder before a fresh export, if it exists.
+
+    Guarded to only ever touch paths under training_runtime/datasets/ — this
+    folder is entirely ours (unlike data/raw/, nothing external reads it), so a
+    fresh export is free to remove whatever was there before, including a stale
+    curation_report.json from a previous export of the same concept.
+    """
+    target = training_dataset_dir(name).resolve()
+    datasets_root = (training_runtime_dir() / "datasets").resolve()
+
+    if datasets_root not in target.parents:
+        raise ValueError(f"Refusing to clear a path outside training_runtime/datasets/: {target}")
+
+    if target.is_dir():
+        shutil.rmtree(target)

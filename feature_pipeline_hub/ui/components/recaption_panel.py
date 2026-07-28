@@ -37,6 +37,10 @@ def render_toolbar(run: IngestionRun, visible: list[DatasetSample]) -> None:
             st.caption(f":material/info: {exc}")
             return
 
+        training_active = state.is_training_active()
+        if training_active:
+            st.caption(":material/info: GPU busy training — recaption is paused until it finishes.")
+
         with st.popover("", icon=":material/tune:", help="Recaption settings"):
             st.checkbox(
                 "Detailed captions",
@@ -48,7 +52,7 @@ def render_toolbar(run: IngestionRun, visible: list[DatasetSample]) -> None:
         if st.button(
             f"Recaption {len(selected)}",
             icon=":material/auto_awesome:",
-            disabled=not selected,
+            disabled=not selected or training_active,
             help="Select images above, then click to regenerate captions with Qwen3-VL. ~2s per image on GPU.",
         ):
             _run_batch(run, selected)
