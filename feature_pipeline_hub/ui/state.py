@@ -45,6 +45,47 @@ def save_caption(sample_id: str, caption: str) -> None:
         repo.update_sample_caption(conn, sample_id, caption)
 
 
+CAPTION_VERSIONS_KEY = "caption_widget_versions"
+
+
+def caption_widget_key(run_id: str, sample_id: str) -> str:
+    """Key for a caption editor, versioned so external edits are picked up.
+
+    A keyed Streamlit widget ignores its `value` argument on later reruns, so a
+    caption written from another tab would otherwise be reverted by the stale text
+    still held in the widget's state. Bumping the version mints a new widget that
+    reads the stored caption afresh.
+    """
+    version = st.session_state.get(CAPTION_VERSIONS_KEY, {}).get(sample_id, 0)
+    return f"caption_{run_id}_{sample_id}_v{version}"
+
+
+def persist_caption(sample_id: str, widget_key: str) -> None:
+    """on_change callback: store whatever the user typed into a caption editor."""
+    save_caption(sample_id, st.session_state[widget_key])
+
+
+def persist_description(sample_id: str, widget_key: str, trigger_word: str) -> None:
+    """on_change callback for the quality panel: turn a description into a caption."""
+    description = st.session_state[widget_key].strip()
+    if not description:
+        return
+
+    save_caption(sample_id, f"{trigger_word}, {description}" if trigger_word else description)
+    versions = st.session_state.setdefault(CAPTION_VERSIONS_KEY, {})
+    versions[sample_id] = versions.get(sample_id, 0) + 1
+
+
+def set_excluded(sample_ids: list[str], excluded: bool) -> None:
+    with _db() as conn:
+        repo.set_samples_excluded(conn, sample_ids, excluded)
+
+
+def mark_duplicates(run_id: str, sample_ids: list[str]) -> None:
+    with _db() as conn:
+        repo.mark_duplicates(conn, run_id, sample_ids)
+
+
 def delete_run(run_id: str) -> None:
     """Drop a run from the database, plus its image folder when we own it."""
     with _db() as conn:

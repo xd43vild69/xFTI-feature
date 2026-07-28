@@ -4,6 +4,7 @@ from PIL import Image
 
 from feature_pipeline.application.image_service import (
     classify_aspect_ratio,
+    color_distance,
     compute_dhash,
     compute_image_metrics,
     hamming_distance,
@@ -79,3 +80,35 @@ def test_classify_aspect_ratio_buckets():
 
 def test_classify_aspect_ratio_falls_back_to_other():
     assert classify_aspect_ratio(3.7) == "other"
+
+
+def test_compute_image_metrics_records_every_perceptual_hash(tmp_path: Path):
+    image_path = tmp_path / "pattern.png"
+    _make_patterned_image(image_path, (512, 512), seed=7)
+
+    metrics = compute_image_metrics(str(image_path))
+
+    assert metrics.phash and metrics.dhash and metrics.colorhash
+    assert metrics.dhash == compute_dhash(str(image_path))
+
+
+def test_color_distance_separates_images_that_share_a_luminance_hash(tmp_path: Path):
+    red_path, blue_path = tmp_path / "red.png", tmp_path / "blue.png"
+    _make_image(red_path, (512, 512), "red")
+    _make_image(blue_path, (512, 512), "blue")
+
+    red = compute_image_metrics(str(red_path))
+    blue = compute_image_metrics(str(blue_path))
+
+    # Flat images are identical to pHash/dHash, which ignore colour entirely.
+    assert hamming_distance(red.phash, blue.phash) == 0
+    assert color_distance(red.colorhash, blue.colorhash) > 0
+
+
+def test_color_distance_is_zero_for_the_same_image(tmp_path: Path):
+    image_path = tmp_path / "red.png"
+    _make_image(image_path, (512, 512), "red")
+
+    metrics = compute_image_metrics(str(image_path))
+
+    assert color_distance(metrics.colorhash, metrics.colorhash) == 0

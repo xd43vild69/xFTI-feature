@@ -8,12 +8,18 @@ from pathlib import Path
 import streamlit as st
 
 import state
+from feature_pipeline.application import quality_service as quality
 from feature_pipeline.domain.models import DatasetSample, IngestionRun
 
+# Each filter takes the sample and the concept's trigger word.
 FILTERS = {
-    "All": lambda s: True,
-    "Validation errors": lambda s: not s.is_valid,
-    "Missing caption": lambda s: not s.original_caption,
+    "Active": lambda s, trigger: not s.is_excluded,
+    "All": lambda s, trigger: True,
+    "Duplicates": lambda s, trigger: s.is_duplicate and not s.is_excluded,
+    "Validation errors": lambda s, trigger: not s.is_valid and not s.is_excluded,
+    "Missing caption": lambda s, trigger: not s.is_excluded
+    and quality.describes_nothing(s.caption, trigger),
+    "Excluded": lambda s, trigger: s.is_excluded,
 }
 
 
@@ -44,7 +50,8 @@ def render() -> None:
         "Columns", options=[2, 3, 4, 5, 6], value=4, key=f"gallery_cols_{run.run_id}"
     )
 
-    samples = [s for s in run.concept.samples if FILTERS[chosen_filter](s)]
+    trigger = run.concept.trigger_word
+    samples = [s for s in run.concept.samples if FILTERS[chosen_filter](s, trigger)]
     if not samples:
         st.info(f"No images match '{chosen_filter}'.")
         return
@@ -64,20 +71,33 @@ def _render_card(sample: DatasetSample, run: IngestionRun) -> None:
     else:
         st.error(f"Missing file: {image_path.name}")
 
-    st.caption(
-        f"{image_path.name} · {sample.metrics.width}×{sample.metrics.height}"
-        f"{'' if sample.is_valid else ' · ⚠️'}"
-    )
+    badges = ""
+    if sample.is_excluded:
+        badges += " · 🚫 excluded"
+    elif sample.is_duplicate:
+        badges += " · 👯 duplicate"
+    if not sample.is_valid:
+        badges += " · ⚠️"
 
-    edited = st.text_area(
+    st.caption(f"{image_path.name} · {sample.metrics.width}×{sample.metrics.height}{badges}")
+
+    caption_key = state.caption_widget_key(run.run_id, sample.sample_id)
+    st.text_area(
         "Caption",
         value=sample.caption,
-        key=f"caption_{run.run_id}_{sample.sample_id}",
+        key=caption_key,
         height=80,
         label_visibility="collapsed",
+        on_change=state.persist_caption,
+        args=(sample.sample_id, caption_key),
     )
-    if edited != sample.caption:
-        state.save_caption(sample.sample_id, edited)
+
+    action = "Restore" if sample.is_excluded else "Exclude"
+    if st.button(
+        action, key=f"toggle_{run.run_id}_{sample.sample_id}", width="stretch"
+    ):
+        state.set_excluded([sample.sample_id], not sample.is_excluded)
+        st.rerun()
 
     if not sample.is_valid:
         st.caption("⚠️ " + "; ".join(sample.validation_errors))
