@@ -39,6 +39,24 @@ def compute_image_metrics(image_path: str) -> ImageMetrics:
     )
 
 
+THUMBNAIL_SIZE = 512
+
+
+def make_square_thumbnail(image_path: str, size: int = THUMBNAIL_SIZE) -> Image.Image:
+    """Fit an image into a size×size canvas without cropping (letterboxed, transparent margins).
+
+    Transparent padding (rather than a solid colour) lets the surrounding card
+    background show through, so the thumbnail adapts to light/dark theme for free.
+    """
+    with Image.open(image_path) as img:
+        img = img.convert("RGBA")
+        img.thumbnail((size, size), Image.LANCZOS)
+        canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        offset = ((size - img.width) // 2, (size - img.height) // 2)
+        canvas.paste(img, offset, img)
+        return canvas
+
+
 def compute_dhash(image_path: str) -> str:
     """Compute a difference hash (dHash), a secondary signal for duplicate detection."""
     with Image.open(image_path) as img:

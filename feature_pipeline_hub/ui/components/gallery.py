@@ -66,10 +66,7 @@ def render() -> None:
 def _render_card(sample: DatasetSample, run: IngestionRun) -> None:
     image_path = Path(sample.image_path)
 
-    if image_path.exists():
-        st.image(str(image_path), width="stretch")
-    else:
-        st.error(f"Missing file: {image_path.name}")
+    state.render_thumbnail(sample.image_path)
 
     badges = ""
     if sample.is_excluded:

@@ -8,6 +8,7 @@ from feature_pipeline.application.image_service import (
     compute_dhash,
     compute_image_metrics,
     hamming_distance,
+    make_square_thumbnail,
 )
 
 
@@ -112,3 +113,49 @@ def test_color_distance_is_zero_for_the_same_image(tmp_path: Path):
     metrics = compute_image_metrics(str(image_path))
 
     assert color_distance(metrics.colorhash, metrics.colorhash) == 0
+
+
+def test_make_square_thumbnail_returns_a_square_regardless_of_source_aspect(tmp_path: Path):
+    landscape = tmp_path / "landscape.png"
+    portrait = tmp_path / "portrait.png"
+    _make_image(landscape, (1024, 512), "red")
+    _make_image(portrait, (512, 1024), "blue")
+
+    assert make_square_thumbnail(str(landscape), size=256).size == (256, 256)
+    assert make_square_thumbnail(str(portrait), size=256).size == (256, 256)
+
+
+def test_make_square_thumbnail_does_not_crop_the_source_content(tmp_path: Path):
+    """The whole image must fit inside the square: no dimension may be upscaled past `size`."""
+    image_path = tmp_path / "wide.png"
+    _make_image(image_path, (1024, 256), "green")
+
+    thumb = make_square_thumbnail(str(image_path), size=200)
+
+    # 1024x256 fit into 200x200 preserving aspect ratio -> 200x50, centred.
+    assert thumb.size == (200, 200)
+    opaque_rows = [y for y in range(200) if thumb.getpixel((100, y))[3] > 0]
+    assert len(opaque_rows) == 50
+    assert min(opaque_rows) == 75 and max(opaque_rows) == 124
+
+
+def test_make_square_thumbnail_of_a_square_image_has_no_transparent_margin(tmp_path: Path):
+    image_path = tmp_path / "square.png"
+    _make_image(image_path, (400, 400), "red")
+
+    thumb = make_square_thumbnail(str(image_path), size=200)
+
+    corners = [thumb.getpixel((x, y)) for x in (0, 199) for y in (0, 199)]
+    assert all(pixel[3] == 255 for pixel in corners)
+
+
+def test_make_square_thumbnail_pads_a_narrow_image_with_transparency(tmp_path: Path):
+    image_path = tmp_path / "portrait.png"
+    _make_image(image_path, (256, 1024), "blue")
+
+    thumb = make_square_thumbnail(str(image_path), size=200)
+
+    # Content is centred horizontally as a narrow vertical strip; corners stay padding.
+    assert thumb.getpixel((0, 0))[3] == 0
+    assert thumb.getpixel((199, 0))[3] == 0
+    assert thumb.getpixel((100, 100))[3] == 255
