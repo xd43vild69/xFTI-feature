@@ -39,6 +39,27 @@ def read_caption_for_image(image_path: str) -> str:
     return ""
 
 
+def write_caption_sidecar(image_path: str, caption: str, keep_backup: bool = True) -> str:
+    """Write the .txt caption next to its image, backing up any previous one once.
+
+    Written via a temp file and os.replace so an interrupted run never leaves a
+    half-written caption. The first overwrite keeps the original as .txt.bak —
+    subsequent ones don't, so the backup always holds the pre-AI caption. Mirrors
+    what LoRAlab's recaption script does to the same folders.
+    """
+    caption_path = Path(image_path).with_suffix(".txt")
+    backup_path = caption_path.with_suffix(".txt.bak")
+
+    if keep_backup and caption_path.exists() and not backup_path.exists():
+        shutil.copyfile(caption_path, backup_path)
+
+    temp_path = caption_path.with_suffix(".txt.tmp")
+    temp_path.write_text(caption, encoding="utf-8")
+    os.replace(temp_path, caption_path)
+
+    return str(caption_path)
+
+
 def save_uploaded_files(uploaded_files: list, destination: str | None = None) -> str:
     """Save Streamlit UploadedFile objects to a folder and return that folder's path.
 

@@ -10,6 +10,7 @@ from feature_pipeline.infrastructure.storage import (
     run_upload_dir,
     save_uploaded_files,
     scan_raw_folder,
+    write_caption_sidecar,
 )
 
 
@@ -129,3 +130,45 @@ def test_delete_managed_folder_refuses_the_raw_root_itself(tmp_path: Path, monke
 
     assert delete_managed_folder(str(raw_root)) is False
     assert raw_root.exists()
+
+
+def test_write_caption_sidecar_creates_the_txt_next_to_the_image(tmp_path: Path):
+    image_path = tmp_path / "a.png"
+    _make_image(image_path)
+
+    written = write_caption_sidecar(str(image_path), "sks_style, a red square")
+
+    assert Path(written) == tmp_path / "a.txt"
+    assert read_caption_for_image(str(image_path)) == "sks_style, a red square"
+
+
+def test_write_caption_sidecar_backs_up_the_previous_caption_once(tmp_path: Path):
+    image_path = tmp_path / "a.png"
+    _make_image(image_path)
+    (tmp_path / "a.txt").write_text("the original caption")
+
+    write_caption_sidecar(str(image_path), "first ai caption")
+    write_caption_sidecar(str(image_path), "second ai caption")
+
+    # The backup keeps the pre-AI text, not the previous AI attempt.
+    assert (tmp_path / "a.txt.bak").read_text() == "the original caption"
+    assert read_caption_for_image(str(image_path)) == "second ai caption"
+
+
+def test_write_caption_sidecar_can_skip_the_backup(tmp_path: Path):
+    image_path = tmp_path / "a.png"
+    _make_image(image_path)
+    (tmp_path / "a.txt").write_text("the original caption")
+
+    write_caption_sidecar(str(image_path), "ai caption", keep_backup=False)
+
+    assert not (tmp_path / "a.txt.bak").exists()
+
+
+def test_write_caption_sidecar_leaves_no_temp_file(tmp_path: Path):
+    image_path = tmp_path / "a.png"
+    _make_image(image_path)
+
+    write_caption_sidecar(str(image_path), "ai caption")
+
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["a.png", "a.txt"]
