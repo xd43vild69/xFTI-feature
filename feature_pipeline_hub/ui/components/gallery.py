@@ -7,4 +7,4 @@ import streamlit as st
 
 
 def render() -> None:
-    st.info("Gallery grid: implemented in Iteración 2.")
+    st.info("Gallery grid: implemented in Iteration 2.")

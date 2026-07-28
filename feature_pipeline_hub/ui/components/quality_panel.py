@@ -7,4 +7,4 @@ import streamlit as st
 
 
 def render() -> None:
-    st.info("Quality panel: implemented in Iteración 3.")
+    st.info("Quality panel: implemented in Iteration 3.")

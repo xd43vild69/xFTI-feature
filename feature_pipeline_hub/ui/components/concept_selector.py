@@ -7,4 +7,4 @@ import streamlit as st
 
 
 def render() -> None:
-    st.info("Concept selector: implemented in Iteración 2.")
+    st.info("Concept selector: implemented in Iteration 2.")

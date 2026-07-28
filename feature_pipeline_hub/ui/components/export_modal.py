@@ -7,4 +7,4 @@ import streamlit as st
 
 
 def render() -> None:
-    st.info("Export & versioning: implemented in Iteración 4.")
+    st.info("Export & versioning: implemented in Iteration 4.")
