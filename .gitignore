@@ -1,0 +1,82 @@
+# --- Datasets & media -------------------------------------------------------
+# This is an ML dataset-curation project: images and captions are data, never
+# source. Dataset folders keep only their .gitkeep skeleton (see
+# feature_pipeline_hub/.gitignore); everything else below is ignored outright.
+datasets/
+dataset/
+exports/
+snapshots/
+fti_upload_*/
+
+# Media files anywhere in the tree. If you ever need to commit a real asset
+# (a logo, a doc screenshot), add it explicitly with: git add -f <path>
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.gif
+*.bmp
+*.tiff
+*.psd
+*.mp4
+*.mov
+*.avi
+*.webm
+
+# Caption sidecars that ship next to training images
+*.caption
+
+# --- Model & artifact formats ----------------------------------------------
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.onnx
+*.parquet
+*.arrow
+*.npy
+*.npz
+
+# --- Python -----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# --- Databases & local state ------------------------------------------------
+*.db
+*.sqlite
+*.sqlite3
+
+# --- Secrets ----------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets.toml
+
+# --- Tooling & editors ------------------------------------------------------
+.claude/
+.streamlit/secrets.toml
+.idea/
+.vscode/
+*.swp
+*~
+
+# --- OS junk ----------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
