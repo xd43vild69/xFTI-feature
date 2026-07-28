@@ -1,0 +1,23 @@
+# Fixed dark theme: without this the app inherits whatever each machine has
+# configured, which is what made buttons render in mismatched colours.
+#
+# Every button in the app uses the same (secondary) style, so primaryColor only
+# drives accents — focus rings, links, sliders, badges.
+
+[theme]
+base = "dark"
+
+primaryColor = "#4C8DF6"
+backgroundColor = "#0E1117"
+secondaryBackgroundColor = "#161B22"
+textColor = "#E6EDF3"
+borderColor = "#262C36"
+
+baseRadius = "0.5rem"
+buttonRadius = "0.5rem"
+showWidgetBorder = true
+
+# Headings one step down from the defaults (2.75/2.25/1.75/1.5/1.25/1rem).
+# Steps are titled by the navigation, so in-page headings are signposts rather
+# than banners and don't need to shout.
+headingFontSizes = ["1.75rem", "1.375rem", "1.125rem", "1rem", "0.9rem", "0.85rem"]

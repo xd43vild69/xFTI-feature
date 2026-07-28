@@ -143,6 +143,32 @@ def render_thumbnail(image_path: str) -> None:
     st.image(thumbnail, width="stretch")
 
 
+IMPORT_STEP = "steps/import_step.py"
+CURATE_STEP = "steps/curate_step.py"
+QUALITY_STEP = "steps/quality_step.py"
+EXPORT_STEP = "steps/export_step.py"
+
+
+def require_active_run() -> IngestionRun | None:
+    """The active run, or None after drawing the shared 'nothing selected' state.
+
+    Steps 2-4 all need a dataset before they can show anything; routing that
+    through one helper keeps the empty state identical everywhere.
+    """
+    run = active_run()
+    if run is not None and run.concept.samples:
+        return run
+
+    if run is not None:
+        st.warning("This dataset has no images.")
+        return None
+
+    st.info("No dataset selected yet.")
+    if st.button("Go to import", icon=":material/arrow_forward:"):
+        st.switch_page(IMPORT_STEP)
+    return None
+
+
 def format_run_label(summary: IngestionRunSummary) -> str:
     icon = "📤" if summary.source_kind == "upload" else "📁"
     when = summary.created_at.astimezone().strftime("%d %b %H:%M")
