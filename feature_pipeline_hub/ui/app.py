@@ -14,6 +14,7 @@ import state
 import streamlit as st
 from components import concept_selector, export_modal, gallery, quality_panel
 
+from feature_pipeline.application import quality_service as quality
 from feature_pipeline.application.dataset_service import create_ingestion_run
 from feature_pipeline.infrastructure.storage import run_upload_dir, save_uploaded_files
 
@@ -118,7 +119,9 @@ with tab_ingest:
         st.caption(f"Active ingestion: **{concept.concept_name}** · `{active_run.run_id}`")
         total = len(concept.samples)
         invalid = sum(1 for s in concept.samples if not s.is_valid)
-        without_caption = sum(1 for s in concept.samples if not s.original_caption)
+        without_caption = len(
+            quality.samples_missing_caption(concept.samples, concept.trigger_word)
+        )
 
         col1, col2, col3 = st.columns(3)
         col1.metric("Images found", total)

@@ -25,6 +25,8 @@ def compute_image_metrics(image_path: str) -> ImageMetrics:
         width, height = img.size
         image_format = (img.format or Path(image_path).suffix.lstrip(".")).upper()
         phash = str(imagehash.phash(img))
+        dhash = str(imagehash.dhash(img))
+        colorhash = str(imagehash.colorhash(img))
 
     return ImageMetrics(
         width=width,
@@ -32,6 +34,8 @@ def compute_image_metrics(image_path: str) -> ImageMetrics:
         aspect_ratio=width / height,
         format=image_format,
         phash=phash,
+        dhash=dhash,
+        colorhash=colorhash,
     )
 
 
@@ -44,6 +48,20 @@ def compute_dhash(image_path: str) -> str:
 def hamming_distance(hash_a: str, hash_b: str) -> int:
     """Distance between two perceptual hashes: 0 means identical, higher means more different."""
     return imagehash.hex_to_hash(hash_a) - imagehash.hex_to_hash(hash_b)
+
+
+COLORHASH_BITS = 42
+
+
+def color_distance(hash_a: str, hash_b: str) -> int:
+    """Distance between two colour hashes.
+
+    Colour hashes are flat bit strings rather than square matrices, so they need a
+    different decoder than `hamming_distance`.
+    """
+    return imagehash.hex_to_flathash(hash_a, COLORHASH_BITS) - imagehash.hex_to_flathash(
+        hash_b, COLORHASH_BITS
+    )
 
 
 def classify_aspect_ratio(aspect_ratio: float) -> str:

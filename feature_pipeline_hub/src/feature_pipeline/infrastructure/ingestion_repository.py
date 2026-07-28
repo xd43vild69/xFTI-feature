@@ -45,9 +45,9 @@ def save_ingestion_run(conn: sqlite3.Connection, run: IngestionRun) -> None:
             """
             INSERT INTO samples
                 (sample_id, run_id, file_path, caption, original_caption,
-                 width, height, aspect_ratio, image_format, phash,
-                 is_duplicate, is_valid, validation_errors, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 width, height, aspect_ratio, image_format, phash, dhash, colorhash,
+                 is_duplicate, is_excluded, is_valid, validation_errors, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -61,7 +61,10 @@ def save_ingestion_run(conn: sqlite3.Connection, run: IngestionRun) -> None:
                     s.metrics.aspect_ratio,
                     s.metrics.format,
                     s.metrics.phash,
+                    s.metrics.dhash,
+                    s.metrics.colorhash,
                     int(s.is_duplicate),
+                    int(s.is_excluded),
                     int(s.is_valid),
                     json.dumps(s.validation_errors),
                     now,
@@ -121,8 +124,11 @@ def load_ingestion_run(conn: sqlite3.Connection, run_id: str) -> IngestionRun | 
                 aspect_ratio=row["aspect_ratio"],
                 format=row["image_format"],
                 phash=row["phash"],
+                dhash=row["dhash"],
+                colorhash=row["colorhash"],
             ),
             is_duplicate=bool(row["is_duplicate"]),
+            is_excluded=bool(row["is_excluded"]),
             is_valid=bool(row["is_valid"]),
             validation_errors=json.loads(row["validation_errors"]),
         )
@@ -150,6 +156,34 @@ def update_sample_caption(conn: sqlite3.Connection, sample_id: str, caption: str
             "UPDATE samples SET caption = ?, updated_at = ? WHERE sample_id = ?",
             (caption, datetime.now(timezone.utc).isoformat(), sample_id),
         )
+
+
+def set_samples_excluded(
+    conn: sqlite3.Connection, sample_ids: list[str], excluded: bool
+) -> None:
+    """Exclude (or restore) samples. The image files are left on disk."""
+    if not sample_ids:
+        return
+
+    placeholders = ",".join("?" for _ in sample_ids)
+    with conn:
+        conn.execute(
+            f"UPDATE samples SET is_excluded = ?, updated_at = ? "
+            f"WHERE sample_id IN ({placeholders})",
+            [int(excluded), datetime.now(timezone.utc).isoformat(), *sample_ids],
+        )
+
+
+def mark_duplicates(conn: sqlite3.Connection, run_id: str, sample_ids: list[str]) -> None:
+    """Record the outcome of a duplicate scan for a run: only `sample_ids` are duplicates."""
+    with conn:
+        conn.execute("UPDATE samples SET is_duplicate = 0 WHERE run_id = ?", (run_id,))
+        if sample_ids:
+            placeholders = ",".join("?" for _ in sample_ids)
+            conn.execute(
+                f"UPDATE samples SET is_duplicate = 1 WHERE sample_id IN ({placeholders})",
+                sample_ids,
+            )
 
 
 def delete_ingestion_run(conn: sqlite3.Connection, run_id: str) -> None:

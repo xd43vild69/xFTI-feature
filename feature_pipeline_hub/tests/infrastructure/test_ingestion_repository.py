@@ -1,3 +1,4 @@
+import sqlite3
 from datetime import datetime, timezone
 
 import pytest
@@ -13,7 +14,9 @@ from feature_pipeline.infrastructure.ingestion_repository import (
     delete_ingestion_run,
     list_ingestion_runs,
     load_ingestion_run,
+    mark_duplicates,
     save_ingestion_run,
+    set_samples_excluded,
     update_sample_caption,
 )
 
@@ -132,3 +135,106 @@ def test_delete_removes_the_run_and_its_samples(conn):
 
 def test_load_missing_run_returns_none(conn):
     assert load_ingestion_run(conn, "nope") is None
+
+
+def test_dhash_and_exclusion_survive_a_round_trip(conn):
+    run = _make_run("r1")
+    run.concept.samples[0].metrics.dhash = "ffeeddccbbaa9988"
+    run.concept.samples[0].is_excluded = True
+
+    save_ingestion_run(conn, run)
+    loaded = load_ingestion_run(conn, "r1")
+
+    assert loaded.concept.samples[0].metrics.dhash == "ffeeddccbbaa9988"
+    assert loaded.concept.samples[0].is_excluded is True
+
+
+def test_set_samples_excluded_toggles_in_both_directions(conn):
+    save_ingestion_run(conn, _make_run("r1", n_samples=3))
+
+    set_samples_excluded(conn, ["r1-s0", "r1-s1"], True)
+    loaded = load_ingestion_run(conn, "r1")
+    assert [s.is_excluded for s in loaded.concept.samples] == [True, True, False]
+
+    set_samples_excluded(conn, ["r1-s0"], False)
+    loaded = load_ingestion_run(conn, "r1")
+    assert [s.is_excluded for s in loaded.concept.samples] == [False, True, False]
+
+
+def test_set_samples_excluded_with_no_ids_is_a_no_op(conn):
+    save_ingestion_run(conn, _make_run("r1"))
+
+    set_samples_excluded(conn, [], True)
+
+    assert load_ingestion_run(conn, "r1").concept.samples[0].is_excluded is False
+
+
+def test_mark_duplicates_replaces_the_previous_scan_result(conn):
+    save_ingestion_run(conn, _make_run("r1", n_samples=3))
+
+    mark_duplicates(conn, "r1", ["r1-s0", "r1-s1"])
+    assert [s.is_duplicate for s in load_ingestion_run(conn, "r1").concept.samples] == [
+        True,
+        True,
+        False,
+    ]
+
+    mark_duplicates(conn, "r1", ["r1-s2"])
+    assert [s.is_duplicate for s in load_ingestion_run(conn, "r1").concept.samples] == [
+        False,
+        False,
+        True,
+    ]
+
+
+def test_mark_duplicates_leaves_other_runs_alone(conn):
+    save_ingestion_run(conn, _make_run("r1"))
+    save_ingestion_run(conn, _make_run("r2"))
+    mark_duplicates(conn, "r1", ["r1-s0"])
+    mark_duplicates(conn, "r2", [])
+
+    assert load_ingestion_run(conn, "r1").concept.samples[0].is_duplicate is True
+
+
+def test_a_database_created_before_dhash_and_exclusion_is_migrated(tmp_path):
+    db_path = str(tmp_path / "legacy.db")
+    legacy = sqlite3.connect(db_path)
+    legacy.executescript(
+        """
+        CREATE TABLE ingestion_runs (
+            run_id TEXT PRIMARY KEY, concept_id TEXT NOT NULL, concept_name TEXT NOT NULL,
+            trigger_word TEXT NOT NULL, source_path TEXT NOT NULL,
+            source_kind TEXT NOT NULL, created_at TEXT NOT NULL
+        );
+        CREATE TABLE samples (
+            sample_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, file_path TEXT NOT NULL,
+            caption TEXT NOT NULL, original_caption TEXT NOT NULL DEFAULT '',
+            width INTEGER NOT NULL, height INTEGER NOT NULL, aspect_ratio REAL NOT NULL,
+            image_format TEXT NOT NULL DEFAULT '', phash TEXT NOT NULL,
+            is_duplicate BOOLEAN NOT NULL DEFAULT 0, is_valid BOOLEAN NOT NULL DEFAULT 1,
+            validation_errors TEXT NOT NULL DEFAULT '[]', is_flagged BOOLEAN NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL
+        );
+        """
+    )
+    legacy.execute(
+        "INSERT INTO ingestion_runs VALUES ('old', 'c', 'cat', 'sks', '/tmp/x', 'folder', ?)",
+        (datetime(2026, 1, 1, tzinfo=timezone.utc).isoformat(),),
+    )
+    legacy.execute(
+        "INSERT INTO samples (sample_id, run_id, file_path, caption, width, height,"
+        " aspect_ratio, phash, updated_at) VALUES ('s0','old','/tmp/x/a.png','sks, a cat',"
+        " 512, 512, 1.0, 'abcd1234', 'now')"
+    )
+    legacy.commit()
+    legacy.close()
+
+    migrated = get_connection(db_path)
+    try:
+        loaded = load_ingestion_run(migrated, "old")
+    finally:
+        migrated.close()
+
+    assert loaded is not None
+    assert loaded.concept.samples[0].metrics.dhash == ""
+    assert loaded.concept.samples[0].is_excluded is False

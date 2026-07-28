@@ -11,6 +11,9 @@ class ImageMetrics(BaseModel):
     aspect_ratio: float
     format: str
     phash: str
+    # Empty for runs ingested before these hashes were recorded.
+    dhash: str = ""
+    colorhash: str = ""
 
 
 class DatasetSample(BaseModel):
@@ -20,8 +23,24 @@ class DatasetSample(BaseModel):
     original_caption: str
     metrics: ImageMetrics
     is_duplicate: bool = False
+    is_excluded: bool = False  # kept on disk, left out of the curated dataset
     is_valid: bool = True
     validation_errors: list[str] = Field(default_factory=list)
+
+
+class DuplicateCluster(BaseModel):
+    """A group of near-identical images found by perceptual hashing.
+
+    `kept` is the sample proposed to survive; `duplicates` are the rest, each with
+    its perceptual distance to `kept`.
+    """
+
+    kept: DatasetSample
+    duplicates: list[tuple[DatasetSample, int]] = Field(default_factory=list)
+
+    @property
+    def size(self) -> int:
+        return 1 + len(self.duplicates)
 
 
 class ConceptGroup(BaseModel):
