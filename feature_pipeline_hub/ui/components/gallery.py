@@ -6,8 +6,10 @@ Renders whichever dataset is active in the context bar.
 from pathlib import Path
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 import state
+from components import recaption_panel
 from feature_pipeline.application import quality_service as quality
 from feature_pipeline.domain.models import DatasetSample, IngestionRun
 
@@ -23,10 +25,72 @@ FILTERS = {
 }
 
 
+@st.dialog("Renombrar palabra en captions")
+def _render_rename_dialog(run: IngestionRun) -> None:
+    st.write("Busca una palabra exacta en los captions de las imágenes y reemplázala.")
+
+    old_word = st.text_input(
+        "Palabra exacta a buscar (case-sensitive)",
+        placeholder="ej. cat",
+        key=f"rename_old_{run.run_id}",
+    )
+    new_word = st.text_input(
+        "Reemplazar por",
+        placeholder="ej. dog",
+        key=f"rename_new_{run.run_id}",
+    )
+
+    matching_samples, total_matches = state.preview_replace_counts(
+        run.concept.samples, old_word
+    )
+
+    if old_word:
+        if total_matches > 0:
+            st.info(
+                f"Se encontraron **{total_matches}** coincidencia(s) en **{matching_samples}** imagen(es)."
+            )
+        else:
+            st.warning(f"No se encontró la palabra exacta '{old_word}'.")
+
+    if st.button(
+        f"Reemplazar {total_matches} coincidencia(s)",
+        type="primary",
+        disabled=(total_matches == 0),
+        use_container_width=True,
+    ):
+        samples_cnt, total_cnt = state.batch_replace_caption_word(
+            run, old_word, new_word
+        )
+        st.success(f"¡Se reemplazaron {total_cnt} coincidencia(s) en {samples_cnt} imagen(es)!")
+        st.rerun()
+
+
 def render() -> None:
     run = state.require_active_run()
     if run is None:
         return
+
+    # Keyboard shortcut listener for F2
+    components.html(
+        """
+        <script>
+        const doc = window.parent.document;
+        if (!doc._f2ListenerAdded) {
+            doc._f2ListenerAdded = true;
+            doc.addEventListener('keydown', function(e) {
+                if (e.key === 'F2') {
+                    e.preventDefault();
+                    const buttons = Array.from(doc.querySelectorAll('button'));
+                    const btn = buttons.find(b => b.innerText && b.innerText.includes('Renombrar (F2)'));
+                    if (btn) btn.click();
+                }
+            });
+        }
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
 
     with st.container(horizontal=True, vertical_alignment="center"):
         chosen_filter = st.segmented_control(
@@ -41,12 +105,23 @@ def render() -> None:
             columns_per_row = st.select_slider(
                 "Columns", options=[2, 3, 4, 5, 6], value=6, key=f"gallery_cols_{run.run_id}"
             )
+        if st.button(
+            "Renombrar (F2)",
+            icon=":material/find_replace:",
+            help="Reemplazar palabra en los captions (F2)",
+            key=f"btn_rename_{run.run_id}",
+        ):
+            _render_rename_dialog(run)
 
     trigger = run.concept.trigger_word
     samples = [s for s in run.concept.samples if FILTERS[chosen_filter](s, trigger)]
     if not samples:
         st.caption(f"No images match '{chosen_filter}'.")
         return
+
+    # Before the grid: selecting all writes the checkboxes' session keys, which
+    # Streamlit only allows while those widgets do not yet exist on this run.
+    recaption_panel.render_toolbar(run, samples)
 
     for row_start in range(0, len(samples), columns_per_row):
         row = samples[row_start : row_start + columns_per_row]
@@ -59,6 +134,12 @@ def _render_card(sample: DatasetSample, run: IngestionRun) -> None:
     state.render_thumbnail(sample.image_path)
 
     with st.container(horizontal=True, vertical_alignment="center"):
+        st.checkbox(
+            Path(sample.image_path).name,
+            key=state.selection_key(run.run_id, sample.sample_id),
+            help="Select for batch recaptioning",
+            label_visibility="collapsed",
+        )
         st.caption(f"{Path(sample.image_path).name} · {_status(sample)}")
 
         excluded = sample.is_excluded

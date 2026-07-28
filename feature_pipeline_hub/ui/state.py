@@ -10,11 +10,11 @@ from pathlib import Path
 import streamlit as st
 from PIL import Image
 
-from feature_pipeline.application import image_service
-from feature_pipeline.domain.models import IngestionRun, IngestionRunSummary
+from feature_pipeline.application import caption_service, image_service
+from feature_pipeline.domain.models import DatasetSample, IngestionRun, IngestionRunSummary
 from feature_pipeline.infrastructure import ingestion_repository as repo
 from feature_pipeline.infrastructure.database import get_connection
-from feature_pipeline.infrastructure.storage import delete_managed_folder
+from feature_pipeline.infrastructure.storage import delete_managed_folder, write_caption_sidecar
 
 ACTIVE_RUN_KEY = "active_run_id"
 
@@ -77,6 +77,85 @@ def persist_description(sample_id: str, widget_key: str, trigger_word: str) -> N
     save_caption(sample_id, f"{trigger_word}, {description}" if trigger_word else description)
     versions = st.session_state.setdefault(CAPTION_VERSIONS_KEY, {})
     versions[sample_id] = versions.get(sample_id, 0) + 1
+
+
+def preview_replace_counts(samples: list[DatasetSample], old_word: str) -> tuple[int, int]:
+    """Calculate matching samples count and total exact word occurrences (case-sensitive)."""
+    if not old_word:
+        return 0, 0
+    matching_samples = 0
+    total_matches = 0
+    for sample in samples:
+        _, count = caption_service.replace_exact_word(sample.caption, old_word, "")
+        if count > 0:
+            matching_samples += 1
+            total_matches += count
+    return matching_samples, total_matches
+
+
+def batch_replace_caption_word(run: IngestionRun, old_word: str, new_word: str) -> tuple[int, int]:
+    """Batch replace exact occurrences of old_word with new_word in run's samples.
+
+    Persists to SQLite and bumps caption widget versions so text areas refresh cleanly.
+    Returns (samples_updated_count, total_replacements_count).
+    """
+    if not old_word:
+        return 0, 0
+
+    samples_updated = 0
+    total_replacements = 0
+    versions = st.session_state.setdefault(CAPTION_VERSIONS_KEY, {})
+
+    with _db() as conn:
+        for sample in run.concept.samples:
+            new_caption, count = caption_service.replace_exact_word(
+                sample.caption, old_word, new_word
+            )
+            if count > 0:
+                repo.update_sample_caption(conn, sample.sample_id, new_caption)
+                sample.caption = new_caption
+                versions[sample.sample_id] = versions.get(sample.sample_id, 0) + 1
+                samples_updated += 1
+                total_replacements += count
+
+    return samples_updated, total_replacements
+
+
+def selection_key(run_id: str, sample_id: str) -> str:
+    return f"select_{run_id}_{sample_id}"
+
+
+def selected_samples(run: IngestionRun) -> list[DatasetSample]:
+    """Samples currently ticked in the curation grid."""
+    return [
+        sample
+        for sample in run.concept.samples
+        if st.session_state.get(selection_key(run.run_id, sample.sample_id))
+    ]
+
+
+def set_selection(run_id: str, samples: list[DatasetSample], selected: bool) -> None:
+    """Tick or untick a group of samples.
+
+    Only safe to call before the checkboxes are instantiated on this run —
+    Streamlit rejects writes to a widget's key once its widget exists.
+    """
+    for sample in samples:
+        st.session_state[selection_key(run_id, sample.sample_id)] = selected
+
+
+def apply_recaption(sample: DatasetSample, caption: str) -> None:
+    """Store an AI caption in the database and alongside the image.
+
+    Writing the .txt sidecar keeps the source folder interoperable with LoRAlab,
+    which reads captions from disk; the pre-AI text is kept as .txt.bak. Bumping
+    the widget version makes the grid's editor pick the new text up.
+    """
+    save_caption(sample.sample_id, caption)
+    write_caption_sidecar(sample.image_path, caption)
+
+    versions = st.session_state.setdefault(CAPTION_VERSIONS_KEY, {})
+    versions[sample.sample_id] = versions.get(sample.sample_id, 0) + 1
 
 
 def set_excluded(sample_ids: list[str], excluded: bool) -> None:

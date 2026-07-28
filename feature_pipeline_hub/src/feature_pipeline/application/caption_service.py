@@ -31,3 +31,20 @@ def inject_trigger_word(caption: str, trigger_word: str) -> str:
         return trigger_word
 
     return f"{trigger_word}, {normalized}"
+
+
+def replace_exact_word(caption: str, old_word: str, new_word: str) -> tuple[str, int]:
+    """Replace exact occurrences of `old_word` with `new_word` in `caption` (case-sensitive).
+
+    Uses non-word boundary checks (`(?<!\\w)` and `(?!\\w)`) to match exact terms
+    delimited by commas, spaces, punctuation, or boundaries.
+
+    Returns (new_caption, count_replaced).
+    """
+    if not old_word or old_word not in caption:
+        return caption, 0
+
+    pattern = re.compile(r"(?<!\w)" + re.escape(old_word) + r"(?!\w)")
+    new_caption, count = pattern.subn(new_word, caption)
+    return new_caption, count
+
