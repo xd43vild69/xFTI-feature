@@ -1,12 +1,12 @@
-__pycache__/
-*.pyc
-.venv/
-.pytest_cache/
-*.egg-info/
+# Dataset working folders: keep the directory skeleton, never the contents.
+# Repo-wide media/model ignores live in the root .gitignore.
+data/raw/**
+data/processed/**
+!data/raw/**/
+!data/processed/**/
+!data/raw/**/.gitkeep
+!data/processed/**/.gitkeep
+
+# Local metadata DB produced during curation
 *.db
 *.sqlite3
-
-data/raw/*
-!data/raw/.gitkeep
-data/processed/*
-!data/processed/.gitkeep
