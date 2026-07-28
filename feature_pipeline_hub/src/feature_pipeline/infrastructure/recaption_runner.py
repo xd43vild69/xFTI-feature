@@ -42,8 +42,9 @@ def resolve_environment() -> RecaptionEnvironment:
     root_value = os.environ.get(LORALAB_ROOT_ENV, "").strip()
     if not root_value:
         raise RecaptionUnavailable(
-            f"Set {LORALAB_ROOT_ENV} to your AcademiaSD_LoRAlab-Krea2 checkout to "
-            "enable AI recaptioning."
+            f"AI recaptioning needs {LORALAB_ROOT_ENV}. Set it to your "
+            "AcademiaSD_LoRAlab-Krea2 checkout before starting the app, e.g. "
+            f'`export {LORALAB_ROOT_ENV}=/path/to/AcademiaSD_LoRAlab-Krea2`.'
         )
 
     root = Path(root_value).expanduser()

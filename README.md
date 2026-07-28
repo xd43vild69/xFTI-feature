@@ -37,6 +37,20 @@ Recaptioning writes the new caption both to the local database and to the `.txt`
 sidecar next to the image, keeping the pre-AI text as `.txt.bak`, so the same
 dataset folder stays usable from LoRAlab.
 
+**How to run it:**
+
+1. In **Curate**, tick the checkbox on each image you want to recaption (or use
+   **All** / **None** above the grid to select everything shown / clear the
+   selection).
+2. Optionally open the ⚙ popover and turn on **Detailed captions** for longer,
+   more descriptive text instead of a single factual sentence.
+3. Click **Recaption N** (N = however many images are selected). Progress shows
+   live, image by image — a batch costs a few seconds of model load plus
+   roughly 2s per image on GPU (detailed captions are slower, ~5s per image).
+
+If `FTI_LORALAB_ROOT` isn't set, that button's spot in the toolbar instead shows
+what to configure.
+
 ## Configuration
 
 | Variable | Purpose |

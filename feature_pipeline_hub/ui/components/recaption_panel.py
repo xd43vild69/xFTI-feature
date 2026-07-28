@@ -42,14 +42,14 @@ def render_toolbar(run: IngestionRun, visible: list[DatasetSample]) -> None:
                 "Detailed captions",
                 key=DETAILED_KEY,
                 help="2-4 sentences covering pose, clothing, lighting and setting, "
-                "instead of a single factual sentence. Slower.",
+                "instead of a single factual sentence. Slower (~5s per image).",
             )
 
         if st.button(
             f"Recaption {len(selected)}",
             icon=":material/auto_awesome:",
             disabled=not selected,
-            help="Regenerate captions with Qwen3-VL",
+            help="Select images above, then click to regenerate captions with Qwen3-VL. ~2s per image on GPU.",
         ):
             _run_batch(run, selected)
 
