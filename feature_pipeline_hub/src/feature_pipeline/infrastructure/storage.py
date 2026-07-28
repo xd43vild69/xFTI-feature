@@ -3,10 +3,21 @@
 Writing curated output to `data/processed/` lands in Iteración 4 (Exportador).
 """
 
+import os
+import shutil
 import tempfile
 from pathlib import Path
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
+
+
+def raw_data_dir() -> Path:
+    """Folder where uploaded datasets are kept, overridable via FTI_DATA_DIR."""
+    override = os.environ.get("FTI_DATA_DIR")
+    base = Path(override) if override else Path(__file__).resolve().parents[3] / "data"
+    raw_dir = base / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    return raw_dir
 
 
 def scan_raw_folder(folder_path: str) -> list[str]:
@@ -28,20 +39,47 @@ def read_caption_for_image(image_path: str) -> str:
     return ""
 
 
-def save_uploaded_files(uploaded_files: list) -> str:
-    """Save Streamlit UploadedFile objects to a temporary folder and return the folder path.
+def save_uploaded_files(uploaded_files: list, destination: str | None = None) -> str:
+    """Save Streamlit UploadedFile objects to a folder and return that folder's path.
 
     Args:
         uploaded_files: List of streamlit.UploadedFile objects from st.file_uploader
+        destination: Target folder; defaults to a temporary one. Runs that must
+            outlive the session pass a folder under `data/raw/`, since /tmp gets
+            swept and would break previews of older ingestions.
 
     Returns:
-        Path to the temporary folder containing the uploaded files
+        Path to the folder containing the uploaded files
     """
-    temp_dir = tempfile.mkdtemp(prefix="fti_upload_")
-    temp_path = Path(temp_dir)
+    if destination is None:
+        folder = Path(tempfile.mkdtemp(prefix="fti_upload_"))
+    else:
+        folder = Path(destination)
+        folder.mkdir(parents=True, exist_ok=True)
 
     for uploaded_file in uploaded_files:
-        file_path = temp_path / uploaded_file.name
+        file_path = folder / uploaded_file.name
         file_path.write_bytes(uploaded_file.getbuffer())
 
-    return temp_dir
+    return str(folder)
+
+
+def run_upload_dir(run_id: str) -> str:
+    """Per-run folder under `data/raw/` for files uploaded through the UI."""
+    return str(raw_data_dir() / run_id)
+
+
+def delete_managed_folder(folder_path: str) -> bool:
+    """Delete a folder only if it lives under `data/raw/`.
+
+    Guards against wiping a user's own source folder when deleting a run that was
+    ingested by path rather than uploaded.
+    """
+    folder = Path(folder_path).resolve()
+    raw_dir = raw_data_dir().resolve()
+
+    if folder == raw_dir or raw_dir not in folder.parents or not folder.is_dir():
+        return False
+
+    shutil.rmtree(folder)
+    return True

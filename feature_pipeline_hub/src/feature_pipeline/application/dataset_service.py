@@ -4,7 +4,12 @@ import uuid
 
 from feature_pipeline.application.caption_service import inject_trigger_word
 from feature_pipeline.application.image_service import compute_image_metrics
-from feature_pipeline.domain.models import ConceptGroup, DatasetManifest, DatasetSample
+from feature_pipeline.domain.models import (
+    ConceptGroup,
+    DatasetManifest,
+    DatasetSample,
+    IngestionRun,
+)
 from feature_pipeline.domain.validators import validate_sample
 from feature_pipeline.infrastructure.storage import read_caption_for_image, scan_raw_folder
 
@@ -37,6 +42,35 @@ def ingest_concept_from_folder(
         concept_name=concept_name,
         trigger_word=trigger_word,
         samples=samples,
+    )
+
+
+def create_ingestion_run(
+    folder_path: str,
+    concept_name: str,
+    trigger_word: str,
+    source_kind: str,
+    run_id: str | None = None,
+    concept_id: str | None = None,
+) -> IngestionRun:
+    """Ingest a folder into a standalone, identifiable run.
+
+    Each call mints a fresh `run_id` so re-scanning a concept adds a run instead of
+    overwriting the previous one.
+    """
+    run_id = run_id or str(uuid.uuid4())
+    concept = ingest_concept_from_folder(
+        folder_path=folder_path,
+        concept_id=concept_id or str(uuid.uuid4()),
+        concept_name=concept_name,
+        trigger_word=trigger_word,
+    )
+
+    return IngestionRun(
+        run_id=run_id,
+        source_path=folder_path,
+        source_kind=source_kind,
+        concept=concept,
     )
 
 

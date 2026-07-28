@@ -2,7 +2,10 @@ from pathlib import Path
 
 from PIL import Image
 
-from feature_pipeline.application.dataset_service import ingest_concept_from_folder
+from feature_pipeline.application.dataset_service import (
+    create_ingestion_run,
+    ingest_concept_from_folder,
+)
 
 
 def _make_image(path: Path, size=(512, 512)) -> None:
@@ -74,3 +77,41 @@ def test_ingest_concept_from_folder_empty_folder_returns_no_samples(tmp_path: Pa
     )
 
     assert concept.samples == []
+
+
+def test_create_ingestion_run_mints_a_new_run_id_per_call(tmp_path: Path):
+    _make_image(tmp_path / "a.png")
+    (tmp_path / "a.txt").write_text("a cat sitting")
+
+    first = create_ingestion_run(
+        folder_path=str(tmp_path),
+        concept_name="cats",
+        trigger_word="sks_cat",
+        source_kind="folder",
+    )
+    second = create_ingestion_run(
+        folder_path=str(tmp_path),
+        concept_name="cats",
+        trigger_word="sks_cat",
+        source_kind="folder",
+    )
+
+    assert first.run_id != second.run_id
+    assert first.source_path == str(tmp_path)
+    assert first.source_kind == "folder"
+    assert len(first.concept.samples) == 1
+
+
+def test_create_ingestion_run_accepts_a_caller_supplied_run_id(tmp_path: Path):
+    _make_image(tmp_path / "a.png")
+
+    run = create_ingestion_run(
+        folder_path=str(tmp_path),
+        concept_name="cats",
+        trigger_word="sks_cat",
+        source_kind="upload",
+        run_id="run-42",
+    )
+
+    assert run.run_id == "run-42"
+    assert run.concept.trigger_word == "sks_cat"

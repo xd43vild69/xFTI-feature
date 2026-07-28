@@ -4,7 +4,10 @@ import pytest
 from PIL import Image
 
 from feature_pipeline.infrastructure.storage import (
+    delete_managed_folder,
+    raw_data_dir,
     read_caption_for_image,
+    run_upload_dir,
     save_uploaded_files,
     scan_raw_folder,
 )
@@ -85,3 +88,44 @@ def test_save_uploaded_files_returns_distinct_folders_per_call():
     second = save_uploaded_files([_FakeUpload("a.txt", b"two")])
 
     assert first != second
+
+
+def test_save_uploaded_files_honours_an_explicit_destination(tmp_path: Path):
+    source_image = tmp_path / "src.png"
+    _make_image(source_image)
+    destination = tmp_path / "runs" / "run-1"
+
+    folder = save_uploaded_files(
+        [_FakeUpload("a.png", source_image.read_bytes())], destination=str(destination)
+    )
+
+    assert Path(folder) == destination
+    assert (destination / "a.png").exists()
+
+
+def test_delete_managed_folder_removes_folders_under_data_raw(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("FTI_DATA_DIR", str(tmp_path))
+    run_folder = Path(run_upload_dir("run-1"))
+    run_folder.mkdir(parents=True)
+    (run_folder / "a.png").write_bytes(b"x")
+
+    assert delete_managed_folder(str(run_folder)) is True
+    assert not run_folder.exists()
+
+
+def test_delete_managed_folder_refuses_folders_outside_data_raw(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("FTI_DATA_DIR", str(tmp_path / "managed"))
+    user_folder = tmp_path / "my_own_images"
+    user_folder.mkdir()
+    _make_image(user_folder / "a.png")
+
+    assert delete_managed_folder(str(user_folder)) is False
+    assert (user_folder / "a.png").exists()
+
+
+def test_delete_managed_folder_refuses_the_raw_root_itself(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("FTI_DATA_DIR", str(tmp_path))
+    raw_root = raw_data_dir()
+
+    assert delete_managed_folder(str(raw_root)) is False
+    assert raw_root.exists()
