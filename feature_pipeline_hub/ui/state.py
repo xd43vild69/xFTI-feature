@@ -5,9 +5,12 @@ on different threads, and a SQLite connection is not shared across them safely.
 """
 
 from contextlib import contextmanager
+from pathlib import Path
 
 import streamlit as st
+from PIL import Image
 
+from feature_pipeline.application import image_service
 from feature_pipeline.domain.models import IngestionRun, IngestionRunSummary
 from feature_pipeline.infrastructure import ingestion_repository as repo
 from feature_pipeline.infrastructure.database import get_connection
@@ -113,6 +116,31 @@ def active_run() -> IngestionRun | None:
     if run is None:  # deleted from another session
         st.session_state.pop(ACTIVE_RUN_KEY, None)
     return run
+
+
+@st.cache_data(max_entries=256)
+def _cached_thumbnail(image_path: str, mtime: float, size: int) -> Image.Image:
+    return image_service.make_square_thumbnail(image_path, size)
+
+
+def render_thumbnail(image_path: str) -> None:
+    """Render a square, theme-adaptive thumbnail, or an error if it's missing/unreadable.
+
+    `mtime` is part of the cache key so an image edited or re-ingested on the same
+    path invalidates its cached thumbnail automatically.
+    """
+    path = Path(image_path)
+    if not path.exists():
+        st.error(f"Missing file: {path.name}")
+        return
+
+    try:
+        thumbnail = _cached_thumbnail(str(path), path.stat().st_mtime, image_service.THUMBNAIL_SIZE)
+    except Exception:
+        st.error(f"Could not read image: {path.name}")
+        return
+
+    st.image(thumbnail, width="stretch")
 
 
 def format_run_label(summary: IngestionRunSummary) -> str:

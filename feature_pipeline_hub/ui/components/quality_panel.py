@@ -108,7 +108,7 @@ def _render_cluster(index: int, cluster: DuplicateCluster, run: IngestionRun) ->
         entries = [(cluster.kept, None), *cluster.duplicates]
         for column, (sample, distance) in zip(st.columns(len(entries)), entries):
             with column:
-                _render_thumbnail(sample)
+                state.render_thumbnail(sample.image_path)
                 st.caption("✅ kept" if distance is None else f"distance {distance}")
                 if distance is not None and st.button(
                     "Exclude",
@@ -131,7 +131,7 @@ def _render_excluded_samples(run: IngestionRun) -> None:
 
         for column, sample in zip(st.columns(min(len(excluded), 6)), excluded):
             with column:
-                _render_thumbnail(sample)
+                state.render_thumbnail(sample.image_path)
                 if st.button(
                     "Restore",
                     key=f"restore_{run.run_id}_{sample.sample_id}",
@@ -208,11 +208,3 @@ def _render_statistics(samples: list[DatasetSample]) -> None:
         help=f"Captions over ~{quality.CAPTION_WORD_WARNING} words tend to exceed "
         "CLIP's 77-token prompt limit and get cut during training.",
     )
-
-
-def _render_thumbnail(sample: DatasetSample) -> None:
-    image_path = Path(sample.image_path)
-    if image_path.exists():
-        st.image(str(image_path), width="stretch")
-    else:
-        st.error(f"Missing file: {image_path.name}")
