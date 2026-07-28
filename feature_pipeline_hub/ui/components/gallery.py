@@ -39,7 +39,7 @@ def render() -> None:
         )
         with st.popover("", icon=":material/tune:", help="View options"):
             columns_per_row = st.select_slider(
-                "Columns", options=[2, 3, 4, 5, 6], value=4, key=f"gallery_cols_{run.run_id}"
+                "Columns", options=[2, 3, 4, 5, 6], value=6, key=f"gallery_cols_{run.run_id}"
             )
 
     trigger = run.concept.trigger_word
