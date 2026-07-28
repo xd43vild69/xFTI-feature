@@ -13,6 +13,8 @@ from PIL import Image
 from feature_pipeline.application import caption_service, image_service
 from feature_pipeline.domain.models import DatasetSample, IngestionRun, IngestionRunSummary
 from feature_pipeline.infrastructure import ingestion_repository as repo
+from feature_pipeline.infrastructure import training_repository as training_repo
+from feature_pipeline.infrastructure import training_runner
 from feature_pipeline.infrastructure.database import get_connection
 from feature_pipeline.infrastructure.storage import delete_managed_folder, write_caption_sidecar
 
@@ -161,6 +163,23 @@ def apply_recaption(sample: DatasetSample, caption: str) -> None:
 def set_excluded(sample_ids: list[str], excluded: bool) -> None:
     with _db() as conn:
         repo.set_samples_excluded(conn, sample_ids, excluded)
+
+
+def is_training_active() -> bool:
+    """Whether a training-runtime job (pre-cache/train/progressive/curate) is
+    running right now — the GPU can only do one heavy job at a time.
+
+    Self-healing: a 'running' row whose process actually died (crash, machine
+    restart) is corrected to 'failed' here rather than blocking the GPU forever.
+    """
+    with _db() as conn:
+        run = training_repo.find_running_training_run(conn)
+        if run is None:
+            return False
+        if training_runner.is_process_alive(run.pid):
+            return True
+        training_repo.update_training_run_status(conn, run.training_run_id, "failed")
+        return False
 
 
 def mark_duplicates(run_id: str, sample_ids: list[str]) -> None:
