@@ -245,6 +245,7 @@ IMPORT_STEP = "steps/import_step.py"
 CURATE_STEP = "steps/curate_step.py"
 QUALITY_STEP = "steps/quality_step.py"
 EXPORT_STEP = "steps/export_step.py"
+TRAIN_STEP = "steps/train_step.py"
 
 
 def require_active_run() -> IngestionRun | None:

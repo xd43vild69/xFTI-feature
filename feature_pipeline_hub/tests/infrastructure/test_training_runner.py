@@ -74,7 +74,7 @@ def test_is_available_is_false_without_a_runtime(monkeypatch, tmp_path):
 STUB_SCRIPT = """
 import json, os, signal, sys, time
 
-settings = json.load(open(os.environ["FTI_TRAINING_SETTINGS_PATH"]))
+settings = json.load(open(os.environ["FTI_TEST_SETTINGS_PATH"]))
 print(f"loaded total_steps={settings['total_steps']}", flush=True)
 
 stopping = {"flag": False}
@@ -105,7 +105,7 @@ def test_launch_writes_settings_and_returns_immediately(stub_environment, tmp_pa
     run_dir = tmp_path / "runs" / "r1"
 
     started = time.monotonic()
-    pid, log_path = launch(script, {"total_steps": 42}, run_dir, environment=env)
+    pid, log_path = launch(script, {"total_steps": 42}, run_dir, "FTI_TEST_SETTINGS_PATH", environment=env)
     elapsed = time.monotonic() - started
 
     assert elapsed < 1.0  # detached: must not block on the subprocess
@@ -118,7 +118,7 @@ def test_launch_writes_settings_and_returns_immediately(stub_environment, tmp_pa
 def test_log_tail_reads_only_new_content(stub_environment, tmp_path):
     env, script = stub_environment
     run_dir = tmp_path / "runs" / "r1"
-    pid, log_path = launch(script, {"total_steps": 5}, run_dir, environment=env)
+    pid, log_path = launch(script, {"total_steps": 5}, run_dir, "FTI_TEST_SETTINGS_PATH", environment=env)
 
     try:
         deadline = time.monotonic() + 5
@@ -140,7 +140,7 @@ def test_log_tail_reads_only_new_content(stub_environment, tmp_path):
 def test_stop_process_sends_sigint_and_the_worker_exits_gracefully(stub_environment, tmp_path):
     env, script = stub_environment
     run_dir = tmp_path / "runs" / "r1"
-    pid, log_path = launch(script, {"total_steps": 5}, run_dir, environment=env)
+    pid, log_path = launch(script, {"total_steps": 5}, run_dir, "FTI_TEST_SETTINGS_PATH", environment=env)
 
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline and "step 0" not in read_log_tail(log_path)[0]:

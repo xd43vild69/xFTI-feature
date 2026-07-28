@@ -48,7 +48,7 @@ fi
 echo "==> Installing pinned dependencies (versions matched to the LoRAlab venv this runtime replaces)"
 "$RUNTIME_DIR/venv/bin/pip" install --upgrade pip --quiet
 "$RUNTIME_DIR/venv/bin/pip" install --quiet \
-    torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+    torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
 "$RUNTIME_DIR/venv/bin/pip" install --quiet \
     "diffusers==0.39.0" \
     "accelerate==1.14.0" \
@@ -57,7 +57,7 @@ echo "==> Installing pinned dependencies (versions matched to the LoRAlab venv t
     "transformers==5.14.1" \
     "safetensors==0.8.0" \
     "insightface==1.0.1" \
-    "opencv-python==5.0.0" \
+    "opencv-python==5.0.0.93" \
     "onnxruntime==1.28.0" \
     "numpy==2.4.4" \
     "Pillow==12.2.0"

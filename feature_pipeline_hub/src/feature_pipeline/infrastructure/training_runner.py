@@ -23,11 +23,6 @@ from feature_pipeline.infrastructure.storage import training_runtime_dir
 
 PYTHON_ENV = "FTI_TRAINING_PYTHON"
 
-# Absolute path to the run's settings.json, passed to the worker via env var —
-# same convention LoRAlab's own scripts use (TRAIN_SETTINGS_PATH), so a ported
-# script barely changes at all: only where it reads the path from.
-SETTINGS_PATH_ENV = "FTI_TRAINING_SETTINGS_PATH"
-
 
 @dataclass(frozen=True)
 class TrainingEnvironment:
@@ -83,10 +78,17 @@ def launch(
     script: Path,
     settings: dict,
     run_dir: Path,
+    settings_path_env: str,
     environment: TrainingEnvironment | None = None,
     extra_env: dict[str, str] | None = None,
 ) -> tuple[int, str]:
     """Write `settings` to `run_dir/settings.json` and launch `script` against it, detached.
+
+    `settings_path_env` is the env var name the *ported script itself* reads its
+    config path from — e.g. "PRECACHE_SETTINGS_PATH" or "TRAIN_SETTINGS_PATH",
+    LoRAlab's own names, left completely untouched in workers/*.py so the ported
+    scripts stay byte-for-byte identical to their originals apart from
+    PROJECT_ROOT's directory depth.
 
     Returns (pid, log_path) immediately — the caller persists these (see
     training_repository.create_training_run) rather than waiting on the process.
@@ -102,7 +104,7 @@ def launch(
 
     process_env = {
         **os.environ,
-        SETTINGS_PATH_ENV: str(settings_path),
+        settings_path_env: str(settings_path),
         **(extra_env or {}),
     }
 

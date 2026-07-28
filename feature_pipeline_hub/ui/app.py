@@ -1,9 +1,9 @@
 """Streamlit entry point: FTI Feature Pipeline Hub.
 
-The dataset curation flow is sequential — import, curate, check quality, export —
-so the steps are pages of a top navigation rather than free-floating tabs. The
-body of this script runs before the selected page, which is what puts the context
-bar on every step without repeating it.
+The dataset curation flow is sequential — import, curate, check quality, export,
+train — so the steps are pages of a top navigation rather than free-floating
+tabs. The body of this script runs before the selected page, which is what puts
+the context bar on every step without repeating it.
 """
 
 import sys
@@ -25,6 +25,7 @@ st.navigation(
         st.Page(state.CURATE_STEP, title="2 · Curate"),
         st.Page(state.QUALITY_STEP, title="3 · Quality"),
         st.Page(state.EXPORT_STEP, title="4 · Export"),
+        st.Page(state.TRAIN_STEP, title="5 · Train"),
     ],
     position="top",
 ).run()
