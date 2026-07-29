@@ -92,7 +92,8 @@ def render() -> None:
         width=0,
     )
 
-    with st.container(horizontal=True, vertical_alignment="center"):
+    toolbar = st.container(horizontal=True, vertical_alignment="center")
+    with toolbar:
         chosen_filter = st.segmented_control(
             "Show",
             list(FILTERS),
@@ -105,13 +106,6 @@ def render() -> None:
             columns_per_row = st.select_slider(
                 "Columns", options=[2, 3, 4, 5, 6], value=6, key=f"gallery_cols_{run.run_id}"
             )
-        if st.button(
-            "Renombrar (F2)",
-            icon=":material/find_replace:",
-            help="Reemplazar palabra en los captions (F2)",
-            key=f"btn_rename_{run.run_id}",
-        ):
-            _render_rename_dialog(run)
 
     trigger = run.concept.trigger_word
     samples = [s for s in run.concept.samples if FILTERS[chosen_filter](s, trigger)]
@@ -119,9 +113,19 @@ def render() -> None:
         st.caption(f"No images match '{chosen_filter}'.")
         return
 
-    # Before the grid: selecting all writes the checkboxes' session keys, which
+    # Rendered into the same toolbar row as the filters above. Also needs to run
+    # before the grid: selecting all writes the checkboxes' session keys, which
     # Streamlit only allows while those widgets do not yet exist on this run.
-    recaption_panel.render_toolbar(run, samples)
+    recaption_panel.render_toolbar(run, samples, container=toolbar)
+
+    with toolbar:
+        if st.button(
+            "Renombrar (F2)",
+            icon=":material/find_replace:",
+            help="Reemplazar palabra en los captions (F2)",
+            key=f"btn_rename_{run.run_id}",
+        ):
+            _render_rename_dialog(run)
 
     for row_start in range(0, len(samples), columns_per_row):
         row = samples[row_start : row_start + columns_per_row]

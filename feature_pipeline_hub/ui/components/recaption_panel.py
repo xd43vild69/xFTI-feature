@@ -17,11 +17,22 @@ from feature_pipeline.infrastructure import recaption_runner
 DETAILED_KEY = "recaption_detailed"
 
 
-def render_toolbar(run: IngestionRun, visible: list[DatasetSample]) -> None:
-    """Selection controls plus the recaption action, above the grid."""
+def render_toolbar(
+    run: IngestionRun,
+    visible: list[DatasetSample],
+    container: "st.delta_generator.DeltaGenerator | None" = None,
+) -> None:
+    """Selection controls plus the recaption action.
+
+    Renders into `container` when given, so it shares a row with the
+    gallery's own filter/rename buttons instead of a separate one.
+    """
     selected = state.selected_samples(run)
 
-    with st.container(horizontal=True, vertical_alignment="center"):
+    ctx = container if container is not None else st.container(
+        horizontal=True, vertical_alignment="center"
+    )
+    with ctx:
         st.caption(f"{len(selected)} selected")
 
         if st.button("All", type="tertiary", help="Select every image shown"):
