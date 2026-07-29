@@ -2093,7 +2093,8 @@ def train_krea2():
     # Guardar también el resume_checkpoint al terminar: en el pipeline progresivo
     # es el hand-off de pesos que carga la fase siguiente vía init_lora_from.
     save_checkpoint_now(TOTAL_STEPS)
-    final = os.path.join(OUTPUT_DIR, "Krea2_FINAL_LoRA.safetensors")
+    final_name = f"{PROJECT_NAME}.safetensors" if PROJECT_NAME else "Krea2_FINAL_LoRA.safetensors"
+    final = os.path.join(OUTPUT_DIR, final_name)
     if ema is not None:
         ema.apply()
     try:
