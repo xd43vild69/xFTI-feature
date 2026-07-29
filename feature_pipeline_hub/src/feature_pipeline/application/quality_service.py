@@ -13,7 +13,7 @@ from feature_pipeline.application.image_service import (
 )
 from feature_pipeline.domain.models import DatasetSample, DuplicateCluster
 
-DEFAULT_PHASH_THRESHOLD = 5
+DEFAULT_PHASH_THRESHOLD = 16
 # pHash and dHash both work on luminance, so flat or low-detail images (renders,
 # screenshots, plain backdrops) hash the same regardless of colour. A colour-hash
 # check vetoes those false positives.
