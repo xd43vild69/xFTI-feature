@@ -93,6 +93,10 @@ DEFAULTS = {
     "preview_cfg": 3.5,
     "preview_caption_mode": "first",
     "project_name": "",
+    # Nombre del .safetensors final, sin extensión. Existe aparte de
+    # project_name porque ése además reescribe cache_dir/output_dir (ver más
+    # abajo), y aquí sólo queremos renombrar el fichero, no mover carpetas.
+    "output_name": "",
     "trigger_word": "",
     "lora_target": "all",
     "compact_text": True,
@@ -276,6 +280,7 @@ PREVIEW_CFG       = _cfg("preview_cfg")
 PREVIEW_CAPTION_MODE = _cfg("preview_caption_mode")
 TRIGGER_WORD      = _cfg("trigger_word")
 PROJECT_NAME      = _cfg("project_name").strip()
+OUTPUT_NAME       = str(_cfg("output_name")).strip()
 LORA_TARGET       = str(_cfg("lora_target")).strip().lower()
 COMPACT_TEXT      = bool(_cfg("compact_text"))
 INIT_LORA_FROM    = str(_cfg("init_lora_from")).strip()
@@ -418,6 +423,7 @@ def _print_effective_config():
     rows = [
         ("model_id",             MODEL_ID),
         ("project_name",         PROJECT_NAME or "(default)"),
+        ("output_name",          OUTPUT_NAME or "(Krea2_FINAL_LoRA)"),
         ("trigger_word",         TRIGGER_WORD),
         ("cache_dir",            CACHE_DIR),
         ("output_dir",           OUTPUT_DIR),
@@ -2093,8 +2099,8 @@ def train_krea2():
     # Guardar también el resume_checkpoint al terminar: en el pipeline progresivo
     # es el hand-off de pesos que carga la fase siguiente vía init_lora_from.
     save_checkpoint_now(TOTAL_STEPS)
-    final_name = f"{PROJECT_NAME}.safetensors" if PROJECT_NAME else "Krea2_FINAL_LoRA.safetensors"
-    final = os.path.join(OUTPUT_DIR, final_name)
+    name = OUTPUT_NAME or PROJECT_NAME
+    final = os.path.join(OUTPUT_DIR, f"{name}.safetensors" if name else "Krea2_FINAL_LoRA.safetensors")
     if ema is not None:
         ema.apply()
     try:
