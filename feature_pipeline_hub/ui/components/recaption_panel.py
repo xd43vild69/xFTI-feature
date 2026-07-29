@@ -1,9 +1,10 @@
 """Batch AI recaptioning from the curation grid.
 
 Captions come from the same Qwen3-VL-4B that Krea 2 uses as its text encoder,
-run in the LoRAlab checkout as a subprocess. A batch costs a few seconds of model
-load plus roughly two seconds per image on GPU, so the run is shown with live
-progress rather than a spinner.
+run as a subprocess against the training runtime's own venv and model copy
+(see recaption_runner.py). A batch costs a few seconds of model load plus
+roughly two seconds per image on GPU, so the run is shown with live progress
+rather than a spinner.
 """
 
 import streamlit as st

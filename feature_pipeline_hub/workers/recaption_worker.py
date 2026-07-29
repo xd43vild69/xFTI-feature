@@ -1,17 +1,18 @@
-"""Standalone recaption worker — runs under the LoRAlab virtualenv, not this project's.
+"""Standalone recaption worker — runs under the training runtime's virtualenv, not this project's.
 
 Loading Qwen3-VL needs torch/transformers/accelerate (~6 GB of dependencies) and
 ~9 GB of VRAM, so instead of pulling that into the hub this script is launched as
-a subprocess against LoRAlab's interpreter. It loads the model once, captions the
-images it is given, and exits — which is what releases the VRAM.
+a subprocess against training_runtime/venv's interpreter (the same one training
+and pre-cache use). It loads the model once, captions the images it is given, and
+exits — which is what releases the VRAM.
 
-The captioning itself is not reimplemented: `caption_qwen3vl` is imported straight
-from the LoRAlab checkout so both projects stay on exactly the same model, prompts
-and decoding parameters.
+The captioning itself is not reimplemented: `caption_qwen3vl` is vendored
+alongside this script (see that file's docstring) so both projects stay on
+exactly the same model, prompts and decoding parameters.
 
 Protocol: a JSON job on stdin, JSON Lines events on stdout.
 
-    job    {"loralab_root": str, "images": [str], "detailed": bool}
+    job    {"text_encoder_dir": str, "images": [str], "detailed": bool}
     events {"event": "loaded",  "device": str, "seconds": float}
            {"event": "caption", "path": str, "caption": str, "seconds": float}
            {"event": "error",   "path": str, "message": str}
@@ -19,7 +20,6 @@ Protocol: a JSON job on stdin, JSON Lines events on stdout.
 """
 
 import json
-import os
 import sys
 import time
 
@@ -35,12 +35,9 @@ def main() -> int:
         pass
 
     job = json.load(sys.stdin)
-    loralab_root = job["loralab_root"]
+    text_encoder_dir = job["text_encoder_dir"]
     images = job["images"]
     detailed = bool(job.get("detailed", False))
-
-    sys.path.insert(0, os.path.join(loralab_root, "scripts", "python"))
-    text_encoder_dir = os.path.join(loralab_root, "Krea-2-NF4", "text_encoder")
 
     import torch
     from caption_qwen3vl import generate_caption, load_captioner
