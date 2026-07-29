@@ -281,6 +281,12 @@ PREVIEW_CAPTION_MODE = _cfg("preview_caption_mode")
 TRIGGER_WORD      = _cfg("trigger_word")
 PROJECT_NAME      = _cfg("project_name").strip()
 OUTPUT_NAME       = str(_cfg("output_name")).strip()
+# Nombres de los .safetensors de salida. El prefijo por paso y el nombre final
+# se derivan aquí a propósito: rotate_checkpoints arma su regex desde
+# STEP_CKPT_PREFIX, así que renombrar no puede dejar la poda sin coincidir.
+_LORA_BASENAME    = OUTPUT_NAME or PROJECT_NAME
+STEP_CKPT_PREFIX  = f"{_LORA_BASENAME}_step_" if _LORA_BASENAME else "Krea2_LoRA_step_"
+FINAL_CKPT_NAME   = f"{_LORA_BASENAME}.safetensors" if _LORA_BASENAME else "Krea2_FINAL_LoRA.safetensors"
 LORA_TARGET       = str(_cfg("lora_target")).strip().lower()
 COMPACT_TEXT      = bool(_cfg("compact_text"))
 INIT_LORA_FROM    = str(_cfg("init_lora_from")).strip()
@@ -882,7 +888,7 @@ def rotate_checkpoints(output_dir, keep):
         return
     found = []
     for name in os.listdir(output_dir):
-        match = re.fullmatch(r"Krea2_LoRA_step_(\d+)\.safetensors", name)
+        match = re.fullmatch(re.escape(STEP_CKPT_PREFIX) + r"(\d+)\.safetensors", name)
         if match:
             found.append((int(match.group(1)), os.path.join(output_dir, name)))
     found.sort(key=lambda pair: pair[0])
@@ -1498,7 +1504,7 @@ def train_krea2():
             if RUN_ID:
                 _atomic_write(RUN_ID_FILE, lambda p: open(p, "w", encoding="utf-8").write(RUN_ID))
 
-            ckpt = os.path.join(OUTPUT_DIR, f"Krea2_LoRA_step_{current_s}.safetensors")
+            ckpt = os.path.join(OUTPUT_DIR, f"{STEP_CKPT_PREFIX}{current_s}.safetensors")
             # El LoRA que se entrega es el EMA; el resume_checkpoint conserva los
             # pesos crudos para no doble-suavizar en cada reinicio.
             if ema is not None:
@@ -2099,8 +2105,7 @@ def train_krea2():
     # Guardar también el resume_checkpoint al terminar: en el pipeline progresivo
     # es el hand-off de pesos que carga la fase siguiente vía init_lora_from.
     save_checkpoint_now(TOTAL_STEPS)
-    name = OUTPUT_NAME or PROJECT_NAME
-    final = os.path.join(OUTPUT_DIR, f"{name}.safetensors" if name else "Krea2_FINAL_LoRA.safetensors")
+    final = os.path.join(OUTPUT_DIR, FINAL_CKPT_NAME)
     if ema is not None:
         ema.apply()
     try:
