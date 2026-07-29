@@ -46,8 +46,8 @@ def save_ingestion_run(conn: sqlite3.Connection, run: IngestionRun) -> None:
             INSERT INTO samples
                 (sample_id, run_id, file_path, caption, original_caption,
                  width, height, aspect_ratio, image_format, phash, dhash, colorhash,
-                 is_duplicate, is_excluded, is_valid, validation_errors, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 is_duplicate, is_excluded, is_flagged, is_valid, validation_errors, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -65,6 +65,7 @@ def save_ingestion_run(conn: sqlite3.Connection, run: IngestionRun) -> None:
                     s.metrics.colorhash,
                     int(s.is_duplicate),
                     int(s.is_excluded),
+                    int(s.is_flagged),
                     int(s.is_valid),
                     json.dumps(s.validation_errors),
                     now,
@@ -129,6 +130,7 @@ def load_ingestion_run(conn: sqlite3.Connection, run_id: str) -> IngestionRun | 
             ),
             is_duplicate=bool(row["is_duplicate"]),
             is_excluded=bool(row["is_excluded"]),
+            is_flagged=bool(row["is_flagged"]),
             is_valid=bool(row["is_valid"]),
             validation_errors=json.loads(row["validation_errors"]),
         )

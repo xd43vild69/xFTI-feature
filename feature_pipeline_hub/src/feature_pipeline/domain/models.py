@@ -1,14 +1,23 @@
 """Pydantic schemas for the Feature Pipeline domain: samples, concepts, and manifests."""
 
 from datetime import datetime, timezone
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+SourceKind = Literal["folder", "upload"]
+
+# `concept_name` becomes a directory name under training_runtime/datasets (see
+# training_service.dataset_dir_for), so it has to stay a single, harmless path
+# segment. Validated rather than sanitised: silently rewriting a name the user
+# typed would point the training job at a folder they never asked for.
+PathSafeName = Annotated[str, Field(min_length=1)]
 
 
 class ImageMetrics(BaseModel):
-    width: int
-    height: int
-    aspect_ratio: float
+    width: int = Field(gt=0)
+    height: int = Field(gt=0)
+    aspect_ratio: float = Field(gt=0)
     format: str
     phash: str
     # Empty for runs ingested before these hashes were recorded.
@@ -24,6 +33,7 @@ class DatasetSample(BaseModel):
     metrics: ImageMetrics
     is_duplicate: bool = False
     is_excluded: bool = False  # kept on disk, left out of the curated dataset
+    is_flagged: bool = False  # marked by the user for a second look
     is_valid: bool = True
     validation_errors: list[str] = Field(default_factory=list)
 
@@ -45,9 +55,18 @@ class DuplicateCluster(BaseModel):
 
 class ConceptGroup(BaseModel):
     concept_id: str
-    concept_name: str
+    concept_name: PathSafeName
     trigger_word: str
     samples: list[DatasetSample] = Field(default_factory=list)
+
+    @field_validator("concept_name")
+    @classmethod
+    def _reject_path_traversal(cls, value: str) -> str:
+        if "/" in value or "\\" in value or value in {".", ".."}:
+            raise ValueError(
+                "concept_name is used as a folder name and cannot contain path separators"
+            )
+        return value
 
 
 class IngestionRun(BaseModel):
@@ -59,7 +78,7 @@ class IngestionRun(BaseModel):
 
     run_id: str
     source_path: str
-    source_kind: str  # "folder" | "upload"
+    source_kind: SourceKind
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     concept: ConceptGroup
 
@@ -70,7 +89,7 @@ class IngestionRunSummary(BaseModel):
     run_id: str
     concept_name: str
     trigger_word: str
-    source_kind: str
+    source_kind: SourceKind
     created_at: datetime
     sample_count: int
 

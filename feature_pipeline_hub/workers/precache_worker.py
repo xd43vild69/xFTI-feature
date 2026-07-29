@@ -17,6 +17,7 @@ import os
 import gc
 import math
 import json
+import re
 import hashlib
 import torch
 import torchvision.transforms.functional as F_vision
@@ -115,6 +116,23 @@ if CACHE_KEY not in ("mtime", "sha1"):
 if PRUNE_ORPHANS not in ("warn", "delete", "off"):
     print(f"⚠ Invalid prune_orphans '{PRUNE_ORPHANS}'. Using 'warn' / usando 'warn'.")
     PRUNE_ORPHANS = "warn"
+
+
+def apply_trigger_word(text):
+    """Antepone TRIGGER_WORD salvo que ya esté presente como término suelto.
+
+    Duplica a propósito `caption_service.inject_trigger_word` (fuente de verdad):
+    este worker corre en su propio intérprete y no puede importar el paquete
+    `feature_pipeline`. El criterio de "ya presente" debe seguir siendo el mismo:
+    límites de palabra e insensible a mayúsculas, de modo que `sks_style` no se dé
+    por presente dentro de `sks_stylevariant`.
+    """
+    if not TRIGGER_WORD:
+        return text
+    pattern = re.compile(r"(?<!\w)" + re.escape(TRIGGER_WORD) + r"(?!\w)", flags=re.IGNORECASE)
+    if pattern.search(text):
+        return text
+    return f"{TRIGGER_WORD}, {text}".strip(", ")
 
 
 def res_label(area):
@@ -438,8 +456,7 @@ def preprocess_krea2():
             text = str(spec.get("prompt", "")).strip()
             if not text:
                 continue
-            if TRIGGER_WORD and TRIGGER_WORD.lower() not in text.lower():
-                text = f"{TRIGGER_WORD}, {text}".strip(", ")
+            text = apply_trigger_word(text)
             s_emb, s_msk = pipe.encode_prompt(prompt=text, max_sequence_length=MAX_SEQ_LEN)
             spec["prompt"] = text
             for out_dir, _ in targets:
@@ -459,8 +476,7 @@ def preprocess_krea2():
             if os.path.exists(ruta_texto):
                 with open(ruta_texto, "r", encoding="utf-8") as f:
                     prompt = f.read().strip()
-            if TRIGGER_WORD and TRIGGER_WORD.lower() not in prompt.lower():
-                prompt = f"{TRIGGER_WORD}, {prompt}".strip(", ")
+            prompt = apply_trigger_word(prompt)
 
             # ── D1: ¿se puede reutilizar lo ya cacheado? ────────────────────
             entry = dict(file_fingerprint(ruta_img))

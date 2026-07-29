@@ -76,7 +76,7 @@ def persist_description(sample_id: str, widget_key: str, trigger_word: str) -> N
     if not description:
         return
 
-    save_caption(sample_id, f"{trigger_word}, {description}" if trigger_word else description)
+    save_caption(sample_id, caption_service.inject_trigger_word(description, trigger_word))
     versions = st.session_state.setdefault(CAPTION_VERSIONS_KEY, {})
     versions[sample_id] = versions.get(sample_id, 0) + 1
 

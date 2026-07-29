@@ -10,9 +10,11 @@ train_settings.json in LoRAlab (see `_cfg()` in train_worker.py).
 import sqlite3
 import time
 import uuid
-from dataclasses import dataclass
 from pathlib import Path
 
+from pydantic import BaseModel, ConfigDict, Field
+
+from feature_pipeline.domain.worker_contracts import PrecacheSettings, TrainSettings
 from feature_pipeline.infrastructure import training_repository as repo
 from feature_pipeline.infrastructure import training_runner
 from feature_pipeline.infrastructure.storage import training_runtime_dir
@@ -27,16 +29,24 @@ TRAIN_SETTINGS_ENV = "TRAIN_SETTINGS_PATH"
 PRECACHE_TIMEOUT_SECONDS = 20 * 60  # pre-cache is I/O + VAE-encode bound, minutes not hours
 
 
-@dataclass(frozen=True)
-class TrainingConfig:
-    total_steps: int = 1200
-    lr: float = 1e-4
-    lora_rank: int = 16
-    lora_alpha: int = 32
-    batch_size: int = 1
-    grad_accum_steps: int = 4
-    save_every: int = 25
-    seed: int = 42
+class TrainingConfig(BaseModel):
+    """LoRA hyperparameters chosen in the UI.
+
+    Bounds are enforced here rather than only by the Streamlit widgets, so a value
+    that would waste a run (zero steps, a negative learning rate) is rejected at
+    the point it is built.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    total_steps: int = Field(default=1200, gt=0)
+    lr: float = Field(default=1e-4, gt=0)
+    lora_rank: int = Field(default=16, gt=0)
+    lora_alpha: int = Field(default=32, gt=0)
+    batch_size: int = Field(default=1, gt=0)
+    grad_accum_steps: int = Field(default=4, gt=0)
+    save_every: int = Field(default=25, gt=0)
+    seed: int = Field(default=42, ge=0)
 
 
 class PrecacheFailed(RuntimeError):
@@ -99,12 +109,12 @@ def _run_precache_blocking(
     trigger_word: str,
 ) -> None:
     run_dir = training_runtime_dir() / "runs" / f"precache-{uuid.uuid4()}"
-    settings = {
-        "model_id": str(model_dir),
-        "dataset_path": str(dataset_path),
-        "cache_dir": str(cache_dir),
-        "trigger_word": trigger_word,
-    }
+    settings = PrecacheSettings(
+        model_id=str(model_dir),
+        dataset_path=str(dataset_path),
+        cache_dir=str(cache_dir),
+        trigger_word=trigger_word,
+    ).model_dump()
 
     pid, log_path = training_runner.launch(
         PRECACHE_SCRIPT, settings, run_dir, PRECACHE_SETTINGS_ENV
@@ -149,21 +159,14 @@ def _launch_train(
     run_dir = training_runtime_dir() / "runs" / f"train-{training_run_id_hint}"
     output_dir = run_dir / "checkpoints"
 
-    settings = {
-        "model_id": str(model_dir),
-        "dataset_path": str(dataset_path),
-        "cache_dir": str(cache_dir),
-        "output_dir": str(output_dir),
-        "trigger_word": trigger_word,
-        "total_steps": config.total_steps,
-        "lr": config.lr,
-        "lora_rank": config.lora_rank,
-        "lora_alpha": config.lora_alpha,
-        "batch_size": config.batch_size,
-        "grad_accum_steps": config.grad_accum_steps,
-        "save_every": config.save_every,
-        "seed": config.seed,
-    }
+    settings = TrainSettings(
+        model_id=str(model_dir),
+        dataset_path=str(dataset_path),
+        cache_dir=str(cache_dir),
+        output_dir=str(output_dir),
+        trigger_word=trigger_word,
+        **config.model_dump(),
+    ).model_dump()
 
     pid, log_path = training_runner.launch(TRAIN_SCRIPT, settings, run_dir, TRAIN_SETTINGS_ENV)
 

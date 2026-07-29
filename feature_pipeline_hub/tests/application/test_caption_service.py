@@ -1,7 +1,9 @@
 from feature_pipeline.application.caption_service import (
+    has_trigger,
     inject_trigger_word,
     normalize_caption,
     replace_exact_word,
+    strip_trigger_word,
 )
 
 
@@ -39,6 +41,33 @@ def test_inject_trigger_word_handles_empty_caption():
 
 def test_inject_trigger_word_no_trigger_returns_normalized():
     assert inject_trigger_word("a cat sitting", "") == "a cat sitting"
+
+
+# The trigger is matched on word boundaries anywhere in the caption, not just as a
+# prefix: these are the cases where a substring or startswith check gets it wrong.
+
+
+def test_inject_trigger_word_detects_a_trigger_mid_caption():
+    assert inject_trigger_word("a cat in sks_style clothing", "sks_style") == (
+        "a cat in sks_style clothing"
+    )
+
+
+def test_inject_trigger_word_prepends_when_the_trigger_is_only_a_substring():
+    result = inject_trigger_word("a sks_stylevariant car", "sks_style")
+    assert result == "sks_style, a sks_stylevariant car"
+
+
+def test_has_trigger_matches_exact_terms_only():
+    assert has_trigger("sks_style, a cat", "sks_style")
+    assert has_trigger("a cat, SKS_STYLE", "sks_style")
+    assert not has_trigger("a sks_stylevariant car", "sks_style")
+    assert not has_trigger("anything", "")
+
+
+def test_strip_trigger_word_leaves_unrelated_words_alone():
+    assert strip_trigger_word("a cat in the garden", "cat") == "a  in the garden"
+    assert strip_trigger_word("a caterpillar", "cat") == "a caterpillar"
 
 
 def test_replace_exact_word_case_sensitive():

@@ -1,0 +1,76 @@
+"""The settings/event schemas are the only thing standing between a typo and a
+silently wrong training run, so the failure cases matter more than the happy path."""
+
+import pytest
+from pydantic import ValidationError
+
+from feature_pipeline.domain.worker_contracts import (
+    CaptionEvent,
+    FailedEvent,
+    PrecacheSettings,
+    TrainSettings,
+    recaption_event_adapter,
+)
+
+VALID_TRAIN = {
+    "model_id": "/models/krea2",
+    "dataset_path": "/datasets/cats",
+    "cache_dir": "/cache/cats",
+    "output_dir": "/runs/train-1/checkpoints",
+    "trigger_word": "sks_cat",
+    "total_steps": 1200,
+    "lr": 1e-4,
+    "lora_rank": 16,
+    "lora_alpha": 32,
+    "batch_size": 1,
+    "grad_accum_steps": 4,
+    "save_every": 25,
+    "seed": 42,
+}
+
+
+def test_train_settings_accept_the_keys_the_worker_reads():
+    assert TrainSettings(**VALID_TRAIN).model_dump() == VALID_TRAIN
+
+
+def test_an_unknown_key_is_rejected_instead_of_silently_ignored():
+    with pytest.raises(ValidationError):
+        TrainSettings(**VALID_TRAIN | {"total_setps": 1200})
+
+
+def test_a_run_that_would_do_nothing_is_rejected():
+    with pytest.raises(ValidationError):
+        TrainSettings(**VALID_TRAIN | {"total_steps": 0})
+    with pytest.raises(ValidationError):
+        TrainSettings(**VALID_TRAIN | {"lr": 0.0})
+
+
+def test_precache_settings_require_the_paths():
+    with pytest.raises(ValidationError):
+        PrecacheSettings(model_id="/models/krea2", dataset_path="/datasets/cats")
+
+
+def test_events_are_parsed_into_their_own_type():
+    event = recaption_event_adapter.validate_python(
+        {"event": "caption", "path": "/data/a.png", "caption": "a red car", "seconds": 2.0}
+    )
+    assert isinstance(event, CaptionEvent)
+    assert event.caption == "a red car"
+
+    assert isinstance(
+        recaption_event_adapter.validate_python({"event": "failed", "message": "boom"}),
+        FailedEvent,
+    )
+
+
+def test_worker_noise_does_not_parse_as_an_event():
+    with pytest.raises(ValidationError):
+        recaption_event_adapter.validate_python({"event": "progress_bar", "pct": 40})
+
+
+def test_unknown_fields_on_a_known_event_are_tolerated():
+    """A newer worker adding a field must not break an older hub."""
+    event = recaption_event_adapter.validate_python(
+        {"event": "caption", "path": "/data/a.png", "caption": "x", "model_revision": "abc"}
+    )
+    assert isinstance(event, CaptionEvent)

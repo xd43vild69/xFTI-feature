@@ -6,6 +6,7 @@ plain values, so the UI can recompute freely without touching disk.
 
 from collections import Counter
 
+from feature_pipeline.application.caption_service import strip_trigger_word
 from feature_pipeline.application.image_service import (
     classify_aspect_ratio,
     color_distance,
@@ -83,7 +84,7 @@ def describes_nothing(caption: str, trigger_word: str) -> bool:
     `original_caption`) means a description typed by hand clears the alert without
     having to re-ingest.
     """
-    remainder = caption.replace(trigger_word, "") if trigger_word else caption
+    remainder = strip_trigger_word(caption, trigger_word)
     return not remainder.strip(" ,.\n\t")
 
 

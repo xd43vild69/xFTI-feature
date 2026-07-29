@@ -8,8 +8,17 @@ caption ends up indistinguishable in shape from a hand-written one.
 from collections.abc import Iterator
 from dataclasses import dataclass
 
+from pydantic import ValidationError
+
 from feature_pipeline.application.caption_service import inject_trigger_word
 from feature_pipeline.domain.models import DatasetSample
+from feature_pipeline.domain.worker_contracts import (
+    CaptionEvent,
+    ErrorEvent,
+    FailedEvent,
+    LoadedEvent,
+    recaption_event_adapter,
+)
 from feature_pipeline.infrastructure import recaption_runner
 
 
@@ -39,32 +48,36 @@ def recaption_samples(
 
     by_path = {sample.image_path: sample for sample in samples}
 
-    for event in recaption_runner.run_recaption(list(by_path), detailed):
-        kind = event.get("event")
+    for raw in recaption_runner.run_recaption(list(by_path), detailed):
+        # The runner is a dumb transport: it forwards every JSON object the worker
+        # prints. Validating here is what turns that stream into the documented
+        # protocol; anything that does not match it is worker noise and is dropped.
+        try:
+            event = recaption_event_adapter.validate_python(raw)
+        except ValidationError:
+            continue
 
-        if kind == "loaded":
-            yield RecaptionProgress(
-                kind="loaded", device=event.get("device", ""), seconds=event.get("seconds", 0.0)
-            )
+        if isinstance(event, LoadedEvent):
+            yield RecaptionProgress(kind="loaded", device=event.device, seconds=event.seconds)
 
-        elif kind == "caption":
-            sample = by_path.get(event.get("path", ""))
+        elif isinstance(event, CaptionEvent):
+            sample = by_path.get(event.path)
             if sample is None:
                 continue
             yield RecaptionProgress(
                 kind="caption",
                 sample_id=sample.sample_id,
-                caption=inject_trigger_word(event.get("caption", ""), trigger_word),
-                seconds=event.get("seconds", 0.0),
+                caption=inject_trigger_word(event.caption, trigger_word),
+                seconds=event.seconds,
             )
 
-        elif kind == "error":
-            sample = by_path.get(event.get("path", ""))
+        elif isinstance(event, ErrorEvent):
+            sample = by_path.get(event.path)
             yield RecaptionProgress(
                 kind="error",
                 sample_id=sample.sample_id if sample else "",
-                message=event.get("message", "Unknown error"),
+                message=event.message,
             )
 
-        elif kind == "failed":
-            yield RecaptionProgress(kind="failed", message=event.get("message", ""))
+        elif isinstance(event, FailedEvent):
+            yield RecaptionProgress(kind="failed", message=event.message)

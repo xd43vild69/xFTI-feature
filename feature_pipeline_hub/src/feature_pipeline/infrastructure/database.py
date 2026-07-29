@@ -103,6 +103,7 @@ SAMPLE_COLUMN_MIGRATIONS = {
     "dhash": "TEXT NOT NULL DEFAULT ''",
     "colorhash": "TEXT NOT NULL DEFAULT ''",
     "is_excluded": "BOOLEAN NOT NULL DEFAULT 0",
+    "is_flagged": "BOOLEAN NOT NULL DEFAULT 0",
 }
 
 
