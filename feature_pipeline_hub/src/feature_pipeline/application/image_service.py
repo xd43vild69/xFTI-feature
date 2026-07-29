@@ -1,8 +1,9 @@
-"""Image analysis: dimension reading, perceptual hashing, and aspect-ratio bucketing."""
+"""Image analysis: dimensions, perceptual hashing, sharpness, and aspect-ratio bucketing."""
 
 from pathlib import Path
 
 import imagehash
+import numpy as np
 from PIL import Image
 
 from feature_pipeline.domain.models import ImageMetrics
@@ -19,14 +20,50 @@ ASPECT_RATIO_BUCKETS: dict[str, float] = {
 BUCKET_TOLERANCE = 0.05
 
 
+SHARPNESS_SAMPLE_SIZE = 512
+
+
+def compute_sharpness(img: Image.Image) -> float:
+    """Variance of the Laplacian: low means blurred or out of focus.
+
+    The image is reduced to a fixed size first because the variance scales with
+    resolution — without that, a large soft photo can outscore a small crisp one and
+    the numbers are not comparable within a set.
+
+    The 3x3 Laplacian is applied directly on a float array rather than through
+    `ImageFilter.Kernel`, which clamps to 0-255 on 8-bit images and would throw away
+    the negative half of the response.
+
+    Note this is only meaningful as a *relative* ranking inside one concept: texture
+    and subject matter move it as much as focus does, so there is no threshold that
+    means "blurry" across datasets.
+    """
+    grey = img.convert("L")
+    grey.thumbnail((SHARPNESS_SAMPLE_SIZE, SHARPNESS_SAMPLE_SIZE), Image.LANCZOS)
+
+    pixels = np.asarray(grey, dtype=np.float64)
+    if pixels.shape[0] < 3 or pixels.shape[1] < 3:
+        return 0.0
+
+    laplacian = (
+        pixels[:-2, 1:-1]
+        + pixels[2:, 1:-1]
+        + pixels[1:-1, :-2]
+        + pixels[1:-1, 2:]
+        - 4 * pixels[1:-1, 1:-1]
+    )
+    return float(laplacian.var())
+
+
 def compute_image_metrics(image_path: str) -> ImageMetrics:
-    """Open an image and derive its dimensions, format, and perceptual hash (pHash)."""
+    """Open an image once and derive its dimensions, format, hashes, and sharpness."""
     with Image.open(image_path) as img:
         width, height = img.size
         image_format = (img.format or Path(image_path).suffix.lstrip(".")).upper()
         phash = str(imagehash.phash(img))
         dhash = str(imagehash.dhash(img))
         colorhash = str(imagehash.colorhash(img))
+        sharpness = compute_sharpness(img)
 
     return ImageMetrics(
         width=width,
@@ -36,6 +73,7 @@ def compute_image_metrics(image_path: str) -> ImageMetrics:
         phash=phash,
         dhash=dhash,
         colorhash=colorhash,
+        sharpness=sharpness,
     )
 
 
@@ -80,6 +118,16 @@ def color_distance(hash_a: str, hash_b: str) -> int:
     return imagehash.hex_to_flathash(hash_a, COLORHASH_BITS) - imagehash.hex_to_flathash(
         hash_b, COLORHASH_BITS
     )
+
+
+SQUARE_TOLERANCE = 0.05
+
+
+def classify_orientation(aspect_ratio: float) -> str:
+    """Coarse landscape / portrait / square rollup of a width/height ratio."""
+    if abs(aspect_ratio - 1.0) <= SQUARE_TOLERANCE:
+        return "square"
+    return "landscape" if aspect_ratio > 1.0 else "portrait"
 
 
 def classify_aspect_ratio(aspect_ratio: float) -> str:

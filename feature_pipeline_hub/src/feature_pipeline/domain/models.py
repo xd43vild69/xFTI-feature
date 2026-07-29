@@ -20,9 +20,12 @@ class ImageMetrics(BaseModel):
     aspect_ratio: float = Field(gt=0)
     format: str
     phash: str
-    # Empty for runs ingested before these hashes were recorded.
+    # Empty/zero for runs ingested before these were recorded.
     dhash: str = ""
     colorhash: str = ""
+    # Variance of the Laplacian. Comparable only within one run — see
+    # image_service.compute_sharpness.
+    sharpness: float = Field(default=0.0, ge=0)
 
 
 class DatasetSample(BaseModel):
@@ -95,6 +98,12 @@ class IngestionRunSummary(BaseModel):
 
 
 class DatasetManifest(BaseModel):
+    """A measurable snapshot of what was exported, so two versions can be compared.
+
+    Without this the quality metrics are recomputed and discarded on every rerun,
+    which makes "is v2 better than v1?" an unanswerable question.
+    """
+
     dataset_name: str
     version: str
     concept_name: str
@@ -103,4 +112,7 @@ class DatasetManifest(BaseModel):
     total_samples: int
     duplicate_count: int
     aspect_ratio_distribution: dict[str, int]
+    orientation_distribution: dict[str, int] = Field(default_factory=dict)
+    median_sharpness: float = 0.0
+    caption_word_stats: dict[str, float] = Field(default_factory=dict)
     content_hash: str

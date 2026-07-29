@@ -23,6 +23,20 @@ def save_ingestion_run(conn: sqlite3.Connection, run: IngestionRun) -> None:
     concept = run.concept
 
     with conn:
+        # `concepts` is what dataset_versions' foreign key points at, so a run has
+        # to leave a row there before it can ever be versioned. Upserted rather
+        # than INSERT OR REPLACE: REPLACE deletes the row first, which a
+        # dataset_versions row referencing it would (rightly) refuse.
+        conn.execute(
+            """
+            INSERT INTO concepts (concept_id, concept_name, trigger_word, created_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(concept_id) DO UPDATE SET
+                concept_name = excluded.concept_name,
+                trigger_word = excluded.trigger_word
+            """,
+            (concept.concept_id, concept.concept_name, concept.trigger_word, now),
+        )
         conn.execute(
             """
             INSERT OR REPLACE INTO ingestion_runs
@@ -46,8 +60,9 @@ def save_ingestion_run(conn: sqlite3.Connection, run: IngestionRun) -> None:
             INSERT INTO samples
                 (sample_id, run_id, file_path, caption, original_caption,
                  width, height, aspect_ratio, image_format, phash, dhash, colorhash,
-                 is_duplicate, is_excluded, is_flagged, is_valid, validation_errors, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 sharpness, is_duplicate, is_excluded, is_flagged, is_valid,
+                 validation_errors, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -63,6 +78,7 @@ def save_ingestion_run(conn: sqlite3.Connection, run: IngestionRun) -> None:
                     s.metrics.phash,
                     s.metrics.dhash,
                     s.metrics.colorhash,
+                    s.metrics.sharpness,
                     int(s.is_duplicate),
                     int(s.is_excluded),
                     int(s.is_flagged),
@@ -127,6 +143,7 @@ def load_ingestion_run(conn: sqlite3.Connection, run_id: str) -> IngestionRun | 
                 phash=row["phash"],
                 dhash=row["dhash"],
                 colorhash=row["colorhash"],
+                sharpness=row["sharpness"],
             ),
             is_duplicate=bool(row["is_duplicate"]),
             is_excluded=bool(row["is_excluded"]),

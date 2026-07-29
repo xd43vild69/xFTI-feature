@@ -1,13 +1,20 @@
 from feature_pipeline.application.quality_service import (
+    CAPTION_WORD_WARNING,
+    TEXT_ENCODER_MAX_TOKENS,
+    TOKENS_PER_WORD,
     aspect_ratio_distribution,
+    blurriest_samples,
     caption_length_stats,
     caption_word_count,
     describes_nothing,
     find_duplicate_clusters,
+    median_sharpness,
+    orientation_distribution,
     perceptual_distance,
     quality_summary,
     resolution_distribution,
     samples_missing_caption,
+    samples_without_source_caption,
 )
 from feature_pipeline.domain.models import DatasetSample, ImageMetrics
 
@@ -27,6 +34,7 @@ def _sample(
     original_caption: str = "a description",
     width: int = 512,
     height: int = 512,
+    sharpness: float = 0.0,
     is_excluded: bool = False,
     is_valid: bool = True,
 ) -> DatasetSample:
@@ -43,10 +51,78 @@ def _sample(
             phash=phash,
             dhash=dhash,
             colorhash=colorhash,
+            sharpness=sharpness,
         ),
         is_excluded=is_excluded,
         is_valid=is_valid,
     )
+
+
+# --- sharpness, orientation, unpaired files ----------------------------------
+
+
+def test_blurriest_samples_ranks_softest_first():
+    samples = [
+        _sample("sharp", sharpness=900.0),
+        _sample("soft", sharpness=12.0),
+        _sample("middling", sharpness=300.0),
+    ]
+
+    assert [s.sample_id for s in blurriest_samples(samples)] == ["soft", "middling", "sharp"]
+
+
+def test_blurriest_samples_skips_excluded_samples():
+    samples = [
+        _sample("dropped", sharpness=5.0, is_excluded=True),
+        _sample("soft", sharpness=40.0),
+    ]
+
+    assert [s.sample_id for s in blurriest_samples(samples)] == ["soft"]
+
+
+def test_a_run_ingested_before_sharpness_existed_produces_no_ranking():
+    samples = [_sample("a", sharpness=0.0), _sample("b", sharpness=0.0)]
+
+    assert blurriest_samples(samples) == []
+
+
+def test_a_flat_image_inside_a_measured_run_ranks_softest():
+    """Zero is a real reading for a uniform image, not the 'unmeasured' sentinel."""
+    samples = [_sample("flat", sharpness=0.0), _sample("detailed", sharpness=900.0)]
+
+    assert [s.sample_id for s in blurriest_samples(samples)] == ["flat", "detailed"]
+
+
+def test_median_sharpness_of_an_even_number_of_samples_averages_the_middle():
+    samples = [_sample(str(i), sharpness=v) for i, v in enumerate([10.0, 20.0, 30.0, 40.0])]
+
+    assert median_sharpness(samples) == 25.0
+
+
+def test_median_sharpness_without_samples_is_zero():
+    assert median_sharpness([]) == 0.0
+
+
+def test_orientation_distribution_rolls_ratios_up_to_three_buckets():
+    samples = [
+        _sample("wide", width=1600, height=900),
+        _sample("tall", width=900, height=1600),
+        _sample("square", width=512, height=512),
+        _sample("also_wide", width=1024, height=768),
+    ]
+
+    assert orientation_distribution(samples) == {"landscape": 2, "portrait": 1, "square": 1}
+
+
+def test_samples_without_source_caption_reads_the_original_not_the_effective_caption():
+    """Ingestion injects the trigger word even with no .txt, so `caption` is never empty."""
+    samples = [
+        _sample("had_txt", original_caption="a red car"),
+        _sample("no_txt", caption="sks_style", original_caption=""),
+        _sample("dropped", original_caption="", is_excluded=True),
+    ]
+
+    assert [s.sample_id for s in samples_without_source_caption(samples)] == ["no_txt"]
 
 
 def test_identical_hashes_have_zero_distance():
@@ -168,9 +244,15 @@ def test_caption_length_stats_summarises_active_samples():
 
 
 def test_caption_length_stats_flags_captions_that_risk_truncation():
-    samples = [_sample("a", caption="word " * 80)]
+    samples = [_sample("a", caption="word " * (CAPTION_WORD_WARNING + 5))]
 
     assert caption_length_stats(samples)["too_long"] == 1
+
+
+def test_the_truncation_warning_tracks_the_text_encoder_budget():
+    """The threshold is derived from max_seq_len, not from CLIP's unrelated 77."""
+    assert CAPTION_WORD_WARNING == int(TEXT_ENCODER_MAX_TOKENS / TOKENS_PER_WORD)
+    assert caption_length_stats([_sample("a", caption="word " * 60)])["too_long"] == 0
 
 
 def test_caption_length_stats_handles_an_empty_dataset():

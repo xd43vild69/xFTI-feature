@@ -13,6 +13,8 @@ import streamlit as st
 import state
 from feature_pipeline.application import quality_service as quality
 from feature_pipeline.domain.models import DatasetSample, DuplicateCluster, IngestionRun
+from feature_pipeline.domain.validators import find_unpaired_files
+from feature_pipeline.infrastructure.storage import scan_caption_files
 
 
 def render() -> None:
@@ -21,7 +23,9 @@ def render() -> None:
         return
 
     _render_duplicates(run)
+    _render_sharpness(run)
     _render_missing_captions(run)
+    _render_orphans(run)
     _render_statistics(run.concept.samples)
 
     if st.button("Continue to export", icon=":material/arrow_forward:"):
@@ -114,6 +118,71 @@ def _render_excluded_samples(run: IngestionRun) -> None:
                     st.rerun()
 
 
+def _render_sharpness(run: IngestionRun) -> None:
+    """The softest images of the run, offered for exclusion.
+
+    Presented as a ranking rather than a pass/fail badge on purpose: the Laplacian
+    variance moves with texture and subject as much as with focus, so it can point
+    at candidates but cannot decide. The call stays with the user.
+    """
+    softest = quality.blurriest_samples(run.concept.samples)
+    if not softest:
+        return
+
+    st.subheader("Sharpness")
+    st.caption(
+        "Least sharp images in this set, softest first. This is a ranking within "
+        "the run, not a verdict — a flat or minimal subject scores low while being "
+        "perfectly in focus."
+    )
+
+    for column, sample in zip(st.columns(len(softest)), softest):
+        with column:
+            state.render_thumbnail(sample.image_path)
+            with st.container(horizontal=True, vertical_alignment="center"):
+                st.caption(f"{sample.metrics.sharpness:.0f}")
+                if st.button(
+                    "",
+                    icon=":material/block:",
+                    type="tertiary",
+                    help="Exclude from the dataset",
+                    key=f"exclude_blur_{run.run_id}_{sample.sample_id}",
+                ):
+                    state.set_excluded([sample.sample_id], True)
+                    st.rerun()
+
+
+def _render_orphans(run: IngestionRun) -> None:
+    """Files in the source folder that never became a usable pair.
+
+    Images without a .txt are read off stored data; orphan .txt files need a listing
+    of the source folder, because ingestion only ever looks a caption up *from* an
+    image and so never sees them.
+    """
+    without_caption = quality.samples_without_source_caption(run.concept.samples)
+    _, orphan_captions = find_unpaired_files(
+        [s.image_path for s in run.concept.samples],
+        scan_caption_files(run.source_path),
+    )
+
+    if not without_caption and not orphan_captions:
+        return
+
+    with st.expander(f"Unpaired files ({len(without_caption) + len(orphan_captions)})"):
+        if without_caption:
+            st.caption(
+                f"{len(without_caption)} image(s) arrived with no .txt file. They carry "
+                "only the trigger word until you describe them above."
+            )
+        if orphan_captions:
+            st.caption(
+                f"{len(orphan_captions)} .txt file(s) in the source folder have no "
+                "matching image, so they were never imported:"
+            )
+            for path in orphan_captions:
+                st.code(Path(path).name, language=None)
+
+
 def _render_missing_captions(run: IngestionRun) -> None:
     st.subheader("Captions")
 
@@ -149,7 +218,9 @@ def _render_statistics(samples: list[DatasetSample]) -> None:
         ratios = quality.aspect_ratio_distribution(samples)
         caption_stats = quality.caption_length_stats(samples)
 
-        col_res, col_ratio = st.columns(2)
+        orientations = quality.orientation_distribution(samples)
+
+        col_res, col_ratio, col_orient = st.columns(3)
         with col_res:
             st.caption("Resolutions")
             st.bar_chart(
@@ -160,6 +231,12 @@ def _render_statistics(samples: list[DatasetSample]) -> None:
             st.caption("Aspect ratios")
             st.bar_chart(
                 pd.DataFrame({"samples": list(ratios.values())}, index=list(ratios)),
+                horizontal=True,
+            )
+        with col_orient:
+            st.caption("Orientation balance")
+            st.bar_chart(
+                pd.DataFrame({"samples": list(orientations.values())}, index=list(orientations)),
                 horizontal=True,
             )
 
@@ -177,6 +254,7 @@ def _render_statistics(samples: list[DatasetSample]) -> None:
         col4.metric(
             "Risk truncation",
             caption_stats["too_long"],
-            help=f"Captions over ~{quality.CAPTION_WORD_WARNING} words tend to exceed "
-            "CLIP's 77-token prompt limit and get cut during training.",
+            help=f"Captions over ~{quality.CAPTION_WORD_WARNING} words risk exceeding the "
+            f"{quality.TEXT_ENCODER_MAX_TOKENS}-token budget the pre-cache step encodes "
+            "with, and would get cut during training.",
         )

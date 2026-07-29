@@ -11,10 +11,17 @@ import streamlit as st
 from PIL import Image
 
 from feature_pipeline.application import caption_service, image_service
-from feature_pipeline.domain.models import DatasetSample, IngestionRun, IngestionRunSummary
+from feature_pipeline.domain.models import (
+    ConceptGroup,
+    DatasetManifest,
+    DatasetSample,
+    IngestionRun,
+    IngestionRunSummary,
+)
 from feature_pipeline.infrastructure import ingestion_repository as repo
 from feature_pipeline.infrastructure import training_repository as training_repo
 from feature_pipeline.infrastructure import training_runner
+from feature_pipeline.infrastructure import version_repository as version_repo
 from feature_pipeline.infrastructure.database import get_connection
 from feature_pipeline.infrastructure.storage import delete_managed_folder, write_caption_sidecar
 
@@ -185,6 +192,24 @@ def is_training_active() -> bool:
 def mark_duplicates(run_id: str, sample_ids: list[str]) -> None:
     with _db() as conn:
         repo.mark_duplicates(conn, run_id, sample_ids)
+
+
+def save_dataset_version(
+    concept: ConceptGroup, version_tag: str, manifest: DatasetManifest, exported_path: str
+) -> str:
+    with _db() as conn:
+        return version_repo.create_dataset_version(
+            conn,
+            concept=concept,
+            version_tag=version_tag,
+            manifest=manifest,
+            exported_path=exported_path,
+        )
+
+
+def latest_dataset_version(concept_id: str) -> version_repo.DatasetVersion | None:
+    with _db() as conn:
+        return version_repo.latest_version_for_concept(conn, concept_id)
 
 
 def delete_run(run_id: str) -> None:

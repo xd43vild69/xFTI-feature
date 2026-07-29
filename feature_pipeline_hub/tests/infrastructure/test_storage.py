@@ -8,6 +8,7 @@ from feature_pipeline.infrastructure.storage import (
     delete_managed_folder,
     raw_data_dir,
     read_caption_for_image,
+    scan_caption_files,
     run_upload_dir,
     save_uploaded_files,
     scan_raw_folder,
@@ -198,3 +199,19 @@ def test_clear_training_dataset_dir_is_a_no_op_when_nothing_exists(tmp_path: Pat
     monkeypatch.setenv("FTI_TRAINING_RUNTIME_DIR", str(tmp_path))
 
     clear_training_dataset_dir("never_exported")  # must not raise
+
+
+def test_scan_caption_files_finds_txt_sidecars(tmp_path):
+    (tmp_path / "a.png").write_bytes(b"pixels")
+    (tmp_path / "a.txt").write_text("a cat")
+    (tmp_path / "orphan.txt").write_text("no image for this one")
+    (tmp_path / "a.txt.bak").write_text("older caption")
+
+    found = [Path(p).name for p in scan_caption_files(str(tmp_path))]
+
+    assert found == ["a.txt", "orphan.txt"]
+
+
+def test_scan_caption_files_of_a_missing_folder_is_empty(tmp_path):
+    """Used for reporting on a run whose source folder may since have been moved."""
+    assert scan_caption_files(str(tmp_path / "gone")) == []

@@ -238,3 +238,23 @@ def test_a_database_created_before_dhash_and_exclusion_is_migrated(tmp_path):
     assert loaded is not None
     assert loaded.concept.samples[0].metrics.dhash == ""
     assert loaded.concept.samples[0].is_excluded is False
+    # Never measured, so it must read back as "unknown" rather than "perfectly soft".
+    assert loaded.concept.samples[0].metrics.sharpness == 0.0
+
+
+def test_sharpness_round_trips_through_storage(conn):
+    run = _make_run("r1", n_samples=1)
+    run.concept.samples[0].metrics.sharpness = 412.5
+
+    save_ingestion_run(conn, run)
+    loaded = load_ingestion_run(conn, "r1")
+
+    assert loaded.concept.samples[0].metrics.sharpness == 412.5
+
+
+def test_saving_a_run_registers_its_concept(conn):
+    """dataset_versions' foreign key points at `concepts`, which used to stay empty."""
+    save_ingestion_run(conn, _make_run("r1", concept_name="cyberpunk"))
+
+    row = conn.execute("SELECT concept_name, trigger_word FROM concepts").fetchone()
+    assert row["concept_name"] == "cyberpunk"

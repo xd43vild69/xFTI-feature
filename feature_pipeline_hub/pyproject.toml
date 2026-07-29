@@ -7,6 +7,7 @@ dependencies = [
     "pydantic>=2.7",
     "pillow>=10.0",
     "imagehash>=4.3",
+    "numpy>=1.26",
     "streamlit>=1.35",
 ]
 

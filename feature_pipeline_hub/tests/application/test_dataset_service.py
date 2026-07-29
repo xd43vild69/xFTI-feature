@@ -3,9 +3,12 @@ from pathlib import Path
 from PIL import Image
 
 from feature_pipeline.application.dataset_service import (
+    build_manifest,
+    compute_content_hash,
     create_ingestion_run,
     ingest_concept_from_folder,
 )
+from feature_pipeline.domain.models import ConceptGroup, DatasetSample, ImageMetrics
 
 
 def _make_image(path: Path, size=(512, 512)) -> None:
@@ -115,3 +118,100 @@ def test_create_ingestion_run_accepts_a_caller_supplied_run_id(tmp_path: Path):
 
     assert run.run_id == "run-42"
     assert run.concept.trigger_word == "sks_cat"
+
+
+# --- manifest -----------------------------------------------------------------
+
+
+def _concept_with(samples: list[DatasetSample]) -> ConceptGroup:
+    return ConceptGroup(
+        concept_id="c1",
+        concept_name="cyberpunk",
+        trigger_word="sks_style",
+        samples=samples,
+    )
+
+
+def _sample(
+    sample_id: str,
+    phash: str = "0000000000000000",
+    caption: str = "sks_style, a cat",
+    sharpness: float = 100.0,
+    is_excluded: bool = False,
+    is_duplicate: bool = False,
+) -> DatasetSample:
+    return DatasetSample(
+        sample_id=sample_id,
+        image_path=f"/data/{sample_id}.png",
+        caption=caption,
+        original_caption=caption,
+        metrics=ImageMetrics(
+            width=512,
+            height=512,
+            aspect_ratio=1.0,
+            format="PNG",
+            phash=phash,
+            sharpness=sharpness,
+        ),
+        is_excluded=is_excluded,
+        is_duplicate=is_duplicate,
+    )
+
+
+def test_content_hash_ignores_the_order_samples_arrive_in():
+    a, b = _sample("a", phash="1111111111111111"), _sample("b", phash="2222222222222222")
+
+    assert compute_content_hash([a, b]) == compute_content_hash([b, a])
+
+
+def test_content_hash_changes_when_a_caption_is_edited():
+    before = compute_content_hash([_sample("a", caption="sks_style, a cat")])
+    after = compute_content_hash([_sample("a", caption="sks_style, a dog")])
+
+    assert before != after
+
+
+def test_content_hash_changes_when_a_sample_is_excluded():
+    samples = [_sample("a"), _sample("b", phash="2222222222222222")]
+    fewer = [_sample("a"), _sample("b", phash="2222222222222222", is_excluded=True)]
+
+    assert compute_content_hash(samples) != compute_content_hash(fewer)
+
+
+def test_content_hash_ignores_samples_that_were_already_excluded():
+    kept = [_sample("a")]
+    kept_plus_dropped = [_sample("a"), _sample("b", phash="9999999999999999", is_excluded=True)]
+
+    assert compute_content_hash(kept) == compute_content_hash(kept_plus_dropped)
+
+
+def test_build_manifest_snapshots_the_active_samples():
+    concept = _concept_with(
+        [
+            _sample("a", phash="1111111111111111", sharpness=100.0),
+            _sample("b", phash="2222222222222222", sharpness=300.0, is_duplicate=True),
+            _sample("c", phash="3333333333333333", is_excluded=True),
+        ]
+    )
+
+    manifest = build_manifest(concept, version="v1", dataset_name="cyberpunk_export")
+
+    assert manifest.dataset_name == "cyberpunk_export"
+    assert manifest.version == "v1"
+    assert manifest.concept_name == "cyberpunk"
+    assert manifest.total_samples == 2
+    assert manifest.duplicate_count == 1
+    assert manifest.orientation_distribution == {"square": 2}
+    assert manifest.median_sharpness == 200.0
+    assert manifest.aspect_ratio_distribution == {"1:1": 2}
+    assert len(manifest.content_hash) == 64
+
+
+def test_two_manifests_of_the_same_content_share_a_hash():
+    concept = _concept_with([_sample("a")])
+
+    first = build_manifest(concept, version="v1", dataset_name="d")
+    second = build_manifest(concept, version="v2", dataset_name="d")
+
+    assert first.content_hash == second.content_hash
+    assert first.version != second.version

@@ -1,12 +1,14 @@
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageFilter
 
 from feature_pipeline.application.image_service import (
     classify_aspect_ratio,
+    classify_orientation,
     color_distance,
     compute_dhash,
     compute_image_metrics,
+    compute_sharpness,
     hamming_distance,
     make_square_thumbnail,
 )
@@ -159,3 +161,64 @@ def test_make_square_thumbnail_pads_a_narrow_image_with_transparency(tmp_path: P
     assert thumb.getpixel((0, 0))[3] == 0
     assert thumb.getpixel((199, 0))[3] == 0
     assert thumb.getpixel((100, 100))[3] == 255
+
+
+# --- sharpness ----------------------------------------------------------------
+
+
+def _checkerboard(size: tuple[int, int], square: int = 16) -> Image.Image:
+    """Hard-edged pattern: plenty of high-frequency detail for the Laplacian to find."""
+    img = Image.new("L", size)
+    pixels = img.load()
+    for x in range(size[0]):
+        for y in range(size[1]):
+            pixels[x, y] = 255 if ((x // square) + (y // square)) % 2 == 0 else 0
+    return img
+
+
+def test_a_blurred_image_scores_lower_than_the_sharp_original():
+    sharp = _checkerboard((256, 256))
+    blurred = sharp.filter(ImageFilter.GaussianBlur(radius=4))
+
+    assert compute_sharpness(blurred) < compute_sharpness(sharp)
+
+
+def test_a_flat_image_has_no_sharpness():
+    assert compute_sharpness(Image.new("L", (128, 128), color=128)) == 0.0
+
+
+def test_sharpness_is_comparable_across_resolutions():
+    """The same pattern at 1024 and 2048 scores the same, because both are normalised.
+
+    This is what the thumbnail step buys: on the raw variance these two differ by
+    roughly 2x purely because of pixel count, which would let resolution masquerade
+    as focus. Note the invariance holds between images that get resampled — a source
+    already at or below SHARPNESS_SAMPLE_SIZE keeps its own edge response.
+    """
+    at_1024 = compute_sharpness(_checkerboard((1024, 1024), square=32))
+    at_2048 = compute_sharpness(_checkerboard((2048, 2048), square=64))
+
+    assert abs(at_1024 - at_2048) / max(at_1024, at_2048) < 0.05
+
+
+def test_sharpness_is_recorded_alongside_the_hashes(tmp_path: Path):
+    image_path = tmp_path / "pattern.png"
+    _make_patterned_image(image_path, (512, 512), seed=7)
+
+    metrics = compute_image_metrics(str(image_path))
+
+    assert metrics.sharpness > 0
+
+
+def test_a_tiny_image_does_not_break_the_laplacian():
+    assert compute_sharpness(Image.new("L", (2, 2), color=200)) == 0.0
+
+
+# --- orientation --------------------------------------------------------------
+
+
+def test_classify_orientation_rolls_up_to_three_buckets():
+    assert classify_orientation(16 / 9) == "landscape"
+    assert classify_orientation(9 / 16) == "portrait"
+    assert classify_orientation(1.0) == "square"
+    assert classify_orientation(1.02) == "square"

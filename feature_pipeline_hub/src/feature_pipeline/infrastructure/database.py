@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS samples (
     phash TEXT NOT NULL,
     dhash TEXT NOT NULL DEFAULT '',
     colorhash TEXT NOT NULL DEFAULT '',
+    sharpness REAL NOT NULL DEFAULT 0,
     is_duplicate BOOLEAN NOT NULL DEFAULT 0,
     is_excluded BOOLEAN NOT NULL DEFAULT 0,
     is_valid BOOLEAN NOT NULL DEFAULT 1,
@@ -104,6 +105,7 @@ SAMPLE_COLUMN_MIGRATIONS = {
     "colorhash": "TEXT NOT NULL DEFAULT ''",
     "is_excluded": "BOOLEAN NOT NULL DEFAULT 0",
     "is_flagged": "BOOLEAN NOT NULL DEFAULT 0",
+    "sharpness": "REAL NOT NULL DEFAULT 0",
 }
 
 

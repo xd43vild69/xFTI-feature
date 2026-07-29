@@ -9,6 +9,7 @@ from collections import Counter
 from feature_pipeline.application.caption_service import strip_trigger_word
 from feature_pipeline.application.image_service import (
     classify_aspect_ratio,
+    classify_orientation,
     color_distance,
     hamming_distance,
 )
@@ -20,9 +21,14 @@ DEFAULT_PHASH_THRESHOLD = 5
 # check vetoes those false positives.
 COLOR_GUARD_DISTANCE = 4
 MAX_DISTANCE = 64
-# Rough stand-in for CLIP's 77-token prompt limit: prompts beyond roughly this many
-# words tend to get truncated during training.
-CAPTION_WORD_WARNING = 55
+# Captions are encoded by Qwen3-VL, not CLIP: the budget that matters is the
+# `max_seq_len` the pre-cache worker passes to `encode_prompt`, not CLIP's 77.
+# The hub has no tokenizer of its own, so words are converted with a ratio typical
+# of a subword tokenizer on English text. Both numbers are named rather than folded
+# into a constant so the assumption is greppable when max_seq_len changes.
+TEXT_ENCODER_MAX_TOKENS = 128  # workers/precache_worker.py DEFAULTS["max_seq_len"]
+TOKENS_PER_WORD = 1.5
+CAPTION_WORD_WARNING = int(TEXT_ENCODER_MAX_TOKENS / TOKENS_PER_WORD)
 
 
 def perceptual_distance(left: DatasetSample, right: DatasetSample) -> int:
@@ -131,6 +137,61 @@ def aspect_ratio_distribution(samples: list[DatasetSample]) -> dict[str, int]:
         classify_aspect_ratio(s.metrics.aspect_ratio) for s in samples if not s.is_excluded
     )
     return dict(counter.most_common())
+
+
+def orientation_distribution(samples: list[DatasetSample]) -> dict[str, int]:
+    """How many samples are landscape, portrait, or square.
+
+    A coarser rollup than `aspect_ratio_distribution`: the bucket breakdown answers
+    "which ratios do I have", this one answers "is the set balanced".
+    """
+    counter = Counter(
+        classify_orientation(s.metrics.aspect_ratio) for s in samples if not s.is_excluded
+    )
+    return dict(counter.most_common())
+
+
+BLURRIEST_SAMPLE_COUNT = 6
+
+
+def blurriest_samples(
+    samples: list[DatasetSample], count: int = BLURRIEST_SAMPLE_COUNT
+) -> list[DatasetSample]:
+    """The least sharp active samples, softest first.
+
+    Deliberately a ranking and not a threshold: the Laplacian variance depends on
+    subject and texture as much as on focus, so "the softest N in this set" is a
+    claim that holds, while "sharpness < X is blurry" is not.
+
+    Runs ingested before sharpness was recorded carry 0.0 everywhere and produce no
+    ranking at all. A single 0.0 inside a measured run is a real reading, though —
+    a perfectly flat image scores exactly zero — so it must not be filtered out, or
+    the softest image in the set would be the one hidden.
+    """
+    active = [s for s in samples if not s.is_excluded]
+    if not any(s.metrics.sharpness > 0 for s in active):
+        return []
+    return sorted(active, key=lambda s: s.metrics.sharpness)[:count]
+
+
+def median_sharpness(samples: list[DatasetSample]) -> float:
+    """Median sharpness across active samples, or 0.0 when none was recorded."""
+    scores = sorted(s.metrics.sharpness for s in samples if not s.is_excluded)
+    if not scores:
+        return 0.0
+    middle = len(scores) // 2
+    if len(scores) % 2:
+        return round(scores[middle], 2)
+    return round((scores[middle - 1] + scores[middle]) / 2, 2)
+
+
+def samples_without_source_caption(samples: list[DatasetSample]) -> list[DatasetSample]:
+    """Active samples whose source folder had no .txt file at all.
+
+    Read off `original_caption`, which ingestion leaves empty in exactly that case —
+    so this needs no disk access, unlike the mirror check for orphan .txt files.
+    """
+    return [s for s in samples if not s.is_excluded and not s.original_caption.strip()]
 
 
 def quality_summary(

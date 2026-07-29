@@ -31,6 +31,21 @@ def scan_raw_folder(folder_path: str) -> list[str]:
     )
 
 
+def scan_caption_files(folder_path: str) -> list[str]:
+    """List .txt caption file paths in a raw folder (non-recursive).
+
+    The mirror of `scan_raw_folder`: ingestion only ever looks up captions from an
+    image, so a .txt whose image is missing or has an unsupported extension is
+    otherwise invisible. Returns an empty list for a folder that is gone, since
+    this is used for reporting rather than ingestion.
+    """
+    folder = Path(folder_path)
+    if not folder.is_dir():
+        return []
+
+    return sorted(str(p) for p in folder.iterdir() if p.is_file() and p.suffix.lower() == ".txt")
+
+
 def read_caption_for_image(image_path: str) -> str:
     """Read the .txt caption accompanying an image, or return an empty string if missing."""
     caption_path = Path(image_path).with_suffix(".txt")

@@ -1,7 +1,9 @@
 """Feature Store assembly, versioning, and snapshotting."""
 
+import hashlib
 import uuid
 
+from feature_pipeline.application import quality_service
 from feature_pipeline.application.caption_service import inject_trigger_word
 from feature_pipeline.application.image_service import compute_image_metrics
 from feature_pipeline.domain.models import (
@@ -74,10 +76,48 @@ def create_ingestion_run(
     )
 
 
-def build_manifest(concept: ConceptGroup, version: str) -> DatasetManifest:
-    """Assemble a DatasetManifest snapshot for a curated ConceptGroup.
+def compute_content_hash(samples: list[DatasetSample]) -> str:
+    """Fingerprint of what a training run would actually see.
 
-    Placeholder for Iteración 4 (Versionado y Publicación): will compute
-    content_hash and aspect_ratio_distribution, then hand off to hf_exporter.
+    Built from the (pHash, caption) pair of every active sample, sorted so the hash
+    does not depend on scan order. That covers both ways a dataset stops being the
+    same dataset — an image entering or leaving, and a caption being edited — while
+    reading nothing back off disk. Two exports of visually identical but re-encoded
+    files hash the same, which is the intended tolerance.
     """
-    raise NotImplementedError("Implemented in Iteración 4")
+    active = sorted(
+        (s.metrics.phash, s.caption) for s in samples if not s.is_excluded
+    )
+    digest = hashlib.sha256()
+    for phash, caption in active:
+        digest.update(phash.encode("utf-8"))
+        digest.update(b"\x00")
+        digest.update(caption.encode("utf-8"))
+        digest.update(b"\x00")
+    return digest.hexdigest()
+
+
+def build_manifest(concept: ConceptGroup, version: str, dataset_name: str) -> DatasetManifest:
+    """Assemble a comparable snapshot of a curated ConceptGroup.
+
+    `dataset_name` is the export destination rather than the concept name: the same
+    concept can be exported under different folder names, and the manifest records
+    what was written where.
+    """
+    samples = concept.samples
+    active = [s for s in samples if not s.is_excluded]
+
+    return DatasetManifest(
+        dataset_name=dataset_name,
+        version=version,
+        concept_name=concept.concept_name,
+        trigger_word=concept.trigger_word,
+        total_samples=len(active),
+        # The stored flag, like the context bar uses — not a fresh O(n²) clustering.
+        duplicate_count=sum(1 for s in active if s.is_duplicate),
+        aspect_ratio_distribution=quality_service.aspect_ratio_distribution(samples),
+        orientation_distribution=quality_service.orientation_distribution(samples),
+        median_sharpness=quality_service.median_sharpness(samples),
+        caption_word_stats=quality_service.caption_length_stats(samples),
+        content_hash=compute_content_hash(samples),
+    )
