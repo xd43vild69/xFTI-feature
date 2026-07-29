@@ -1,22 +1,20 @@
-"""Launches the recaption worker in the LoRAlab virtualenv and streams its events.
+"""Launches the recaption worker in the training runtime's virtualenv and streams its events.
 
-Qwen3-VL lives in another checkout with its own (heavy) dependency set, so this
-module owns the process boundary: locating that environment, feeding it a job, and
-turning its JSON Lines output back into events the application layer can consume.
+Qwen3-VL is the same text encoder the training runtime already carries a local
+copy of (see training_runner.py / scripts/setup_training_runtime.sh), so
+recaptioning reuses that interpreter and model copy instead of reaching into an
+external checkout. This module owns the process boundary: locating that
+environment, feeding it a job, and turning its JSON Lines output back into
+events the application layer can consume.
 """
 
 import json
-import os
 import subprocess
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
-# Set FTI_LORALAB_ROOT to the AcademiaSD_LoRAlab-Krea2 checkout. There is no
-# default on purpose: the path is machine-specific, and guessing wrong would fail
-# with a confusing import error deep inside the worker.
-LORALAB_ROOT_ENV = "FTI_LORALAB_ROOT"
-PYTHON_ENV = "FTI_RECAPTION_PYTHON"
+from feature_pipeline.infrastructure import training_runner
 
 WORKER = Path(__file__).resolve().parents[3] / "workers" / "recaption_worker.py"
 
@@ -25,12 +23,12 @@ WORKER = Path(__file__).resolve().parents[3] / "workers" / "recaption_worker.py"
 class RecaptionEnvironment:
     """Everything needed to run the worker, already checked to exist on disk."""
 
-    loralab_root: Path
+    runtime_dir: Path
     python: Path
 
     @property
     def model_dir(self) -> Path:
-        return self.loralab_root / "Krea-2-NF4" / "text_encoder"
+        return self.runtime_dir / "model" / "text_encoder"
 
 
 class RecaptionUnavailable(RuntimeError):
@@ -38,35 +36,22 @@ class RecaptionUnavailable(RuntimeError):
 
 
 def resolve_environment() -> RecaptionEnvironment:
-    """Locate the LoRAlab checkout and interpreter, or explain what is missing."""
-    root_value = os.environ.get(LORALAB_ROOT_ENV, "").strip()
-    if not root_value:
+    """Locate the training runtime's interpreter and text encoder, or explain what is missing."""
+    try:
+        training_env = training_runner.resolve_environment()
+    except training_runner.TrainingUnavailable as exc:
         raise RecaptionUnavailable(
-            f"AI recaptioning needs {LORALAB_ROOT_ENV}. Set it to your "
-            "AcademiaSD_LoRAlab-Krea2 checkout before starting the app, e.g. "
-            f'`export {LORALAB_ROOT_ENV}=/path/to/AcademiaSD_LoRAlab-Krea2`.'
-        )
+            f"AI recaptioning reuses the training runtime, which isn't set up yet: {exc}"
+        ) from exc
 
-    root = Path(root_value).expanduser()
-    if not root.is_dir():
-        raise RecaptionUnavailable(f"{LORALAB_ROOT_ENV} points to a missing folder: {root}")
-
-    python_value = os.environ.get(PYTHON_ENV, "").strip()
-    python = Path(python_value).expanduser() if python_value else root / "venv" / "bin" / "python"
-    if not python.is_file():
-        raise RecaptionUnavailable(
-            f"No Python interpreter at {python}. Set {PYTHON_ENV} if the LoRAlab "
-            "virtualenv lives elsewhere."
-        )
-
-    model_dir = root / "Krea-2-NF4" / "text_encoder"
+    model_dir = training_env.model_dir / "text_encoder"
     if not (model_dir / "model.safetensors").is_file():
         raise RecaptionUnavailable(f"No Qwen3-VL weights found at {model_dir}")
 
     if not WORKER.is_file():
         raise RecaptionUnavailable(f"Recaption worker script is missing at {WORKER}")
 
-    return RecaptionEnvironment(loralab_root=root, python=python)
+    return RecaptionEnvironment(runtime_dir=training_env.runtime_dir, python=training_env.python)
 
 
 def is_available() -> bool:
@@ -87,7 +72,7 @@ def run_recaption(
     """
     env = environment or resolve_environment()
     job = json.dumps(
-        {"loralab_root": str(env.loralab_root), "images": image_paths, "detailed": detailed}
+        {"text_encoder_dir": str(env.model_dir), "images": image_paths, "detailed": detailed}
     )
 
     process = subprocess.Popen(

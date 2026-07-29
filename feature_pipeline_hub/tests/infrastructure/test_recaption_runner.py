@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from feature_pipeline.infrastructure import recaption_runner
+from feature_pipeline.infrastructure import recaption_runner, training_runner
 from feature_pipeline.infrastructure.recaption_runner import (
     RecaptionEnvironment,
     RecaptionUnavailable,
@@ -12,71 +12,66 @@ from feature_pipeline.infrastructure.recaption_runner import (
 )
 
 
-def _fake_loralab(tmp_path: Path) -> Path:
-    """A checkout shaped like AcademiaSD_LoRAlab-Krea2, without the 8 GB of weights."""
-    root = tmp_path / "loralab"
-    (root / "Krea-2-NF4" / "text_encoder").mkdir(parents=True)
-    (root / "Krea-2-NF4" / "text_encoder" / "model.safetensors").write_bytes(b"not really weights")
-    (root / "venv" / "bin").mkdir(parents=True)
-    (root / "venv" / "bin" / "python").write_text("#!/bin/sh\n")
-    return root
+def _fake_runtime(tmp_path: Path) -> Path:
+    """A training_runtime/ shaped like scripts/setup_training_runtime.sh produces,
+    without the tens of GB of real weights."""
+    runtime_dir = tmp_path / "training_runtime"
+    for name in ("transformer", "text_encoder", "vae"):
+        (runtime_dir / "model" / name).mkdir(parents=True)
+    (runtime_dir / "model" / "text_encoder" / "model.safetensors").write_bytes(b"not really weights")
+    (runtime_dir / "venv" / "bin").mkdir(parents=True)
+    (runtime_dir / "venv" / "bin" / "python").write_text("#!/bin/sh\n")
+    return runtime_dir
 
 
-def test_missing_env_var_explains_what_to_set(monkeypatch):
-    monkeypatch.delenv(recaption_runner.LORALAB_ROOT_ENV, raising=False)
+def test_missing_training_runtime_is_reported(monkeypatch, tmp_path):
+    monkeypatch.setenv("FTI_TRAINING_RUNTIME_DIR", str(tmp_path / "nope"))
 
-    with pytest.raises(RecaptionUnavailable, match=recaption_runner.LORALAB_ROOT_ENV):
-        resolve_environment()
-
-
-def test_a_nonexistent_root_is_reported(monkeypatch, tmp_path):
-    monkeypatch.setenv(recaption_runner.LORALAB_ROOT_ENV, str(tmp_path / "nope"))
-
-    with pytest.raises(RecaptionUnavailable, match="missing folder"):
+    with pytest.raises(RecaptionUnavailable, match="training runtime"):
         resolve_environment()
 
 
 def test_missing_weights_are_reported(monkeypatch, tmp_path):
-    root = _fake_loralab(tmp_path)
-    (root / "Krea-2-NF4" / "text_encoder" / "model.safetensors").unlink()
-    monkeypatch.setenv(recaption_runner.LORALAB_ROOT_ENV, str(root))
+    runtime_dir = _fake_runtime(tmp_path)
+    (runtime_dir / "model" / "text_encoder" / "model.safetensors").unlink()
+    monkeypatch.setenv("FTI_TRAINING_RUNTIME_DIR", str(runtime_dir))
 
     with pytest.raises(RecaptionUnavailable, match="No Qwen3-VL weights"):
         resolve_environment()
 
 
 def test_missing_interpreter_is_reported(monkeypatch, tmp_path):
-    root = _fake_loralab(tmp_path)
-    (root / "venv" / "bin" / "python").unlink()
-    monkeypatch.setenv(recaption_runner.LORALAB_ROOT_ENV, str(root))
+    runtime_dir = _fake_runtime(tmp_path)
+    (runtime_dir / "venv" / "bin" / "python").unlink()
+    monkeypatch.setenv("FTI_TRAINING_RUNTIME_DIR", str(runtime_dir))
 
-    with pytest.raises(RecaptionUnavailable, match="No Python interpreter"):
+    with pytest.raises(RecaptionUnavailable, match="training runtime"):
         resolve_environment()
 
 
-def test_a_complete_checkout_resolves(monkeypatch, tmp_path):
-    root = _fake_loralab(tmp_path)
-    monkeypatch.setenv(recaption_runner.LORALAB_ROOT_ENV, str(root))
+def test_a_complete_runtime_resolves(monkeypatch, tmp_path):
+    runtime_dir = _fake_runtime(tmp_path)
+    monkeypatch.setenv("FTI_TRAINING_RUNTIME_DIR", str(runtime_dir))
 
     env = resolve_environment()
 
-    assert env.loralab_root == root
-    assert env.python == root / "venv" / "bin" / "python"
-    assert env.model_dir.name == "text_encoder"
+    assert env.runtime_dir == runtime_dir
+    assert env.python == runtime_dir / "venv" / "bin" / "python"
+    assert env.model_dir == runtime_dir / "model" / "text_encoder"
 
 
 def test_the_interpreter_can_be_overridden(monkeypatch, tmp_path):
-    root = _fake_loralab(tmp_path)
+    runtime_dir = _fake_runtime(tmp_path)
     other = tmp_path / "other-python"
     other.write_text("#!/bin/sh\n")
-    monkeypatch.setenv(recaption_runner.LORALAB_ROOT_ENV, str(root))
-    monkeypatch.setenv(recaption_runner.PYTHON_ENV, str(other))
+    monkeypatch.setenv("FTI_TRAINING_RUNTIME_DIR", str(runtime_dir))
+    monkeypatch.setenv(training_runner.PYTHON_ENV, str(other))
 
     assert resolve_environment().python == other
 
 
-def test_is_available_is_false_without_configuration(monkeypatch):
-    monkeypatch.delenv(recaption_runner.LORALAB_ROOT_ENV, raising=False)
+def test_is_available_is_false_without_a_runtime(monkeypatch, tmp_path):
+    monkeypatch.setenv("FTI_TRAINING_RUNTIME_DIR", str(tmp_path / "nope"))
 
     assert recaption_runner.is_available() is False
 
@@ -109,7 +104,7 @@ def stub_environment(tmp_path, monkeypatch):
         worker = tmp_path / "worker.py"
         worker.write_text(script)
         monkeypatch.setattr(recaption_runner, "WORKER", worker)
-        return RecaptionEnvironment(loralab_root=tmp_path, python=Path(sys.executable))
+        return RecaptionEnvironment(runtime_dir=tmp_path, python=Path(sys.executable))
 
     return _install
 
@@ -129,7 +124,7 @@ ECHO_WORKER = """
 import json, sys
 job = json.load(sys.stdin)
 print(json.dumps({"event": "job", "images": job["images"],
-                  "detailed": job["detailed"], "root": job["loralab_root"]}), flush=True)
+                  "detailed": job["detailed"], "text_encoder_dir": job["text_encoder_dir"]}), flush=True)
 """
 
 
@@ -140,7 +135,7 @@ def test_the_job_reaches_the_worker_on_stdin(stub_environment):
 
     assert events[0]["images"] == ["/data/a.png"]
     assert events[0]["detailed"] is True
-    assert events[0]["root"] == str(env.loralab_root)
+    assert events[0]["text_encoder_dir"] == str(env.model_dir)
 
 
 def test_a_crashing_worker_yields_a_failed_event_with_stderr(stub_environment):

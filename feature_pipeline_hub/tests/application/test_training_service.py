@@ -87,6 +87,38 @@ def test_start_training_runs_precache_then_launches_train(
     training_runner.stop_process(train_run.pid, grace_period_seconds=1)
 
 
+def test_train_settings_name_the_lora_after_the_concept(
+    conn, fake_model_dir, tmp_path, monkeypatch
+):
+    """The final .safetensors is named from the concept, via `output_name`.
+
+    Not `project_name`: that key also makes the worker rewrite cache_dir and
+    output_dir out of the run directory, which would strand the pre-cached
+    latents and the progress CSV the UI polls.
+    """
+    monkeypatch.setattr(
+        training_service, "PRECACHE_SCRIPT", _write_stub(tmp_path, SUCCESSFUL_PRECACHE)
+    )
+    monkeypatch.setattr(training_service, "TRAIN_SCRIPT", _write_stub(tmp_path, STUB_TRAIN))
+
+    training_run_id = training_service.start_training(
+        conn,
+        dataset_run_id="run-1",
+        dataset_name="le_bd_v1",
+        trigger_word="sks_test",
+        config=training_service.TrainingConfig(total_steps=20),
+    )
+
+    train_run = repo.get_training_run(conn, training_run_id)
+    assert train_run.config["output_name"] == "le_bd_v1"
+    assert "project_name" not in train_run.config
+    assert train_run.config["output_dir"].endswith("/checkpoints")
+
+    from feature_pipeline.infrastructure import training_runner
+
+    training_runner.stop_process(train_run.pid, grace_period_seconds=1)
+
+
 def test_a_failing_precache_raises_and_never_launches_train(
     conn, fake_model_dir, tmp_path, monkeypatch
 ):

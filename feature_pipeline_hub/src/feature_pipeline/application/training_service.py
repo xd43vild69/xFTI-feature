@@ -81,6 +81,7 @@ def start_training(
     return _launch_train(
         conn,
         dataset_run_id=dataset_run_id,
+        dataset_name=dataset_name,
         model_dir=model_dir,
         dataset_path=dataset_path,
         cache_dir=cache_dir,
@@ -139,6 +140,7 @@ def _launch_train(
     conn: sqlite3.Connection,
     *,
     dataset_run_id: str,
+    dataset_name: str,
     model_dir: Path,
     dataset_path: Path,
     cache_dir: Path,
@@ -155,6 +157,10 @@ def _launch_train(
         "cache_dir": str(cache_dir),
         "output_dir": str(output_dir),
         "trigger_word": trigger_word,
+        # Nombra el .safetensors final con el concept name. No usamos
+        # project_name: esa clave además reescribe cache_dir/output_dir en el
+        # worker, y aquí los pasamos explícitos apuntando al run_dir.
+        "output_name": dataset_name,
         "total_steps": config.total_steps,
         "lr": config.lr,
         "lora_rank": config.lora_rank,

@@ -71,25 +71,21 @@ The application is organized into **five sequential workflow steps** accessible 
 
 ## 🛠️ Setup & Provisioning
 
-### 1. AI Recaptioning Setup (Qwen3-VL Integration)
+### Training Runtime Provisioning
 
-Recaptioning uses a subprocess runner (`workers/recaption_worker.py`) pointing to an external checkout of [AcademiaSD_LoRAlab-Krea2](https://github.com/xd43vild69/AcademiaSD_LoRAlab-Krea2):
-
-```bash
-export FTI_LORALAB_ROOT=/path/to/AcademiaSD_LoRAlab-Krea2
-```
-*(Optional)* Set the Python environment if not located at `<root>/venv/bin/python`:
-```bash
-export FTI_RECAPTION_PYTHON=/path/to/virtualenv/bin/python
-```
-
-### 2. Training Runtime Provisioning
-
-To enable Step 5 (Train), run the one-time provisioning script to copy model weights (~46GB) and set up the training environment:
+Both Step 2 (AI Recaptioning) and Step 5 (Train) run against the same self-contained
+`training_runtime/` — a local copy of the Krea-2-NF4 weights (including the Qwen3-VL
+text encoder used for captioning) plus a dedicated venv. Run the one-time provisioning
+script, pointed at an existing [AcademiaSD_LoRAlab-Krea2](https://github.com/xd43vild69/AcademiaSD_LoRAlab-Krea2)
+checkout, to copy the weights (~46GB) and set up the environment:
 
 ```bash
 FTI_LORALAB_ROOT=/path/to/AcademiaSD_LoRAlab-Krea2 ./scripts/setup_training_runtime.sh
 ```
+
+That checkout is only needed for this one-time copy — once `training_runtime/` exists,
+neither recaptioning nor training reach back out to it, and the app runs standalone
+against its own local model + venv.
 
 ---
 
@@ -97,10 +93,8 @@ FTI_LORALAB_ROOT=/path/to/AcademiaSD_LoRAlab-Krea2 ./scripts/setup_training_runt
 
 | Variable | Description | Default Value |
 |---|---|---|
-| `FTI_LORALAB_ROOT` | Path to `AcademiaSD_LoRAlab-Krea2` checkout for AI recaptioning | *Unset* |
-| `FTI_RECAPTION_PYTHON` | Python interpreter containing Qwen3-VL dependencies | `<FTI_LORALAB_ROOT>/venv/bin/python` |
-| `FTI_TRAINING_RUNTIME_DIR` | Directory holding model weights, datasets, cache, and training venv | `feature_pipeline_hub/training_runtime` |
-| `FTI_TRAINING_PYTHON` | Python interpreter for training workers | `<FTI_TRAINING_RUNTIME_DIR>/venv/bin/python` |
+| `FTI_TRAINING_RUNTIME_DIR` | Directory holding model weights, datasets, cache, and the shared venv used by both recaptioning and training | `feature_pipeline_hub/training_runtime` |
+| `FTI_TRAINING_PYTHON` | Python interpreter for training and recaption workers | `<FTI_TRAINING_RUNTIME_DIR>/venv/bin/python` |
 | `FTI_DB_PATH` | Path to the SQLite metadata database file | `feature_pipeline_hub/data/feature_pipeline.db` |
 | `FTI_DATA_DIR` | Base directory for raw dataset uploads | `feature_pipeline_hub/data` |
 
@@ -144,6 +138,7 @@ feature_pipeline_hub/
 │   └── components/                # UI panels (Import, Gallery, Recaption, Quality, Export, Train, Context Bar)
 ├── workers/                       # Worker scripts executed in dedicated environments
 │   ├── recaption_worker.py        # Qwen3-VL recaption worker
+│   ├── caption_qwen3vl.py         # Vendored Qwen3-VL loading/captioning (ported from LoRAlab)
 │   ├── precache_worker.py         # VAE & text embedding pre-cache worker
 │   └── train_worker.py            # LoRA training execution worker
 ```
