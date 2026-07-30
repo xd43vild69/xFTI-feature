@@ -12,12 +12,15 @@ from feature_pipeline.domain.models import (
 from feature_pipeline.infrastructure.database import get_connection
 from feature_pipeline.infrastructure.ingestion_repository import (
     delete_ingestion_run,
+    get_step_telemetry,
+    inventory_fingerprint,
     list_ingestion_runs,
     load_ingestion_run,
     mark_duplicates,
     save_ingestion_run,
     set_samples_excluded,
     update_sample_caption,
+    update_step_telemetry,
 )
 
 
@@ -258,3 +261,69 @@ def test_saving_a_run_registers_its_concept(conn):
 
     row = conn.execute("SELECT concept_name, trigger_word FROM concepts").fetchone()
     assert row["concept_name"] == "cyberpunk"
+
+
+def test_inventory_fingerprint_is_stable_without_writes(conn):
+    save_ingestion_run(conn, _make_run("r1", n_samples=2))
+
+    assert inventory_fingerprint(conn) == inventory_fingerprint(conn)
+
+
+def test_inventory_fingerprint_changes_after_a_duplicate_scan(conn):
+    """mark_duplicates leaves updated_at alone, so the fingerprint must not rely on it."""
+    save_ingestion_run(conn, _make_run("r1", n_samples=2))
+    before = inventory_fingerprint(conn)
+
+    mark_duplicates(conn, "r1", ["r1-s0"])
+
+    assert inventory_fingerprint(conn) != before
+
+
+def test_inventory_fingerprint_changes_after_excluding(conn):
+    save_ingestion_run(conn, _make_run("r1", n_samples=2))
+    before = inventory_fingerprint(conn)
+
+    set_samples_excluded(conn, ["r1-s0"], True)
+
+    assert inventory_fingerprint(conn) != before
+
+
+def test_inventory_fingerprint_changes_after_a_caption_edit(conn):
+    save_ingestion_run(conn, _make_run("r1"))
+    before = inventory_fingerprint(conn)
+
+    update_sample_caption(conn, "r1-s0", "sks_style, edited")
+
+    assert inventory_fingerprint(conn) != before
+
+
+def test_inventory_fingerprint_changes_when_runs_are_added_or_deleted(conn):
+    empty = inventory_fingerprint(conn)
+
+    save_ingestion_run(conn, _make_run("r1", n_samples=1))
+    with_run = inventory_fingerprint(conn)
+    assert with_run != empty
+
+    delete_ingestion_run(conn, "r1")
+    assert inventory_fingerprint(conn) == empty
+
+
+def test_step_telemetry_of_an_unknown_run_is_none(conn):
+    assert get_step_telemetry(conn, "nope") is None
+
+
+def test_step_telemetry_reads_back_what_was_recorded(conn):
+    save_ingestion_run(conn, _make_run("r1"))
+
+    update_step_telemetry(conn, "r1", step="import", duration_seconds=1.5, error_count=2)
+    update_step_telemetry(conn, "r1", step="export", duration_seconds=0.25)
+
+    telemetry = get_step_telemetry(conn, "r1")
+
+    assert telemetry.import_duration_seconds == 1.5
+    assert telemetry.import_error_count == 2
+    assert telemetry.export_duration_seconds == 0.25
+    assert telemetry.export_error_count == 0
+    # Never recorded: the quality step does not call record_step at all.
+    assert telemetry.quality_duration_seconds is None
+    assert telemetry.cost_estimate is None

@@ -22,16 +22,7 @@ def render() -> None:
 
     conn = get_connection()
     try:
-        ingest_row = conn.execute(
-            """
-            SELECT run_id, import_duration_seconds, import_error_count,
-                   recaption_duration_seconds, recaption_error_count,
-                   quality_duration_seconds, export_duration_seconds, export_error_count,
-                   cost_estimate
-            FROM ingestion_runs WHERE run_id = ?
-            """,
-            (run.run_id,),
-        ).fetchone()
+        telemetry = repo.get_step_telemetry(conn, run.run_id)
 
         # Find the training run for this dataset (if any)
         training_runs = training_repo.list_training_runs(conn, dataset_run_id=run.run_id)
@@ -39,24 +30,20 @@ def render() -> None:
     finally:
         conn.close()
 
-    if ingest_row is None:
+    if telemetry is None:
         st.warning("No pipeline data for this run yet.")
         return
 
     st.subheader("📊 Pipeline Metrics")
 
-    # Unpack ingestion telemetry
-    (
-        _,
-        import_dur,
-        import_err,
-        recaption_dur,
-        recaption_err,
-        quality_dur,
-        export_dur,
-        export_err,
-        ingest_cost,
-    ) = ingest_row
+    import_dur = telemetry.import_duration_seconds
+    import_err = telemetry.import_error_count
+    recaption_dur = telemetry.recaption_duration_seconds
+    recaption_err = telemetry.recaption_error_count
+    quality_dur = telemetry.quality_duration_seconds
+    export_dur = telemetry.export_duration_seconds
+    export_err = telemetry.export_error_count
+    ingest_cost = telemetry.cost_estimate
 
     # Build rows for the table
     rows = []
@@ -125,12 +112,13 @@ def render() -> None:
         total_cost = (ingest_cost or 0.0) + (train_cost or 0.0)
         st.metric("Total Cost", f"${total_cost:.4f}" if total_cost > 0 else "N/A")
 
-    # Status summary
+    # Status summary. Each fragment is guarded on its own field: the ternary used to
+    # wrap the whole f-string, so a run with a duration but no GPU telemetry would
+    # divide None by 3600 while building the string it was supposed to skip.
     if train_run is not None:
-        st.caption(
-            f"Training: {train_run.status} · "
-            f"{train_run.duration_seconds / 60:.1f} min "
-            f"({train_run.gpu_seconds / 3600:.2f} GPU-hours)"
-            if train_run.duration_seconds
-            else f"Training: {train_run.status}"
-        )
+        summary = f"Training: {train_run.status}"
+        if train_run.duration_seconds:
+            summary += f" · {train_run.duration_seconds / 60:.1f} min"
+        if train_run.gpu_seconds:
+            summary += f" ({train_run.gpu_seconds / 3600:.2f} GPU-hours)"
+        st.caption(summary)

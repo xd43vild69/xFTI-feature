@@ -1,12 +1,15 @@
-"""Step 0: Pipeline observability dashboard.
+"""Metrics page: the dataset fleet first, then the active run's pipeline detail.
 
-Shows aggregated metrics across all 5 curation + training steps: durations,
-throughput, errors, and GPU costs. Helps operators understand the pipeline
-performance and diagnose bottlenecks.
+The inventory answers "what do I have and which set is cleanest" across every
+import; the panel below it answers "how did this one dataset get here" — durations,
+throughput, errors, and GPU cost per step.
 
-This step can be viewed anytime and is updated as each step completes.
+This page can be viewed anytime and is updated as each step completes.
 """
 
-from components import observability_panel
+import streamlit as st
+from components import inventory_panel, observability_panel
 
+inventory_panel.render()
+st.divider()
 observability_panel.render()
