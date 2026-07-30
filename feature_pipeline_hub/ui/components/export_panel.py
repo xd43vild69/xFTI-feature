@@ -11,9 +11,12 @@ Confirmation is an inline two-step (not st.dialog): exporting overwrites a
 folder, and a plain widget flow is what AppTest can actually drive end to end.
 """
 
+import time
+
 import streamlit as st
 
 import state
+import step_telemetry
 from feature_pipeline.application.dataset_service import build_manifest
 from feature_pipeline.application.export_service import export_active_samples
 from feature_pipeline.domain.models import DatasetManifest, IngestionRun
@@ -106,6 +109,7 @@ def _export_and_version(run: IngestionRun, destination_name: str, version_tag: s
     snapshot describes exactly those files. Failing to record a version must not make
     a successful export look failed, so that half is reported separately.
     """
+    started = time.time()
     previous = state.latest_dataset_version(run.concept.concept_id)
     result = export_active_samples(run, destination_name)
 
@@ -124,6 +128,7 @@ def _export_and_version(run: IngestionRun, destination_name: str, version_tag: s
         )
 
     st.session_state["export_message"] = message
+    step_telemetry.record_step(run.run_id, "export", time.time() - started, error_count=0)
 
 
 def _describe_delta(previous: DatasetManifest | None, current: DatasetManifest) -> list[str]:

@@ -14,6 +14,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from feature_pipeline.domain import cost
 from feature_pipeline.domain.worker_contracts import PrecacheSettings, TrainSettings
 from feature_pipeline.infrastructure import training_repository as repo
 from feature_pipeline.infrastructure import training_runner
@@ -51,6 +52,33 @@ class TrainingConfig(BaseModel):
 
 class PrecacheFailed(RuntimeError):
     """Pre-cache exited non-zero or timed out; the caller should not launch training."""
+
+
+def finalize_dead_run(conn: sqlite3.Connection, run: repo.TrainingRun, *, fallback_status: str) -> None:
+    """Move a 'running' row whose process has exited to its real status, with telemetry.
+
+    Reads the worker_finished/worker_failed line workers/_telemetry.py prints as
+    its last line of output (see training_runner.read_lifecycle_event) and uses
+    it as the source of truth for status, duration and cost — falling back to
+    `fallback_status` with no telemetry if the process died too hard to print
+    one (killed, machine restart, or a run launched before this existed).
+    """
+    event = training_runner.read_lifecycle_event(run.log_path)
+    if event is None:
+        repo.update_training_run_status(conn, run.training_run_id, fallback_status)
+        return
+
+    status = "completed" if event.get("event") == "worker_finished" else "failed"
+    gpu_seconds = float(event.get("gpu_seconds") or 0.0)
+    repo.update_training_run_status(
+        conn,
+        run.training_run_id,
+        status,
+        duration_seconds=float(event.get("duration_seconds") or 0.0),
+        gpu_seconds=gpu_seconds,
+        cost_estimate=cost.estimate_cost(gpu_seconds, cost.gpu_hourly_rate()),
+        error_message=str(event.get("error", "")),
+    )
 
 
 def dataset_dir_for(dataset_name: str) -> Path:
@@ -108,7 +136,8 @@ def _run_precache_blocking(
     cache_dir: Path,
     trigger_word: str,
 ) -> None:
-    run_dir = training_runtime_dir() / "runs" / f"precache-{uuid.uuid4()}"
+    precache_run_id = str(uuid.uuid4())
+    run_dir = training_runtime_dir() / "runs" / f"precache-{precache_run_id}"
     settings = PrecacheSettings(
         model_id=str(model_dir),
         dataset_path=str(dataset_path),
@@ -117,7 +146,11 @@ def _run_precache_blocking(
     ).model_dump()
 
     pid, log_path = training_runner.launch(
-        PRECACHE_SCRIPT, settings, run_dir, PRECACHE_SETTINGS_ENV
+        PRECACHE_SCRIPT,
+        settings,
+        run_dir,
+        PRECACHE_SETTINGS_ENV,
+        extra_env={"FTI_RUN_ID": precache_run_id},
     )
     training_run_id = repo.create_training_run(
         conn,
@@ -137,12 +170,16 @@ def _run_precache_blocking(
         time.sleep(0.5)
 
     log_text, _ = training_runner.read_log_tail(log_path)
+    run = repo.get_training_run(conn, training_run_id)
     if "Pre-caching finished" not in log_text:
-        repo.update_training_run_status(conn, training_run_id, "failed")
+        if run is not None:
+            finalize_dead_run(conn, run, fallback_status="failed")
+        else:
+            repo.update_training_run_status(conn, training_run_id, "failed")
         tail = "\n".join(log_text.splitlines()[-15:])
         raise PrecacheFailed(f"Pre-cache did not report success. Last log lines:\n{tail}")
 
-    repo.update_training_run_status(conn, training_run_id, "completed")
+    finalize_dead_run(conn, run, fallback_status="completed")
 
 
 def _launch_train(
@@ -168,7 +205,13 @@ def _launch_train(
         **config.model_dump(),
     ).model_dump()
 
-    pid, log_path = training_runner.launch(TRAIN_SCRIPT, settings, run_dir, TRAIN_SETTINGS_ENV)
+    pid, log_path = training_runner.launch(
+        TRAIN_SCRIPT,
+        settings,
+        run_dir,
+        TRAIN_SETTINGS_ENV,
+        extra_env={"FTI_RUN_ID": training_run_id_hint},
+    )
 
     return repo.create_training_run(
         conn,

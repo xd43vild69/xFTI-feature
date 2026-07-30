@@ -7,9 +7,12 @@ roughly two seconds per image on GPU, so the run is shown with live progress
 rather than a spinner.
 """
 
+import time
+
 import streamlit as st
 
 import state
+import step_telemetry
 from feature_pipeline.application import recaption_service
 from feature_pipeline.domain.models import DatasetSample, IngestionRun
 from feature_pipeline.infrastructure import recaption_runner
@@ -71,6 +74,7 @@ def render_toolbar(
 
 
 def _run_batch(run: IngestionRun, samples: list[DatasetSample]) -> None:
+    started = time.time()
     total = len(samples)
     detailed = bool(st.session_state.get(DETAILED_KEY))
 
@@ -98,12 +102,14 @@ def _run_batch(run: IngestionRun, samples: list[DatasetSample]) -> None:
             elif event.kind == "failed":
                 status.update(label="Recaption failed", state="error")
                 st.error(event.message)
+                step_telemetry.record_step(run.run_id, "recaption", time.time() - started, error_count=failed + 1)
                 return
 
         label = f"Recaptioned {done}/{total}"
         if failed:
             label += f" · {failed} failed"
         status.update(label=label, state="complete", expanded=bool(failed))
+        step_telemetry.record_step(run.run_id, "recaption", time.time() - started, error_count=failed)
 
     # st.rerun() below refreshes the caption widgets (their keys are versioned by
     # apply_recaption), but it also wipes whatever the status/progress widgets

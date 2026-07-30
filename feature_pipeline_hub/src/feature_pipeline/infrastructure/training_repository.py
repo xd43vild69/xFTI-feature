@@ -22,6 +22,10 @@ class TrainingRun:
     config: dict
     started_at: datetime
     finished_at: datetime | None
+    duration_seconds: float | None = None
+    gpu_seconds: float | None = None
+    cost_estimate: float | None = None
+    error_message: str = ""
 
 
 def create_training_run(
@@ -56,15 +60,42 @@ def create_training_run(
 
 
 def update_training_run_status(
-    conn: sqlite3.Connection, training_run_id: str, status: str
+    conn: sqlite3.Connection,
+    training_run_id: str,
+    status: str,
+    *,
+    duration_seconds: float | None = None,
+    gpu_seconds: float | None = None,
+    cost_estimate: float | None = None,
+    error_message: str = "",
 ) -> None:
+    """Move a run to `status`, optionally attaching the telemetry it finished with.
+
+    The telemetry fields come from training_runner.read_lifecycle_event() (the
+    worker_finished/worker_failed line workers/_telemetry.py prints) — left at
+    their defaults when no such event was found (a run that predates this
+    telemetry, or one that crashed too hard to print anything).
+    """
     finished_at = (
         datetime.now(timezone.utc).isoformat() if status != "running" else None
     )
     with conn:
         conn.execute(
-            "UPDATE training_runs SET status = ?, finished_at = ? WHERE training_run_id = ?",
-            (status, finished_at, training_run_id),
+            """
+            UPDATE training_runs
+            SET status = ?, finished_at = ?, duration_seconds = ?, gpu_seconds = ?,
+                cost_estimate = ?, error_message = ?
+            WHERE training_run_id = ?
+            """,
+            (
+                status,
+                finished_at,
+                duration_seconds,
+                gpu_seconds,
+                cost_estimate,
+                error_message,
+                training_run_id,
+            ),
         )
 
 
@@ -112,4 +143,8 @@ def _row_to_training_run(row: sqlite3.Row) -> TrainingRun:
         finished_at=(
             datetime.fromisoformat(row["finished_at"]) if row["finished_at"] else None
         ),
+        duration_seconds=row["duration_seconds"],
+        gpu_seconds=row["gpu_seconds"],
+        cost_estimate=row["cost_estimate"],
+        error_message=row["error_message"],
     )

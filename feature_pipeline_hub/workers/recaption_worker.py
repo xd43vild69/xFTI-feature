@@ -10,25 +10,31 @@ The captioning itself is not reimplemented: `caption_qwen3vl` is vendored
 alongside this script (see that file's docstring) so both projects stay on
 exactly the same model, prompts and decoding parameters.
 
-Protocol: a JSON job on stdin, JSON Lines events on stdout.
+Protocol: a JSON job on stdin, JSON Lines events on stdout. Every event carries
+`timestamp` (absolute, unix seconds) and `run_id` (echoed back from the job,
+empty if the caller did not set one) so events from concurrent or successive
+runs can be told apart downstream.
 
-    job    {"text_encoder_dir": str, "images": [str], "detailed": bool}
-    events {"event": "loaded",  "device": str, "seconds": float}
-           {"event": "caption", "path": str, "caption": str, "seconds": float}
-           {"event": "error",   "path": str, "message": str}
-           {"event": "done",    "captioned": int, "failed": int}
+    job    {"text_encoder_dir": str, "images": [str], "detailed": bool, "run_id": str}
+    events {"event": "loaded",  "device": str, "seconds": float, "timestamp": float, "run_id": str}
+           {"event": "caption", "path": str, "caption": str, "seconds": float, "timestamp": float, "run_id": str}
+           {"event": "error",   "path": str, "message": str, "timestamp": float, "run_id": str}
+           {"event": "done",    "captioned": int, "failed": int, "timestamp": float, "run_id": str}
 """
 
 import json
 import sys
 import time
 
+_run_id = ""
+
 
 def _emit(**event) -> None:
-    print(json.dumps(event), flush=True)
+    print(json.dumps({"timestamp": time.time(), "run_id": _run_id, **event}), flush=True)
 
 
 def main() -> int:
+    global _run_id
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
@@ -38,6 +44,7 @@ def main() -> int:
     text_encoder_dir = job["text_encoder_dir"]
     images = job["images"]
     detailed = bool(job.get("detailed", False))
+    _run_id = str(job.get("run_id", ""))
 
     import torch
     from caption_qwen3vl import generate_caption, load_captioner

@@ -12,6 +12,7 @@ from feature_pipeline.infrastructure.training_runner import (
     TrainingUnavailable,
     is_process_alive,
     launch,
+    read_lifecycle_event,
     read_log_tail,
     resolve_environment,
     stop_process,
@@ -159,3 +160,59 @@ def test_is_process_alive_is_false_for_a_nonexistent_pid():
 
 def test_stop_process_is_a_no_op_for_an_already_dead_pid():
     stop_process(2**30, grace_period_seconds=0.1)  # must not raise
+
+
+# --- read_lifecycle_event ------------------------------------------------------
+# workers/_telemetry.py prints exactly one of these lines as a worker's last
+# output; this reads it back out of an otherwise free-text log.
+
+
+def test_missing_log_has_no_lifecycle_event(tmp_path):
+    assert read_lifecycle_event(str(tmp_path / "nope.txt")) is None
+
+
+def test_a_log_with_only_free_text_has_no_lifecycle_event(tmp_path):
+    log_path = tmp_path / "log.txt"
+    log_path.write_text("Model ID: foo\nProcessing: bar\n")
+
+    assert read_lifecycle_event(str(log_path)) is None
+
+
+def test_finds_the_worker_finished_line_among_free_text(tmp_path):
+    log_path = tmp_path / "log.txt"
+    log_path.write_text(
+        '{"event": "worker_started", "worker": "precache", "timestamp": 1.0}\n'
+        "Processing: a.png\nProcessing: b.png\n"
+        '{"event": "worker_finished", "worker": "precache", "run_id": "r1", '
+        '"timestamp": 2.0, "duration_seconds": 12.5, "gpu_seconds": 12.5}\n'
+    )
+
+    event = read_lifecycle_event(str(log_path))
+
+    assert event == {
+        "event": "worker_finished",
+        "worker": "precache",
+        "run_id": "r1",
+        "timestamp": 2.0,
+        "duration_seconds": 12.5,
+        "gpu_seconds": 12.5,
+    }
+
+
+def test_finds_worker_failed_over_a_large_tail(tmp_path):
+    log_path = tmp_path / "log.txt"
+    filler = "x" * 200 + "\n"
+    log_path.write_text(filler * 100 + '{"event": "worker_failed", "worker": "train", "error": "boom"}\n')
+
+    event = read_lifecycle_event(str(log_path))
+
+    assert event["event"] == "worker_failed"
+    assert event["error"] == "boom"
+
+
+def test_ignores_a_log_too_large_to_contain_the_event_in_the_tail(tmp_path):
+    log_path = tmp_path / "log.txt"
+    filler = "x" * 200 + "\n"
+    log_path.write_text('{"event": "worker_finished", "worker": "train"}\n' + filler * 100)
+
+    assert read_lifecycle_event(str(log_path)) is None

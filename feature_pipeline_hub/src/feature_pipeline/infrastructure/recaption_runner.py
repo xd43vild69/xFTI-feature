@@ -10,6 +10,7 @@ events the application layer can consume.
 
 import json
 import subprocess
+import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -68,11 +69,19 @@ def run_recaption(
     """Caption `image_paths`, yielding the worker's events as they arrive.
 
     Streaming rather than collecting lets the caller show progress: a batch takes
-    a few seconds of model load plus roughly two seconds per image on GPU.
+    a few seconds of model load plus roughly two seconds per image on GPU. Each
+    call mints its own run_id so its events can be told apart from a concurrent
+    or later batch once they land in a shared log/metrics store.
     """
     env = environment or resolve_environment()
+    run_id = str(uuid.uuid4())
     job = json.dumps(
-        {"text_encoder_dir": str(env.model_dir), "images": image_paths, "detailed": detailed}
+        {
+            "text_encoder_dir": str(env.model_dir),
+            "images": image_paths,
+            "detailed": detailed,
+            "run_id": run_id,
+        }
     )
 
     process = subprocess.Popen(
@@ -107,4 +116,5 @@ def run_recaption(
         yield {
             "event": "failed",
             "message": f"Recaption worker exited with code {process.returncode}.\n{tail}",
+            "run_id": run_id,
         }

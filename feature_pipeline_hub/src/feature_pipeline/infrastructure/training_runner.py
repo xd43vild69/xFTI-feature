@@ -140,6 +140,42 @@ def read_log_tail(log_path: str, since_offset: int = 0) -> tuple[str, int]:
     return chunk.decode("utf-8", errors="replace"), new_offset
 
 
+LIFECYCLE_TAIL_BYTES = 4000
+
+
+def read_lifecycle_event(log_path: str) -> dict | None:
+    """The last worker_finished/worker_failed JSON line in the log, if any.
+
+    workers/_telemetry.py prints that line as the very last thing a worker
+    does, so it is always within the tail — reading the last few KB instead
+    of the whole file keeps this cheap even for a multi-hour training log.
+    Returns a raw dict (not validated against WorkerLifecycleEvent) since
+    this module only owns the process boundary; callers decide what to do
+    with an untrusted/partial line.
+    """
+    path = Path(log_path)
+    if not path.is_file():
+        return None
+
+    size = path.stat().st_size
+    offset = max(0, size - LIFECYCLE_TAIL_BYTES)
+    with path.open("rb") as f:
+        f.seek(offset)
+        chunk = f.read().decode("utf-8", errors="replace")
+
+    for line in reversed(chunk.splitlines()):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if data.get("event") in ("worker_finished", "worker_failed"):
+            return data
+    return None
+
+
 def is_process_alive(pid: int) -> bool:
     """Whether `pid` is still doing work — false for gone *and* for zombies.
 

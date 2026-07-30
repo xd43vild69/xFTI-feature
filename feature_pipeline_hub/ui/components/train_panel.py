@@ -115,10 +115,17 @@ def _render_progress(training_run_id: str) -> None:
 
         alive = training_runner.is_process_alive(run.pid)
         if not alive and run.status == "running":
-            training_repo.update_training_run_status(conn, training_run_id, "completed")
+            training_service.finalize_dead_run(conn, run, fallback_status="failed")
             run = training_repo.get_training_run(conn, training_run_id)
 
-    st.caption(f"Training · {run.status} · started {run.started_at}")
+    status_line = f"Training · {run.status} · started {run.started_at}"
+    if run.duration_seconds:
+        status_line += f" · {run.duration_seconds / 60:.1f} min"
+    if run.cost_estimate is not None:
+        status_line += f" · ~${run.cost_estimate:.2f}"
+    st.caption(status_line)
+    if run.status == "failed" and run.error_message:
+        st.caption(f"⚠ {run.error_message}")
 
     csv_path = training_service.training_log_csv_path(run)
     if csv_path.is_file():

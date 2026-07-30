@@ -210,3 +210,35 @@ def delete_ingestion_run(conn: sqlite3.Connection, run_id: str) -> None:
     with conn:
         conn.execute("DELETE FROM samples WHERE run_id = ?", (run_id,))
         conn.execute("DELETE FROM ingestion_runs WHERE run_id = ?", (run_id,))
+
+
+# --- Pipeline telemetry (Fase 2: observability panel) ---
+
+
+def update_step_telemetry(
+    conn: sqlite3.Connection,
+    run_id: str,
+    *,
+    step: str,  # "import" | "recaption" | "quality" | "export"
+    duration_seconds: float,
+    error_count: int = 0,
+) -> None:
+    """Record the duration and error count for one step of the curation pipeline.
+
+    Called from the UI panels (import_panel.py, recaption_panel.py, etc.) right
+    after a step completes, to populate the observability dashboard.
+    """
+    duration_col = f"{step}_duration_seconds"
+    error_col = f"{step}_error_count"
+
+    with conn:
+        conn.execute(
+            f"UPDATE ingestion_runs SET {duration_col} = ?, {error_col} = ? WHERE run_id = ?",
+            (duration_seconds, error_count, run_id),
+        )
+
+
+def update_run_cost_estimate(conn: sqlite3.Connection, run_id: str, cost: float | None) -> None:
+    """Update the aggregated cost estimate for a run (training cost summed with import/etc)."""
+    with conn:
+        conn.execute("UPDATE ingestion_runs SET cost_estimate = ? WHERE run_id = ?", (cost, run_id))

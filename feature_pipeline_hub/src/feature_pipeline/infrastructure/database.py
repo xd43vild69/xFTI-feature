@@ -22,7 +22,15 @@ CREATE TABLE IF NOT EXISTS ingestion_runs (
     trigger_word TEXT NOT NULL,
     source_path TEXT NOT NULL,
     source_kind TEXT NOT NULL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    import_duration_seconds REAL,
+    import_error_count INTEGER DEFAULT 0,
+    recaption_duration_seconds REAL,
+    recaption_error_count INTEGER DEFAULT 0,
+    quality_duration_seconds REAL,
+    export_duration_seconds REAL,
+    export_error_count INTEGER DEFAULT 0,
+    cost_estimate REAL
 );
 
 CREATE TABLE IF NOT EXISTS samples (
@@ -71,7 +79,11 @@ CREATE TABLE IF NOT EXISTS training_runs (
     log_path TEXT NOT NULL,
     config_json TEXT NOT NULL DEFAULT '{}',
     started_at TEXT NOT NULL,
-    finished_at TEXT
+    finished_at TEXT,
+    duration_seconds REAL,
+    gpu_seconds REAL,
+    cost_estimate REAL,
+    error_message TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_training_runs_status ON training_runs(status);
@@ -108,17 +120,42 @@ SAMPLE_COLUMN_MIGRATIONS = {
     "sharpness": "REAL NOT NULL DEFAULT 0",
 }
 
+# Telemetry columns added once workers/_telemetry.py started emitting
+# worker_finished/worker_failed events (see workers/_telemetry.py and
+# training_runner.read_lifecycle_event).
+TRAINING_RUN_COLUMN_MIGRATIONS = {
+    "duration_seconds": "REAL",
+    "gpu_seconds": "REAL",
+    "cost_estimate": "REAL",
+    "error_message": "TEXT NOT NULL DEFAULT ''",
+}
+
+# Per-step telemetry for ingestion runs: durations, error counts, and a cost
+# estimate aggregated from training time (see ui/components/observability_panel.py).
+INGESTION_RUN_COLUMN_MIGRATIONS = {
+    "import_duration_seconds": "REAL",
+    "import_error_count": "INTEGER DEFAULT 0",
+    "recaption_duration_seconds": "REAL",
+    "recaption_error_count": "INTEGER DEFAULT 0",
+    "quality_duration_seconds": "REAL",
+    "export_duration_seconds": "REAL",
+    "export_error_count": "INTEGER DEFAULT 0",
+    "cost_estimate": "REAL",
+}
+
 
 def create_tables(conn: sqlite3.Connection) -> None:
     """Create the curation tables if they don't already exist, then migrate columns."""
     conn.executescript(SCHEMA)
-    _migrate_sample_columns(conn)
+    _migrate_columns(conn, "samples", SAMPLE_COLUMN_MIGRATIONS)
+    _migrate_columns(conn, "training_runs", TRAINING_RUN_COLUMN_MIGRATIONS)
+    _migrate_columns(conn, "ingestion_runs", INGESTION_RUN_COLUMN_MIGRATIONS)
     conn.commit()
 
 
-def _migrate_sample_columns(conn: sqlite3.Connection) -> None:
-    existing = {row[1] for row in conn.execute("PRAGMA table_info(samples)")}
+def _migrate_columns(conn: sqlite3.Connection, table: str, migrations: dict[str, str]) -> None:
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
 
-    for column, definition in SAMPLE_COLUMN_MIGRATIONS.items():
+    for column, definition in migrations.items():
         if column not in existing:
-            conn.execute(f"ALTER TABLE samples ADD COLUMN {column} {definition}")
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")

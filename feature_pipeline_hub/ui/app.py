@@ -21,6 +21,7 @@ context_bar.render()
 
 st.navigation(
     [
+        st.Page(state.OBSERVABILITY_STEP, title="📊 Metrics"),
         st.Page(state.IMPORT_STEP, title="1 · Import", default=True),
         st.Page(state.CURATE_STEP, title="2 · Curate"),
         st.Page(state.QUALITY_STEP, title="3 · Quality"),
