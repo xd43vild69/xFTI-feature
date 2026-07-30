@@ -321,7 +321,29 @@ def render_thumbnail(image_path: str, *, width: int | str = "stretch", size: int
 _PASSTHROUGH_OUTPUT_FORMAT = {"JPEG": "JPEG", "JPG": "JPEG", "PNG": "PNG", "GIF": "auto"}
 
 
-def render_original_image(image_path: str, *, show_facts: bool = True) -> None:
+# Streamlit already writes the image's natural width onto the <img> inline (that is
+# what passing `width=` above buys), then keeps it from being honoured two ways: a
+# max-width cap, and a flex container that lets the image shrink below its own size.
+# Undoing both is all that separates the fitted view from a 1:1 one, so the sizing
+# itself is left to that inline width rather than restated here. Selectors verified
+# against the bundled frontend: `stDialog` is a class, `stImageContainer` a testid.
+_ACTUAL_SIZE_CSS = """
+<style>
+.stDialog [data-testid="stImageContainer"] {
+    overflow: auto;
+    max-height: 75vh;
+}
+.stDialog [data-testid="stImageContainer"] img {
+    max-width: none !important;
+    flex-shrink: 0 !important;
+}
+</style>
+"""
+
+
+def render_original_image(
+    image_path: str, *, actual_size: bool = False, show_facts: bool = True
+) -> None:
     """Render an image at its original quality, scaled to fit only by the browser.
 
     Passing the image's own pixel width as `width` is what avoids the server-side
@@ -329,6 +351,10 @@ def render_original_image(image_path: str, *, show_facts: bool = True) -> None:
     it clamps an oversized width to the container in CSS anyway. So the browser
     receives the untouched file and does the fitting itself, which is both a better
     resample than BILINEAR and correct on high-DPI screens.
+
+    `actual_size` swaps the fitted view for a 1:1 one that scrolls, for judging focus
+    and compression artefacts at real pixels. The bytes are the same either way — only
+    the CSS differs — so toggling it costs nothing beyond a re-layout.
     """
     path = Path(image_path)
     if not path.exists():
@@ -340,6 +366,9 @@ def render_original_image(image_path: str, *, show_facts: bool = True) -> None:
     except Exception:
         st.error(f"Could not read image: {path.name}")
         return
+
+    if actual_size:
+        st.html(_ACTUAL_SIZE_CSS)
 
     st.image(
         str(path),

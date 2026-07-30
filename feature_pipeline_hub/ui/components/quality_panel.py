@@ -31,8 +31,16 @@ def _render_zoom_dialog(image_path: str) -> None:
     This is where the user judges focus and compression artefacts, so it goes
     through `render_original_image` rather than `st.image` directly — the latter
     would quietly resample and recompress anything over 1460px wide.
+
+    The toggle is a widget inside a dialog, so it reruns only this function rather
+    than the whole page, and the dialog stays open across the switch.
     """
-    state.render_original_image(image_path)
+    actual_size = st.toggle(
+        "Tamaño real (100 %)",
+        key="zoom_actual_size",
+        help="Ver los píxeles sin escalar, con scroll, en lugar de ajustar la imagen al diálogo",
+    )
+    state.render_original_image(image_path, actual_size=actual_size)
 
 
 def _zoom_button(image_path: str, key: str) -> None:
