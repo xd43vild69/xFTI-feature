@@ -100,6 +100,49 @@ def save_uploaded_files(uploaded_files: list, destination: str | None = None) ->
     return str(folder)
 
 
+def _available_stem(taken: set[str], stem: str) -> str:
+    """A stem no file in the folder uses yet, suffixed `-1`, `-2`… on collision."""
+    if stem not in taken:
+        return stem
+
+    index = 1
+    while f"{stem}-{index}" in taken:
+        index += 1
+    return f"{stem}-{index}"
+
+
+def append_uploaded_files(uploaded_files: list, folder: str) -> list[str]:
+    """Save uploads into a folder that already holds files, and return what was written.
+
+    `save_uploaded_files` owns the folder it writes to, so a name collision there
+    cannot happen. Adding to a curated run is the opposite case: overwriting would
+    swap the bytes under a sample that is already captioned, measured and validated,
+    while its stored metrics went on describing the old image. Colliding names take a
+    suffix instead, so nothing already in the dataset is ever replaced.
+
+    The suffix is resolved per stem, not per file, so an image and the .txt uploaded
+    beside it keep matching names — `read_caption_for_image` pairs them by stem.
+    """
+    destination = Path(folder)
+    destination.mkdir(parents=True, exist_ok=True)
+
+    taken = {path.stem for path in destination.iterdir() if path.is_file()}
+    stems: dict[str, str] = {}
+    written: list[str] = []
+
+    for uploaded_file in uploaded_files:
+        source = Path(uploaded_file.name)
+        if source.stem not in stems:
+            stems[source.stem] = _available_stem(taken, source.stem)
+            taken.add(stems[source.stem])
+
+        target = destination / f"{stems[source.stem]}{source.suffix}"
+        target.write_bytes(uploaded_file.getbuffer())
+        written.append(str(target))
+
+    return written
+
+
 def run_upload_dir(run_id: str) -> str:
     """Per-run folder under `data/raw/` for files uploaded through the UI."""
     return str(raw_data_dir() / run_id)

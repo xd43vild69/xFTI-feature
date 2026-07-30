@@ -4,6 +4,7 @@ import pytest
 from PIL import Image
 
 from feature_pipeline.infrastructure.storage import (
+    append_uploaded_files,
     clear_training_dataset_dir,
     delete_managed_folder,
     raw_data_dir,
@@ -215,3 +216,45 @@ def test_scan_caption_files_finds_txt_sidecars(tmp_path):
 def test_scan_caption_files_of_a_missing_folder_is_empty(tmp_path):
     """Used for reporting on a run whose source folder may since have been moved."""
     assert scan_caption_files(str(tmp_path / "gone")) == []
+
+
+def test_append_uploaded_files_keeps_existing_files_intact(tmp_path: Path):
+    source_image = tmp_path / "src.png"
+    _make_image(source_image)
+    folder = tmp_path / "run-1"
+    folder.mkdir()
+    (folder / "a.png").write_bytes(b"original bytes")
+
+    written = append_uploaded_files(
+        [_FakeUpload("a.png", source_image.read_bytes())], str(folder)
+    )
+
+    assert (folder / "a.png").read_bytes() == b"original bytes"
+    assert [Path(p).name for p in written] == ["a-1.png"]
+
+
+def test_append_uploaded_files_keeps_an_image_paired_with_its_caption(tmp_path: Path):
+    source_image = tmp_path / "src.png"
+    _make_image(source_image)
+    folder = tmp_path / "run-1"
+    folder.mkdir()
+    (folder / "a.png").write_bytes(b"original bytes")
+    (folder / "a.txt").write_text("the original caption")
+
+    append_uploaded_files(
+        [
+            _FakeUpload("a.png", source_image.read_bytes()),
+            _FakeUpload("a.txt", b"the added caption"),
+        ],
+        str(folder),
+    )
+
+    # Both took the same suffix, so the sidecar still resolves from the image.
+    assert read_caption_for_image(str(folder / "a-1.png")) == "the added caption"
+    assert read_caption_for_image(str(folder / "a.png")) == "the original caption"
+
+
+def test_append_uploaded_files_creates_the_folder_when_missing(tmp_path: Path):
+    written = append_uploaded_files([_FakeUpload("a.txt", b"one")], str(tmp_path / "new"))
+
+    assert Path(written[0]) == tmp_path / "new" / "a.txt"

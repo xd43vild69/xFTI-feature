@@ -2,6 +2,7 @@
 
 import hashlib
 import uuid
+from pathlib import Path
 
 from feature_pipeline.application import quality_service
 from feature_pipeline.application.caption_service import inject_trigger_word
@@ -16,34 +17,34 @@ from feature_pipeline.domain.validators import validate_sample
 from feature_pipeline.infrastructure.storage import read_caption_for_image, scan_raw_folder
 
 
+def build_sample(image_path: str, trigger_word: str) -> DatasetSample:
+    """Turn one image on disk into a captioned, measured, validated sample."""
+    original_caption = read_caption_for_image(image_path)
+    caption = inject_trigger_word(original_caption, trigger_word)
+    metrics = compute_image_metrics(image_path)
+
+    sample = DatasetSample(
+        sample_id=str(uuid.uuid4()),
+        image_path=image_path,
+        caption=caption,
+        original_caption=original_caption,
+        metrics=metrics,
+    )
+    errors = validate_sample(sample)
+    sample.is_valid = not errors
+    sample.validation_errors = errors
+    return sample
+
+
 def ingest_concept_from_folder(
     folder_path: str, concept_id: str, concept_name: str, trigger_word: str
 ) -> ConceptGroup:
     """Scan a raw folder, build a validated DatasetSample per image, and group them."""
-    samples: list[DatasetSample] = []
-
-    for image_path in scan_raw_folder(folder_path):
-        original_caption = read_caption_for_image(image_path)
-        caption = inject_trigger_word(original_caption, trigger_word)
-        metrics = compute_image_metrics(image_path)
-
-        sample = DatasetSample(
-            sample_id=str(uuid.uuid4()),
-            image_path=image_path,
-            caption=caption,
-            original_caption=original_caption,
-            metrics=metrics,
-        )
-        errors = validate_sample(sample)
-        sample.is_valid = not errors
-        sample.validation_errors = errors
-        samples.append(sample)
-
     return ConceptGroup(
         concept_id=concept_id,
         concept_name=concept_name,
         trigger_word=trigger_word,
-        samples=samples,
+        samples=[build_sample(path, trigger_word) for path in scan_raw_folder(folder_path)],
     )
 
 
@@ -74,6 +75,52 @@ def create_ingestion_run(
         source_kind=source_kind,
         concept=concept,
     )
+
+
+def append_images_to_run(
+    run: IngestionRun,
+    image_paths: list[str],
+    duplicate_threshold: int = quality_service.DEFAULT_PHASH_THRESHOLD,
+) -> list[DatasetSample]:
+    """Add images to an already-curated run, in place, and return the ones added.
+
+    The counterpart to `create_ingestion_run` for the "I forgot one" case. Re-scanning
+    the concept would mint a whole new run, and with it new sample ids, discarding the
+    exclusions, edited captions and duplicate verdicts the run already carries — so a
+    single missing image would cost re-curating the dataset.
+
+    Paths the run already holds are skipped rather than added twice, which keeps the
+    operation safe to repeat with the same files.
+
+    Each new image is compared against what the run already holds, including earlier
+    images from this same batch, so an accidental re-upload arrives already flagged.
+    That is O(new x existing); the quality step's O(n^2) sweep stays the authority on
+    the dataset as a whole, and re-running it can still cluster these differently.
+    """
+    already_present = {_resolved(s.image_path) for s in run.concept.samples}
+    added: list[DatasetSample] = []
+
+    for image_path in image_paths:
+        if _resolved(image_path) in already_present:
+            continue
+
+        sample = build_sample(image_path, run.concept.trigger_word)
+        sample.is_duplicate = any(
+            quality_service.perceptual_distance(sample, other) <= duplicate_threshold
+            for other in run.concept.samples
+            if not other.is_excluded
+        )
+
+        run.concept.samples.append(sample)
+        already_present.add(_resolved(image_path))
+        added.append(sample)
+
+    return added
+
+
+def _resolved(image_path: str) -> str:
+    """Absolute, symlink-free form of a path, for comparing two references to a file."""
+    return str(Path(image_path).resolve())
 
 
 def compute_content_hash(samples: list[DatasetSample]) -> str:

@@ -12,6 +12,7 @@ from PIL import Image
 
 from feature_pipeline.application import (
     caption_service,
+    dataset_service,
     image_service,
     inventory_service,
     training_service,
@@ -29,7 +30,13 @@ from feature_pipeline.infrastructure import training_repository as training_repo
 from feature_pipeline.infrastructure import training_runner
 from feature_pipeline.infrastructure import version_repository as version_repo
 from feature_pipeline.infrastructure.database import get_connection
-from feature_pipeline.infrastructure.storage import delete_managed_folder, write_caption_sidecar
+from feature_pipeline.infrastructure.storage import (
+    IMAGE_EXTENSIONS,
+    append_uploaded_files,
+    delete_managed_folder,
+    run_upload_dir,
+    write_caption_sidecar,
+)
 
 ACTIVE_RUN_KEY = "active_run_id"
 
@@ -56,6 +63,26 @@ def load_run(run_id: str) -> IngestionRun | None:
 def save_run(run: IngestionRun) -> None:
     with _db() as conn:
         repo.save_ingestion_run(conn, run)
+
+
+def append_images(run: IngestionRun, uploaded_files: list) -> list[DatasetSample]:
+    """Add uploaded images to an existing dataset, keeping its curation intact.
+
+    Files land in `data/raw/<run_id>/` whatever the run was originally imported from.
+    A run ingested by path points at a folder the user owns, which `delete_managed_folder`
+    deliberately refuses to clean up — writing there would both touch a directory that
+    is not ours and leave those files behind when the dataset is deleted.
+
+    Non-image uploads are written too, since a .txt beside an image is how a caption
+    arrives, but only the images become samples.
+    """
+    written = append_uploaded_files(uploaded_files, run_upload_dir(run.run_id))
+    images = [path for path in written if Path(path).suffix.lower() in IMAGE_EXTENSIONS]
+
+    added = dataset_service.append_images_to_run(run, images)
+    if added:
+        save_run(run)
+    return added
 
 
 def _inventory_fingerprint() -> tuple:
@@ -248,6 +275,11 @@ def delete_run(run_id: str) -> None:
 
     if run is not None and run.source_kind == "upload":
         delete_managed_folder(run.source_path)
+
+    # Images added later live under data/raw/<run_id>/ whatever the run was imported
+    # from, so a run ingested by path can own a managed folder too. Deleting it is a
+    # no-op when nothing was ever appended.
+    delete_managed_folder(run_upload_dir(run_id))
 
     if st.session_state.get(ACTIVE_RUN_KEY) == run_id:
         st.session_state.pop(ACTIVE_RUN_KEY, None)

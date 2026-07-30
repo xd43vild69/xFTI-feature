@@ -3,6 +3,7 @@ from pathlib import Path
 from PIL import Image
 
 from feature_pipeline.application.dataset_service import (
+    append_images_to_run,
     build_manifest,
     compute_content_hash,
     create_ingestion_run,
@@ -215,3 +216,86 @@ def test_two_manifests_of_the_same_content_share_a_hash():
 
     assert first.content_hash == second.content_hash
     assert first.version != second.version
+
+
+def _run_with(tmp_path: Path, filenames: list[str], color: str = "blue"):
+    for name in filenames:
+        Image.new("RGB", (512, 512), color=color).save(tmp_path / name)
+    return create_ingestion_run(
+        folder_path=str(tmp_path),
+        concept_name="cyberpunk_style",
+        trigger_word="sks_style",
+        source_kind="folder",
+    )
+
+
+def test_append_images_keeps_the_existing_samples_and_their_curation(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    run = _run_with(source, ["a.png"])
+    kept = run.concept.samples[0]
+    kept.caption = "sks_style, a caption edited by hand"
+    kept.is_excluded = True
+
+    extra = tmp_path / "extra.png"
+    Image.new("RGB", (512, 512), color="red").save(extra)
+    added = append_images_to_run(run, [str(extra)])
+
+    assert len(added) == 1
+    assert len(run.concept.samples) == 2
+    # The curated sample survives untouched: same id, same edits.
+    assert run.concept.samples[0].sample_id == kept.sample_id
+    assert run.concept.samples[0].caption == "sks_style, a caption edited by hand"
+    assert run.concept.samples[0].is_excluded is True
+
+
+def test_append_images_injects_the_runs_trigger_word(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    run = _run_with(source, ["a.png"])
+
+    extra = tmp_path / "extra.png"
+    Image.new("RGB", (512, 512), color="red").save(extra)
+    (tmp_path / "extra.txt").write_text("a red square")
+    added = append_images_to_run(run, [str(extra)])
+
+    assert added[0].caption == "sks_style, a red square"
+    assert added[0].is_valid is True
+
+
+def test_append_images_flags_an_image_already_in_the_dataset(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    run = _run_with(source, ["a.png"])
+
+    # A copy of the same picture under a different name: a re-upload of what is there.
+    extra = tmp_path / "copy.png"
+    Image.new("RGB", (512, 512), color="blue").save(extra)
+    added = append_images_to_run(run, [str(extra)])
+
+    assert added[0].is_duplicate is True
+
+
+def test_append_images_skips_paths_the_run_already_holds(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    run = _run_with(source, ["a.png"])
+    existing_path = run.concept.samples[0].image_path
+
+    added = append_images_to_run(run, [existing_path])
+
+    assert added == []
+    assert len(run.concept.samples) == 1
+
+
+def test_append_images_changes_the_content_hash(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    run = _run_with(source, ["a.png"])
+    before = compute_content_hash(run.concept.samples)
+
+    extra = tmp_path / "extra.png"
+    Image.new("RGB", (512, 512), color="red").save(extra)
+    append_images_to_run(run, [str(extra)])
+
+    assert compute_content_hash(run.concept.samples) != before

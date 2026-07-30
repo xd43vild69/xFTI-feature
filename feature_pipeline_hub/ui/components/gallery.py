@@ -65,10 +65,51 @@ def _render_rename_dialog(run: IngestionRun) -> None:
         st.rerun()
 
 
+@st.dialog("Añadir imágenes")
+def _render_append_dialog(run: IngestionRun) -> None:
+    st.write(
+        "Añade imágenes que falten a este dataset. La curación ya hecha "
+        "(exclusiones, captions editados) se conserva."
+    )
+
+    uploaded_files = st.file_uploader(
+        "Imágenes (PNG, JPG, WebP) y captions .txt opcionales",
+        type=["png", "jpg", "jpeg", "webp", "txt"],
+        accept_multiple_files=True,
+        key=f"append_files_{run.run_id}",
+        label_visibility="collapsed",
+    )
+
+    if st.button(
+        "Añadir al dataset",
+        type="primary",
+        disabled=not uploaded_files,
+        use_container_width=True,
+    ):
+        added = state.append_images(run, uploaded_files)
+        if not added:
+            st.warning("No se añadió ninguna imagen nueva.")
+            return
+
+        duplicates = sum(1 for s in added if s.is_duplicate)
+        invalid = sum(1 for s in added if not s.is_valid)
+        notes = [f"{len(added)} imagen(es) añadida(s)"]
+        if duplicates:
+            notes.append(f"{duplicates} marcada(s) como duplicada(s)")
+        if invalid:
+            notes.append(f"{invalid} con errores de validación")
+
+        st.session_state["append_message"] = " · ".join(notes) + "."
+        st.rerun()
+
+
 def render() -> None:
     run = state.require_active_run()
     if run is None:
         return
+
+    if message := st.session_state.pop("append_message", None):
+        st.success(message)
 
     image_zoom.inject_styles()
 
@@ -111,9 +152,6 @@ def render() -> None:
 
     trigger = run.concept.trigger_word
     samples = [s for s in run.concept.samples if FILTERS[chosen_filter](s, trigger)]
-    if not samples:
-        st.caption(f"No images match '{chosen_filter}'.")
-        return
 
     # Rendered into the same toolbar row as the filters above. Also needs to run
     # before the grid: selecting all writes the checkboxes' session keys, which
@@ -128,6 +166,20 @@ def render() -> None:
             key=f"btn_rename_{run.run_id}",
         ):
             _render_rename_dialog(run)
+
+        if st.button(
+            "Añadir",
+            icon=":material/add_photo_alternate:",
+            help="Añadir imágenes a este dataset sin perder la curación",
+            key=f"btn_append_{run.run_id}",
+        ):
+            _render_append_dialog(run)
+
+    # After the toolbar, not before it: a filter matching nothing is exactly when
+    # adding images is most likely to be what the user wants.
+    if not samples:
+        st.caption(f"No images match '{chosen_filter}'.")
+        return
 
     thumbnail_size = state.thumbnail_size_for_columns(columns_per_row)
     for row_start in range(0, len(samples), columns_per_row):
