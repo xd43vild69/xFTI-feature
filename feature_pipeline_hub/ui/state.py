@@ -246,11 +246,14 @@ def _cached_thumbnail(image_path: str, mtime: float, size: int) -> Image.Image:
     return image_service.make_square_thumbnail(image_path, size)
 
 
-def render_thumbnail(image_path: str) -> None:
+def render_thumbnail(image_path: str, *, width: int | str = "stretch") -> None:
     """Render a square, theme-adaptive thumbnail, or an error if it's missing/unreadable.
 
     `mtime` is part of the cache key so an image edited or re-ingested on the same
-    path invalidates its cached thumbnail automatically.
+    path invalidates its cached thumbnail automatically. `width` defaults to filling
+    the container (right for a fixed-column grid like the curate gallery); pass a
+    pixel value where the surrounding column width varies, so the thumbnail stays a
+    consistent size regardless of how many items share the row.
     """
     path = Path(image_path)
     if not path.exists():
@@ -263,7 +266,7 @@ def render_thumbnail(image_path: str) -> None:
         st.error(f"Could not read image: {path.name}")
         return
 
-    st.image(thumbnail, width="stretch")
+    st.image(thumbnail, width=width)
 
 
 OBSERVABILITY_STEP = "steps/observability_step.py"

@@ -16,6 +16,34 @@ from feature_pipeline.domain.models import DatasetSample, DuplicateCluster, Inge
 from feature_pipeline.domain.validators import find_unpaired_files
 from feature_pipeline.infrastructure.storage import scan_caption_files
 
+# Fixed display size for every thumbnail on this page. Groups here (a duplicate
+# cluster, the excluded shelf, the blur ranking) vary in size from one to many
+# images, so `st.columns(n)` produces columns of very different widths; a
+# stretch-to-fill thumbnail would balloon in the narrow groups. A constant pixel
+# width keeps every image the same size regardless of how many share the row.
+THUMBNAIL_WIDTH = 150
+
+
+@st.dialog(" ", width="large")
+def _render_zoom_dialog(image_path: str) -> None:
+    st.image(image_path, width="stretch")
+
+
+def _zoom_button(image_path: str, key: str) -> None:
+    """Icon button that opens `image_path` at full size in a modal.
+
+    Streamlit has no double-click event to bind to, so a click on this icon is
+    the closest equivalent for "inspect this one image up close".
+    """
+    if st.button(
+        "",
+        icon=":material/zoom_in:",
+        type="tertiary",
+        help="Ver en tamaño grande",
+        key=f"zoom_{key}",
+    ):
+        _render_zoom_dialog(image_path)
+
 
 def render() -> None:
     run = state.require_active_run()
@@ -80,9 +108,10 @@ def _render_cluster(index: int, cluster: DuplicateCluster, run: IngestionRun) ->
         entries = [(cluster.kept, None), *cluster.duplicates]
         for column, (sample, distance) in zip(st.columns(len(entries)), entries):
             with column:
-                state.render_thumbnail(sample.image_path)
+                state.render_thumbnail(sample.image_path, width=THUMBNAIL_WIDTH)
                 with st.container(horizontal=True, vertical_alignment="center"):
                     st.caption("kept" if distance is None else f"distance {distance}")
+                    _zoom_button(sample.image_path, f"cluster_{run.run_id}_{sample.sample_id}")
                     if distance is not None and st.button(
                         "",
                         icon=":material/block:",
@@ -106,16 +135,18 @@ def _render_excluded_samples(run: IngestionRun) -> None:
 
         for column, sample in zip(st.columns(min(len(excluded), 6)), excluded):
             with column:
-                state.render_thumbnail(sample.image_path)
-                if st.button(
-                    "",
-                    icon=":material/undo:",
-                    type="tertiary",
-                    help="Restore into the dataset",
-                    key=f"restore_{run.run_id}_{sample.sample_id}",
-                ):
-                    state.set_excluded([sample.sample_id], False)
-                    st.rerun()
+                state.render_thumbnail(sample.image_path, width=THUMBNAIL_WIDTH)
+                with st.container(horizontal=True, vertical_alignment="center"):
+                    _zoom_button(sample.image_path, f"excluded_{run.run_id}_{sample.sample_id}")
+                    if st.button(
+                        "",
+                        icon=":material/undo:",
+                        type="tertiary",
+                        help="Restore into the dataset",
+                        key=f"restore_{run.run_id}_{sample.sample_id}",
+                    ):
+                        state.set_excluded([sample.sample_id], False)
+                        st.rerun()
 
 
 def _render_sharpness(run: IngestionRun) -> None:
@@ -138,9 +169,10 @@ def _render_sharpness(run: IngestionRun) -> None:
 
     for column, sample in zip(st.columns(len(softest)), softest):
         with column:
-            state.render_thumbnail(sample.image_path)
+            state.render_thumbnail(sample.image_path, width=THUMBNAIL_WIDTH)
             with st.container(horizontal=True, vertical_alignment="center"):
                 st.caption(f"{sample.metrics.sharpness:.0f}")
+                _zoom_button(sample.image_path, f"blur_{run.run_id}_{sample.sample_id}")
                 if st.button(
                     "",
                     icon=":material/block:",
@@ -200,7 +232,8 @@ def _render_missing_captions(run: IngestionRun) -> None:
     for sample in pending:
         col_image, col_caption = st.columns([1, 6], vertical_alignment="center")
         with col_image:
-            state.render_thumbnail(sample.image_path)
+            state.render_thumbnail(sample.image_path, width=THUMBNAIL_WIDTH)
+            _zoom_button(sample.image_path, f"missing_{run.run_id}_{sample.sample_id}")
         with col_caption:
             description_key = f"missing_caption_{run.run_id}_{sample.sample_id}"
             st.text_input(
