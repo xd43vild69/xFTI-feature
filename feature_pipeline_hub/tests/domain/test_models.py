@@ -1,5 +1,8 @@
+from datetime import datetime, timezone
+
 from feature_pipeline.domain.models import (
     ConceptGroup,
+    DatasetHealth,
     DatasetManifest,
     DatasetSample,
     ImageMetrics,
@@ -60,3 +63,32 @@ def test_dataset_manifest_defaults_created_at():
     )
     assert manifest.total_samples == 10
     assert manifest.created_at is not None
+
+
+def _health(**overrides) -> DatasetHealth:
+    fields = {
+        "run_id": "r1",
+        "concept_name": "cyberpunk",
+        "trigger_word": "sks_style",
+        "source_kind": "upload",
+        "created_at": datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc),
+        "total_samples": 3,
+        "active_samples": 3,
+        "excluded_samples": 0,
+        "duplicate_count": 0,
+        "missing_caption_count": 0,
+        "invalid_count": 0,
+    }
+    return DatasetHealth(**{**fields, **overrides})
+
+
+def test_a_clean_dataset_has_no_issues():
+    assert _health().has_issues is False
+    # Excluding images is a curation decision, not a problem to flag.
+    assert _health(active_samples=2, excluded_samples=1).has_issues is False
+
+
+def test_any_single_problem_flags_the_dataset():
+    assert _health(duplicate_count=1).has_issues is True
+    assert _health(missing_caption_count=1).has_issues is True
+    assert _health(invalid_count=1).has_issues is True

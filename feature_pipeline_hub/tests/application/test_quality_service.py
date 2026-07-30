@@ -15,6 +15,7 @@ from feature_pipeline.application.quality_service import (
     resolution_distribution,
     samples_missing_caption,
     samples_without_source_caption,
+    stored_quality_summary,
 )
 from feature_pipeline.domain.models import DatasetSample, ImageMetrics
 
@@ -37,6 +38,7 @@ def _sample(
     sharpness: float = 0.0,
     is_excluded: bool = False,
     is_valid: bool = True,
+    is_duplicate: bool = False,
 ) -> DatasetSample:
     return DatasetSample(
         sample_id=sample_id,
@@ -55,6 +57,7 @@ def _sample(
         ),
         is_excluded=is_excluded,
         is_valid=is_valid,
+        is_duplicate=is_duplicate,
     )
 
 
@@ -335,3 +338,48 @@ def test_colour_guard_is_skipped_when_a_sample_predates_colour_hashing():
     legacy = _sample("b", phash=HASH_A, colorhash="")
 
     assert perceptual_distance(red, legacy) == 0
+
+
+def test_stored_summary_never_reclusters():
+    """The load-bearing guarantee: two samples that *would* cluster, but aren't flagged.
+
+    quality_summary would report these as duplicates; the stored variant must not,
+    because re-clustering is exactly the O(n²) cost it exists to avoid.
+    """
+    a = _sample("a", phash=HASH_A)
+    b = _sample("b", phash=HASH_A_1BIT)
+
+    assert len(find_duplicate_clusters([a, b], threshold=5)) == 1
+    assert stored_quality_summary([a, b])["duplicates"] == 0
+
+
+def test_stored_summary_trusts_the_flag_over_the_hashes():
+    far_but_flagged = _sample("a", phash=HASH_FAR, is_duplicate=True)
+    near_but_unflagged = _sample("b", phash=HASH_A)
+
+    assert stored_quality_summary([far_but_flagged, near_but_unflagged])["duplicates"] == 1
+
+
+def test_stored_summary_counts_excluded_samples_only_as_excluded():
+    active = _sample("a")
+    excluded = _sample("b", is_excluded=True, is_valid=False, is_duplicate=True, caption="sks")
+
+    summary = stored_quality_summary([active, excluded], "sks")
+
+    assert summary["total"] == 2
+    assert summary["active"] == 1
+    assert summary["excluded"] == 1
+    assert summary["duplicates"] == 0
+    assert summary["invalid"] == 0
+    assert summary["missing_caption"] == 0
+
+
+def test_stored_summary_of_an_empty_set_is_all_zeros():
+    assert stored_quality_summary([]) == {
+        "total": 0,
+        "active": 0,
+        "excluded": 0,
+        "duplicates": 0,
+        "missing_caption": 0,
+        "invalid": 0,
+    }

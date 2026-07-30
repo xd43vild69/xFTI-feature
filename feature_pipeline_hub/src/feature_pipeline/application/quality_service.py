@@ -194,6 +194,33 @@ def samples_without_source_caption(samples: list[DatasetSample]) -> list[Dataset
     return [s for s in samples if not s.is_excluded and not s.original_caption.strip()]
 
 
+def stored_quality_summary(
+    samples: list[DatasetSample], trigger_word: str = ""
+) -> dict[str, int]:
+    """Headline counts that never re-cluster: duplicates come from the stored flag.
+
+    Same shape as `quality_summary` minus `duplicate_clusters`, which a per-sample
+    flag cannot reconstruct. Clustering is O(n²) and the quality step already
+    persists its verdict, so a view spanning every dataset reads that verdict back
+    instead of recomputing it — the same trade `context_bar._render_counters` and
+    `dataset_service.build_manifest` make.
+
+    The cost of the trade: a run that has never been through the quality step has
+    no flags set and reports zero duplicates. Callers showing this to a user have
+    to say so.
+    """
+    active = [s for s in samples if not s.is_excluded]
+
+    return {
+        "total": len(samples),
+        "active": len(active),
+        "excluded": len(samples) - len(active),
+        "duplicates": sum(1 for s in active if s.is_duplicate),
+        "missing_caption": len(samples_missing_caption(samples, trigger_word)),
+        "invalid": sum(1 for s in active if not s.is_valid),
+    }
+
+
 def quality_summary(
     samples: list[DatasetSample],
     trigger_word: str = "",

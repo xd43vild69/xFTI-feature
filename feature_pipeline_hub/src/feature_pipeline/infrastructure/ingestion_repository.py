@@ -6,6 +6,7 @@ removed when the user explicitly deletes them.
 
 import json
 import sqlite3
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from feature_pipeline.domain.models import (
@@ -205,6 +206,29 @@ def mark_duplicates(conn: sqlite3.Connection, run_id: str, sample_ids: list[str]
             )
 
 
+def inventory_fingerprint(conn: sqlite3.Connection) -> tuple:
+    """Cheap value that changes whenever the dataset inventory would look different.
+
+    Aggregates only, so it costs a scan and materialises no rows — the point is to
+    key a cache whose miss path loads every sample of every run.
+
+    `SUM(is_duplicate)` is in here deliberately: `mark_duplicates` rewrites that
+    column without touching `updated_at`, so a timestamp-only fingerprint would
+    miss every duplicate scan. `MAX` over ISO-8601 UTC strings orders correctly as
+    text. The run count catches deleting a run that had no samples to begin with.
+    """
+    counts = conn.execute(
+        """
+        SELECT COUNT(*), COALESCE(SUM(is_duplicate), 0), COALESCE(SUM(is_excluded), 0),
+               COALESCE(MAX(updated_at), '')
+        FROM samples
+        """
+    ).fetchone()
+    run_count = conn.execute("SELECT COUNT(*) FROM ingestion_runs").fetchone()[0]
+
+    return (*counts, run_count)
+
+
 def delete_ingestion_run(conn: sqlite3.Connection, run_id: str) -> None:
     """Delete a run and its samples. Files on disk are handled by the caller."""
     with conn:
@@ -236,6 +260,49 @@ def update_step_telemetry(
             f"UPDATE ingestion_runs SET {duration_col} = ?, {error_col} = ? WHERE run_id = ?",
             (duration_seconds, error_count, run_id),
         )
+
+
+@dataclass(frozen=True)
+class StepTelemetry:
+    """What `update_step_telemetry` recorded for one run, read back for the dashboard."""
+
+    run_id: str
+    import_duration_seconds: float | None
+    import_error_count: int
+    recaption_duration_seconds: float | None
+    recaption_error_count: int
+    quality_duration_seconds: float | None
+    export_duration_seconds: float | None
+    export_error_count: int
+    cost_estimate: float | None
+
+
+def get_step_telemetry(conn: sqlite3.Connection, run_id: str) -> StepTelemetry | None:
+    """Per-step durations and error counts for one run, or None if the run is gone."""
+    row = conn.execute(
+        """
+        SELECT run_id, import_duration_seconds, import_error_count,
+               recaption_duration_seconds, recaption_error_count,
+               quality_duration_seconds, export_duration_seconds, export_error_count,
+               cost_estimate
+        FROM ingestion_runs WHERE run_id = ?
+        """,
+        (run_id,),
+    ).fetchone()
+    if row is None:
+        return None
+
+    return StepTelemetry(
+        run_id=row["run_id"],
+        import_duration_seconds=row["import_duration_seconds"],
+        import_error_count=row["import_error_count"] or 0,
+        recaption_duration_seconds=row["recaption_duration_seconds"],
+        recaption_error_count=row["recaption_error_count"] or 0,
+        quality_duration_seconds=row["quality_duration_seconds"],
+        export_duration_seconds=row["export_duration_seconds"],
+        export_error_count=row["export_error_count"] or 0,
+        cost_estimate=row["cost_estimate"],
+    )
 
 
 def update_run_cost_estimate(conn: sqlite3.Connection, run_id: str, cost: float | None) -> None:

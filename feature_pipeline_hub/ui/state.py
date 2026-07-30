@@ -10,9 +10,15 @@ from pathlib import Path
 import streamlit as st
 from PIL import Image
 
-from feature_pipeline.application import caption_service, image_service, training_service
+from feature_pipeline.application import (
+    caption_service,
+    image_service,
+    inventory_service,
+    training_service,
+)
 from feature_pipeline.domain.models import (
     ConceptGroup,
+    DatasetHealth,
     DatasetManifest,
     DatasetSample,
     IngestionRun,
@@ -50,6 +56,28 @@ def load_run(run_id: str) -> IngestionRun | None:
 def save_run(run: IngestionRun) -> None:
     with _db() as conn:
         repo.save_ingestion_run(conn, run)
+
+
+def _inventory_fingerprint() -> tuple:
+    with _db() as conn:
+        return repo.inventory_fingerprint(conn)
+
+
+@st.cache_data(max_entries=4, show_spinner=False)
+def _cached_inventory(fingerprint: tuple) -> list[DatasetHealth]:
+    with _db() as conn:
+        return inventory_service.load_dataset_inventory(conn)
+
+
+def dataset_inventory() -> list[DatasetHealth]:
+    """Health counts for every dataset, rebuilt only when something actually changed.
+
+    Same shape as `_cached_thumbnail` below: a cheap key guarding an expensive value.
+    Building the inventory loads every sample of every run, and Streamlit reruns the
+    whole script on each widget interaction, so without the fingerprint that load
+    would repeat on every click of the Metrics page.
+    """
+    return _cached_inventory(_inventory_fingerprint())
 
 
 def save_caption(sample_id: str, caption: str) -> None:

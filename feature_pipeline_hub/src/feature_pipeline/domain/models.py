@@ -97,6 +97,40 @@ class IngestionRunSummary(BaseModel):
     sample_count: int
 
 
+class DatasetHealth(BaseModel):
+    """Per-dataset counts for the cross-dataset inventory on the Metrics page.
+
+    `duplicate_count` comes from the stored `is_duplicate` flag, not from fresh
+    clustering — see `quality_service.stored_quality_summary`. That makes it a
+    report of the last quality scan rather than of the dataset's current state,
+    which is the trade the inventory has to make to stay cheap across every run.
+    """
+
+    run_id: str
+    concept_name: str
+    trigger_word: str
+    source_kind: SourceKind
+    created_at: datetime
+    total_samples: int
+    active_samples: int
+    excluded_samples: int
+    duplicate_count: int
+    missing_caption_count: int
+    invalid_count: int
+    # Only comparable within one dataset — see image_service.compute_sharpness.
+    median_sharpness: float = 0.0
+
+    @property
+    def has_issues(self) -> bool:
+        """Whether anything on this dataset is worth acting on.
+
+        A boolean rather than a total, because one sample can be duplicate *and*
+        invalid at once: summing the counts would read like a sample count while
+        being something else entirely.
+        """
+        return bool(self.duplicate_count or self.missing_caption_count or self.invalid_count)
+
+
 class DatasetManifest(BaseModel):
     """A measurable snapshot of what was exported, so two versions can be compared.
 
