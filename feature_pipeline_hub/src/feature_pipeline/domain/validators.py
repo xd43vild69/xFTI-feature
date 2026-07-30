@@ -6,6 +6,9 @@ from feature_pipeline.domain.models import DatasetSample, ImageMetrics
 
 ALLOWED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 MIN_RESOLUTION_PX = 512
+# A side reaching this clears the sample even if the other falls short of
+# MIN_RESOLUTION_PX: a tall or wide crop can carry enough detail on one axis alone.
+MIN_RESOLUTION_PX_ALT = 1024
 MIN_CAPTION_LENGTH = 3
 MAX_CAPTION_LENGTH = 500
 
@@ -21,12 +24,17 @@ def validate_extension(image_path: str) -> list[str]:
 
 
 def validate_resolution(metrics: ImageMetrics) -> list[str]:
-    if metrics.width < MIN_RESOLUTION_PX or metrics.height < MIN_RESOLUTION_PX:
-        return [
-            f"Resolution {metrics.width}x{metrics.height} is below the minimum "
-            f"{MIN_RESOLUTION_PX}x{MIN_RESOLUTION_PX}"
-        ]
-    return []
+    both_sides_pass = metrics.width >= MIN_RESOLUTION_PX and metrics.height >= MIN_RESOLUTION_PX
+    one_side_is_large = metrics.width >= MIN_RESOLUTION_PX_ALT or metrics.height >= MIN_RESOLUTION_PX_ALT
+
+    if both_sides_pass or one_side_is_large:
+        return []
+
+    return [
+        f"Resolution {metrics.width}x{metrics.height} is below the minimum "
+        f"{MIN_RESOLUTION_PX}x{MIN_RESOLUTION_PX} "
+        f"(and neither side reaches {MIN_RESOLUTION_PX_ALT})"
+    ]
 
 
 def validate_caption(caption: str) -> list[str]:

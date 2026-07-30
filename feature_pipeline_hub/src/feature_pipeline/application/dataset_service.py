@@ -118,6 +118,25 @@ def append_images_to_run(
     return added
 
 
+def revalidate_samples(samples: list[DatasetSample]) -> int:
+    """Recompute is_valid/validation_errors in place, and return how many changed.
+
+    Validation runs once, at ingestion, and its verdict is what's stored — so a
+    sample imported before a validation rule changed keeps the old rule's verdict
+    until this runs. Meant as a one-off correction after a rule change, not
+    something called on every render.
+    """
+    changed = 0
+    for sample in samples:
+        errors = validate_sample(sample)
+        is_valid = not errors
+        if is_valid != sample.is_valid or errors != sample.validation_errors:
+            sample.is_valid = is_valid
+            sample.validation_errors = errors
+            changed += 1
+    return changed
+
+
 def _resolved(image_path: str) -> str:
     """Absolute, symlink-free form of a path, for comparing two references to a file."""
     return str(Path(image_path).resolve())

@@ -8,6 +8,8 @@ import shutil
 import tempfile
 from pathlib import Path
 
+from feature_pipeline.domain.naming import standardized_stem
+
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 
 
@@ -75,11 +77,86 @@ def write_caption_sidecar(image_path: str, caption: str, keep_backup: bool = Tru
     return str(caption_path)
 
 
-def save_uploaded_files(uploaded_files: list, destination: str | None = None) -> str:
-    """Save Streamlit UploadedFile objects to a folder and return that folder's path.
+def _available_stem(taken: set[str], stem: str) -> str:
+    """A stem no file in the folder uses yet, suffixed `-1`, `-2`… on collision.
+
+    A safety net rather than the normal path: `standardized_stem` combined with
+    `next_standard_index` should already hand out a free name, but this still
+    guards against a stray file — one dropped in by hand, or left over from before
+    the standardized scheme — happening to occupy it.
+    """
+    if stem not in taken:
+        return stem
+
+    index = 1
+    while f"{stem}-{index}" in taken:
+        index += 1
+    return f"{stem}-{index}"
+
+
+def _pair_uploads(uploaded_files: list) -> tuple[list[tuple], list]:
+    """Split uploads into (image, same-stem caption or None) pairs, plus orphan captions.
+
+    Mirrors how ingestion looks up a caption: by stem, next to the image. A .txt
+    with no image of that stem in the same batch has nothing to attach to, so it's
+    kept aside and written under its own name rather than silently dropped.
+    """
+    images: dict[str, object] = {}
+    captions: dict[str, object] = {}
+
+    for uploaded_file in uploaded_files:
+        path = Path(uploaded_file.name)
+        if path.suffix.lower() in IMAGE_EXTENSIONS:
+            images[path.stem] = uploaded_file
+        elif path.suffix.lower() == ".txt":
+            captions[path.stem] = uploaded_file
+
+    pairs = [(image, captions.pop(stem, None)) for stem, image in images.items()]
+    return pairs, list(captions.values())
+
+
+def _write_standardized(
+    uploaded_files: list, folder: Path, concept_name: str, start_index: int
+) -> list[str]:
+    """Write uploads as `<concept_slug>_NNNN.ext`, images numbered in upload order.
+
+    A same-stem `.txt` uploaded alongside an image takes that image's new stem, so
+    the pair still matches under `read_caption_for_image`'s by-stem lookup.
+    """
+    pairs, orphan_captions = _pair_uploads(uploaded_files)
+    taken = {path.stem for path in folder.iterdir() if path.is_file()}
+    written: list[str] = []
+    index = start_index
+
+    for image, caption in pairs:
+        stem = _available_stem(taken, standardized_stem(concept_name, index))
+        taken.add(stem)
+        index += 1
+
+        image_path = folder / f"{stem}{Path(image.name).suffix}"
+        image_path.write_bytes(image.getbuffer())
+        written.append(str(image_path))
+
+        if caption is not None:
+            (folder / f"{stem}.txt").write_bytes(caption.getbuffer())
+
+    for caption in orphan_captions:
+        stem = _available_stem(taken, Path(caption.name).stem)
+        taken.add(stem)
+        (folder / f"{stem}.txt").write_bytes(caption.getbuffer())
+
+    return written
+
+
+def save_uploaded_files(uploaded_files: list, concept_name: str, destination: str | None = None) -> str:
+    """Save Streamlit UploadedFile objects to a folder, named `<concept_slug>_NNNN.ext`.
 
     Args:
         uploaded_files: List of streamlit.UploadedFile objects from st.file_uploader
+        concept_name: The dataset's concept name, source of the standardized stem —
+            every image lands under one naming scheme regardless of what it was
+            called on the user's machine, which is what later lets a raw filename
+            be traced back to its position in the dataset.
         destination: Target folder; defaults to a temporary one. Runs that must
             outlive the session pass a folder under `data/raw/`, since /tmp gets
             swept and would break previews of older ingestions.
@@ -93,54 +170,30 @@ def save_uploaded_files(uploaded_files: list, destination: str | None = None) ->
         folder = Path(destination)
         folder.mkdir(parents=True, exist_ok=True)
 
-    for uploaded_file in uploaded_files:
-        file_path = folder / uploaded_file.name
-        file_path.write_bytes(uploaded_file.getbuffer())
-
+    _write_standardized(uploaded_files, folder, concept_name, start_index=1)
     return str(folder)
 
 
-def _available_stem(taken: set[str], stem: str) -> str:
-    """A stem no file in the folder uses yet, suffixed `-1`, `-2`… on collision."""
-    if stem not in taken:
-        return stem
-
-    index = 1
-    while f"{stem}-{index}" in taken:
-        index += 1
-    return f"{stem}-{index}"
-
-
-def append_uploaded_files(uploaded_files: list, folder: str) -> list[str]:
+def append_uploaded_files(
+    uploaded_files: list, folder: str, concept_name: str, start_index: int
+) -> list[str]:
     """Save uploads into a folder that already holds files, and return what was written.
+
+    Continues the standardized numbering from `start_index` — the caller works out
+    what that is from the samples the run already has, since a dataset started
+    before this naming scheme, or one mixed with files added outside the app,
+    won't have a count that matches what's on disk.
 
     `save_uploaded_files` owns the folder it writes to, so a name collision there
     cannot happen. Adding to a curated run is the opposite case: overwriting would
-    swap the bytes under a sample that is already captioned, measured and validated,
-    while its stored metrics went on describing the old image. Colliding names take a
-    suffix instead, so nothing already in the dataset is ever replaced.
-
-    The suffix is resolved per stem, not per file, so an image and the .txt uploaded
-    beside it keep matching names — `read_caption_for_image` pairs them by stem.
+    swap the bytes under a sample that is already captioned, measured and
+    validated, while its stored metrics went on describing the old image — so a
+    collision here still falls back to a `-1`, `-2`… suffix instead of replacing
+    anything.
     """
     destination = Path(folder)
     destination.mkdir(parents=True, exist_ok=True)
-
-    taken = {path.stem for path in destination.iterdir() if path.is_file()}
-    stems: dict[str, str] = {}
-    written: list[str] = []
-
-    for uploaded_file in uploaded_files:
-        source = Path(uploaded_file.name)
-        if source.stem not in stems:
-            stems[source.stem] = _available_stem(taken, source.stem)
-            taken.add(stems[source.stem])
-
-        target = destination / f"{stems[source.stem]}{source.suffix}"
-        target.write_bytes(uploaded_file.getbuffer())
-        written.append(str(target))
-
-    return written
+    return _write_standardized(uploaded_files, destination, concept_name, start_index)
 
 
 def run_upload_dir(run_id: str) -> str:

@@ -8,6 +8,7 @@ from feature_pipeline.application.dataset_service import (
     compute_content_hash,
     create_ingestion_run,
     ingest_concept_from_folder,
+    revalidate_samples,
 )
 from feature_pipeline.domain.models import ConceptGroup, DatasetSample, ImageMetrics
 
@@ -299,3 +300,39 @@ def test_append_images_changes_the_content_hash(tmp_path: Path):
     append_images_to_run(run, [str(extra)])
 
     assert compute_content_hash(run.concept.samples) != before
+
+
+def test_revalidate_samples_clears_a_verdict_stale_from_an_older_rule():
+    # Simulates a sample imported under an older, stricter resolution rule: stored
+    # as invalid even though it now passes (one side >= 1024).
+    sample = DatasetSample(
+        sample_id="s1",
+        image_path="a.png",
+        caption="sks_style, a cat",
+        original_caption="a cat",
+        metrics=ImageMetrics(
+            width=406, height=1024, aspect_ratio=406 / 1024, format="PNG", phash="a" * 16
+        ),
+        is_valid=False,
+        validation_errors=["Resolution 406x1024 is below the minimum 512x512"],
+    )
+
+    changed = revalidate_samples([sample])
+
+    assert changed == 1
+    assert sample.is_valid is True
+    assert sample.validation_errors == []
+
+
+def test_revalidate_samples_leaves_an_already_correct_verdict_untouched():
+    sample = DatasetSample(
+        sample_id="s1",
+        image_path="a.png",
+        caption="sks_style, a cat",
+        original_caption="a cat",
+        metrics=ImageMetrics(
+            width=512, height=512, aspect_ratio=1.0, format="PNG", phash="a" * 16
+        ),
+    )
+
+    assert revalidate_samples([sample]) == 0

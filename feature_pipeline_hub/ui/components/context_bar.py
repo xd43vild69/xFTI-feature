@@ -48,9 +48,25 @@ def render() -> None:
             _render_details(run)
 
         if st.button(
+            "Revalidate",
+            icon=":material/rule:",
+            type="tertiary",
+            help="Re-check every dataset against the current validation rules "
+            "(fixes stale verdicts after a rule change)",
+        ):
+            changed = state.revalidate_all_runs()
+            st.session_state["revalidate_message"] = (
+                f"{changed} sample(s) updated." if changed else "Nothing changed."
+            )
+            st.rerun()
+
+        if st.button(
             "Delete", icon=":material/delete:", type="tertiary", help="Delete this dataset"
         ):
             _confirm_delete(selected, labels[selected])
+
+    if message := st.session_state.pop("revalidate_message", None):
+        st.toast(message, icon=":material/rule:")
 
 
 def _render_counters(run: IngestionRun) -> None:

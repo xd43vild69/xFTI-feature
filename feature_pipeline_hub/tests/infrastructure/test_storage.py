@@ -74,23 +74,40 @@ class _FakeUpload:
         return self._payload
 
 
-def test_save_uploaded_files_writes_files_to_a_scannable_folder(tmp_path: Path):
+def test_save_uploaded_files_names_images_after_the_concept(tmp_path: Path):
     source_image = tmp_path / "src.png"
     _make_image(source_image)
     uploads = [
-        _FakeUpload("a.png", source_image.read_bytes()),
-        _FakeUpload("a.txt", b"a red square"),
+        _FakeUpload("original_name.png", source_image.read_bytes()),
+        _FakeUpload("original_name.txt", b"a red square"),
     ]
 
-    folder = save_uploaded_files(uploads)
+    folder = save_uploaded_files(uploads, "Cyberpunk Style")
 
-    assert sorted(Path(p).name for p in scan_raw_folder(folder)) == ["a.png"]
-    assert read_caption_for_image(str(Path(folder) / "a.png")) == "a red square"
+    assert sorted(Path(p).name for p in scan_raw_folder(folder)) == ["cyberpunk_style_0001.png"]
+    assert (
+        read_caption_for_image(str(Path(folder) / "cyberpunk_style_0001.png"))
+        == "a red square"
+    )
+
+
+def test_save_uploaded_files_numbers_multiple_images_in_upload_order(tmp_path: Path):
+    source_image = tmp_path / "src.png"
+    _make_image(source_image)
+    uploads = [
+        _FakeUpload("z.png", source_image.read_bytes()),
+        _FakeUpload("a.png", source_image.read_bytes()),
+    ]
+
+    folder = save_uploaded_files(uploads, "cyberpunk_style")
+
+    names = sorted(Path(p).name for p in scan_raw_folder(folder))
+    assert names == ["cyberpunk_style_0001.png", "cyberpunk_style_0002.png"]
 
 
 def test_save_uploaded_files_returns_distinct_folders_per_call():
-    first = save_uploaded_files([_FakeUpload("a.txt", b"one")])
-    second = save_uploaded_files([_FakeUpload("a.txt", b"two")])
+    first = save_uploaded_files([_FakeUpload("a.txt", b"one")], "concept")
+    second = save_uploaded_files([_FakeUpload("a.txt", b"two")], "concept")
 
     assert first != second
 
@@ -101,11 +118,13 @@ def test_save_uploaded_files_honours_an_explicit_destination(tmp_path: Path):
     destination = tmp_path / "runs" / "run-1"
 
     folder = save_uploaded_files(
-        [_FakeUpload("a.png", source_image.read_bytes())], destination=str(destination)
+        [_FakeUpload("a.png", source_image.read_bytes())],
+        "concept",
+        destination=str(destination),
     )
 
     assert Path(folder) == destination
-    assert (destination / "a.png").exists()
+    assert (destination / "concept_0001.png").exists()
 
 
 def test_delete_managed_folder_removes_folders_under_data_raw(tmp_path: Path, monkeypatch):
@@ -218,19 +237,42 @@ def test_scan_caption_files_of_a_missing_folder_is_empty(tmp_path):
     assert scan_caption_files(str(tmp_path / "gone")) == []
 
 
-def test_append_uploaded_files_keeps_existing_files_intact(tmp_path: Path):
+def test_append_uploaded_files_continues_the_standardized_numbering(tmp_path: Path):
     source_image = tmp_path / "src.png"
     _make_image(source_image)
     folder = tmp_path / "run-1"
     folder.mkdir()
-    (folder / "a.png").write_bytes(b"original bytes")
+    (folder / "cyberpunk_style_0001.png").write_bytes(b"already there")
 
     written = append_uploaded_files(
-        [_FakeUpload("a.png", source_image.read_bytes())], str(folder)
+        [_FakeUpload("whatever_name.png", source_image.read_bytes())],
+        str(folder),
+        "cyberpunk_style",
+        start_index=2,
     )
 
-    assert (folder / "a.png").read_bytes() == b"original bytes"
-    assert [Path(p).name for p in written] == ["a-1.png"]
+    assert [Path(p).name for p in written] == ["cyberpunk_style_0002.png"]
+    assert (folder / "cyberpunk_style_0001.png").read_bytes() == b"already there"
+
+
+def test_append_uploaded_files_falls_back_to_a_suffix_on_a_disk_collision(tmp_path: Path):
+    """`start_index` is a hint from the caller; a stray file on disk still wins the
+    race rather than being overwritten, via the same -1/-2 fallback as before."""
+    source_image = tmp_path / "src.png"
+    _make_image(source_image)
+    folder = tmp_path / "run-1"
+    folder.mkdir()
+    (folder / "cyberpunk_style_0002.png").write_bytes(b"unexpectedly already there")
+
+    written = append_uploaded_files(
+        [_FakeUpload("whatever_name.png", source_image.read_bytes())],
+        str(folder),
+        "cyberpunk_style",
+        start_index=2,
+    )
+
+    assert [Path(p).name for p in written] == ["cyberpunk_style_0002-1.png"]
+    assert (folder / "cyberpunk_style_0002.png").read_bytes() == b"unexpectedly already there"
 
 
 def test_append_uploaded_files_keeps_an_image_paired_with_its_caption(tmp_path: Path):
@@ -238,23 +280,43 @@ def test_append_uploaded_files_keeps_an_image_paired_with_its_caption(tmp_path: 
     _make_image(source_image)
     folder = tmp_path / "run-1"
     folder.mkdir()
-    (folder / "a.png").write_bytes(b"original bytes")
-    (folder / "a.txt").write_text("the original caption")
 
     append_uploaded_files(
         [
-            _FakeUpload("a.png", source_image.read_bytes()),
-            _FakeUpload("a.txt", b"the added caption"),
+            _FakeUpload("photo.png", source_image.read_bytes()),
+            _FakeUpload("photo.txt", b"the added caption"),
         ],
         str(folder),
+        "cyberpunk_style",
+        start_index=1,
     )
 
-    # Both took the same suffix, so the sidecar still resolves from the image.
-    assert read_caption_for_image(str(folder / "a-1.png")) == "the added caption"
-    assert read_caption_for_image(str(folder / "a.png")) == "the original caption"
+    assert read_caption_for_image(str(folder / "cyberpunk_style_0001.png")) == "the added caption"
 
 
 def test_append_uploaded_files_creates_the_folder_when_missing(tmp_path: Path):
-    written = append_uploaded_files([_FakeUpload("a.txt", b"one")], str(tmp_path / "new"))
+    source_image = tmp_path / "src.png"
+    _make_image(source_image)
 
-    assert Path(written[0]) == tmp_path / "new" / "a.txt"
+    written = append_uploaded_files(
+        [_FakeUpload("a.png", source_image.read_bytes())],
+        str(tmp_path / "new"),
+        "concept",
+        start_index=1,
+    )
+
+    assert Path(written[0]) == tmp_path / "new" / "concept_0001.png"
+
+
+def test_append_uploaded_files_writes_an_orphan_caption_under_its_own_name(tmp_path: Path):
+    """A .txt with no matching image in the batch has nothing to attach to."""
+    folder = tmp_path / "run-1"
+
+    append_uploaded_files(
+        [_FakeUpload("stray.txt", b"no image for this one")],
+        str(folder),
+        "concept",
+        start_index=1,
+    )
+
+    assert (folder / "stray.txt").read_text() == "no image for this one"

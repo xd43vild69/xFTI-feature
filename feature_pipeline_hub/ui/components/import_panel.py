@@ -13,10 +13,15 @@ import streamlit as st
 import state
 import step_telemetry
 from feature_pipeline.application.dataset_service import create_ingestion_run
+from feature_pipeline.domain.naming import slugify
 from feature_pipeline.infrastructure.storage import run_upload_dir, save_uploaded_files
 
 SOURCE_FOLDER = "From folder"
 SOURCE_UPLOAD = "Upload files"
+
+# Set once the user edits Trigger word by hand, so their edit sticks instead of
+# being overwritten the next time Concept name changes.
+_TRIGGER_TOUCHED_KEY = "trigger_word_touched"
 
 
 def render() -> None:
@@ -24,10 +29,37 @@ def render() -> None:
     _render_result()
 
 
+def _sync_trigger_word() -> None:
+    """Mirror Concept name into Trigger word, until the user has typed one directly.
+
+    Runs on Concept name's on_change, so it can write session_state before Trigger
+    word's own widget renders on the same script run — Streamlit forbids setting a
+    keyed widget's value after it has already been instantiated.
+    """
+    if st.session_state.get(_TRIGGER_TOUCHED_KEY):
+        return
+    st.session_state["trigger_word"] = slugify(st.session_state.get("concept_name", ""))
+
+
+def _mark_trigger_word_touched() -> None:
+    st.session_state[_TRIGGER_TOUCHED_KEY] = True
+
+
 def _render_form() -> None:
     with st.container(horizontal=True):
-        st.text_input("Concept name", key="concept_name", placeholder="cyberpunk_style")
-        st.text_input("Trigger word", key="trigger_word", placeholder="sks_style")
+        st.text_input(
+            "Concept name",
+            key="concept_name",
+            placeholder="cyberpunk_style",
+            on_change=_sync_trigger_word,
+        )
+        st.text_input(
+            "Trigger word",
+            key="trigger_word",
+            placeholder="sks_style",
+            help="Auto-filled from Concept name until you edit it directly.",
+            on_change=_mark_trigger_word_touched,
+        )
 
     source = st.segmented_control(
         "Source",
@@ -69,24 +101,25 @@ def _ingest(from_folder: bool, typed_path: str | None, uploaded_files: list | No
     concept_name = st.session_state.get("concept_name", "").strip()
     trigger_word = st.session_state.get("trigger_word", "").strip()
 
-    # A fresh run per click: previous ingestions stay selectable instead of being
-    # overwritten. Uploads are copied into data/raw/<run_id>/ so they survive reloads.
-    run_id = str(uuid.uuid4())
-    folder_path = typed_path if from_folder else (
-        save_uploaded_files(uploaded_files, destination=run_upload_dir(run_id))
-        if uploaded_files
-        else None
-    )
-
-    if not folder_path:
-        st.warning(
-            "Enter a folder path." if from_folder else "Upload at least one image."
-        )
+    # Checked before writing anything: standardized filenames are derived from
+    # concept_name, so an upload can't be saved to disk without it, and a run row
+    # never gets written for a rejected submission — nothing to leave orphaned.
+    if not from_folder and not uploaded_files:
+        st.warning("Upload at least one image.")
         return
-
+    if from_folder and not typed_path:
+        st.warning("Enter a folder path.")
+        return
     if not concept_name or not trigger_word:
         st.warning("Set concept name and trigger word above first.")
         return
+
+    # A fresh run per click: previous ingestions stay selectable instead of being
+    # overwritten. Uploads are copied into data/raw/<run_id>/ so they survive reloads.
+    run_id = str(uuid.uuid4())
+    folder_path = typed_path if from_folder else save_uploaded_files(
+        uploaded_files, concept_name, destination=run_upload_dir(run_id)
+    )
 
     started = time.time()
     try:

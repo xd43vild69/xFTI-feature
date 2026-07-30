@@ -25,6 +25,7 @@ from feature_pipeline.domain.models import (
     IngestionRun,
     IngestionRunSummary,
 )
+from feature_pipeline.domain.naming import next_standard_index
 from feature_pipeline.infrastructure import ingestion_repository as repo
 from feature_pipeline.infrastructure import training_repository as training_repo
 from feature_pipeline.infrastructure import training_runner
@@ -60,6 +61,26 @@ def load_run(run_id: str) -> IngestionRun | None:
         return repo.load_ingestion_run(conn, run_id)
 
 
+def revalidate_all_runs() -> int:
+    """Re-check every sample of every run against the current validation rules.
+
+    A one-off correction for a validation rule change: samples keep the verdict
+    computed when they were imported, so a rule made stricter or looser afterward
+    otherwise never reaches datasets that already existed. Returns how many
+    samples' verdicts actually changed.
+    """
+    total_changed = 0
+    for summary in list_runs():
+        run = load_run(summary.run_id)
+        if run is None:
+            continue
+        changed = dataset_service.revalidate_samples(run.concept.samples)
+        if changed:
+            save_run(run)
+            total_changed += changed
+    return total_changed
+
+
 def save_run(run: IngestionRun) -> None:
     with _db() as conn:
         repo.save_ingestion_run(conn, run)
@@ -75,8 +96,18 @@ def append_images(run: IngestionRun, uploaded_files: list) -> list[DatasetSample
 
     Non-image uploads are written too, since a .txt beside an image is how a caption
     arrives, but only the images become samples.
+
+    Filenames continue the standardized `<concept_slug>_NNNN` numbering: the next
+    index is read off the run's existing sample stems rather than assumed from
+    their count, so it still lands on a free number for a run started before this
+    naming scheme, or one that mixes standardized and non-standardized names.
     """
-    written = append_uploaded_files(uploaded_files, run_upload_dir(run.run_id))
+    existing_stems = [Path(s.image_path).stem for s in run.concept.samples]
+    start_index = next_standard_index(existing_stems, run.concept.concept_name)
+
+    written = append_uploaded_files(
+        uploaded_files, run_upload_dir(run.run_id), run.concept.concept_name, start_index
+    )
     images = [path for path in written if Path(path).suffix.lower() in IMAGE_EXTENSIONS]
 
     added = dataset_service.append_images_to_run(run, images)

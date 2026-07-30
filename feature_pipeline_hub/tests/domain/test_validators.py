@@ -33,6 +33,18 @@ def test_validate_resolution_passes_minimum():
     assert validate_resolution(_metrics(width=512, height=512)) == []
 
 
+def test_validate_resolution_passes_when_one_side_reaches_the_alt_minimum():
+    # A tall crop: the short side falls under 512, but the long side alone (>=1024)
+    # carries enough detail.
+    assert validate_resolution(_metrics(width=406, height=1024)) == []
+    assert validate_resolution(_metrics(width=1024, height=406)) == []
+
+
+def test_validate_resolution_still_flags_a_side_below_the_alt_minimum_on_both_axes():
+    errors = validate_resolution(_metrics(width=1023, height=511))
+    assert len(errors) == 1
+
+
 def test_validate_caption_flags_empty():
     assert validate_caption("   ") == ["Caption is empty"]
 

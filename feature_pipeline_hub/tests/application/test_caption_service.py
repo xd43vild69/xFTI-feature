@@ -87,3 +87,4 @@ def test_replace_exact_word_avoids_substring_matches():
     assert new_text == "caterpillar, dog, bobcat"
     assert count == 1
 
+
