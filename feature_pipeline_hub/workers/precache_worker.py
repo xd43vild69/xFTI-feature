@@ -575,4 +575,26 @@ def preprocess_krea2():
 
 
 if __name__ == "__main__":
-    preprocess_krea2()
+    import time as _time
+
+    from _telemetry import emit_lifecycle
+
+    _started = _time.time()
+    emit_lifecycle("worker_started", "precache")
+    try:
+        preprocess_krea2()
+    except Exception as _exc:
+        emit_lifecycle(
+            "worker_failed",
+            "precache",
+            duration_seconds=round(_time.time() - _started, 1),
+            gpu_seconds=round(_time.time() - _started, 1),
+            error=f"{type(_exc).__name__}: {_exc}",
+        )
+        raise
+    emit_lifecycle(
+        "worker_finished",
+        "precache",
+        duration_seconds=round(_time.time() - _started, 1),
+        gpu_seconds=round(_time.time() - _started, 1),
+    )

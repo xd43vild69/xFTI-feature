@@ -2106,4 +2106,24 @@ def train_krea2():
 
 
 if __name__ == "__main__":
-    train_krea2()
+    from _telemetry import emit_lifecycle
+
+    _started = time.time()
+    emit_lifecycle("worker_started", "train")
+    try:
+        train_krea2()
+    except Exception as _exc:
+        emit_lifecycle(
+            "worker_failed",
+            "train",
+            duration_seconds=round(time.time() - _started, 1),
+            gpu_seconds=round(time.time() - _started, 1),
+            error=f"{type(_exc).__name__}: {_exc}",
+        )
+        raise
+    emit_lifecycle(
+        "worker_finished",
+        "train",
+        duration_seconds=round(time.time() - _started, 1),
+        gpu_seconds=round(time.time() - _started, 1),
+    )

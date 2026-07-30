@@ -10,7 +10,7 @@ from pathlib import Path
 import streamlit as st
 from PIL import Image
 
-from feature_pipeline.application import caption_service, image_service
+from feature_pipeline.application import caption_service, image_service, training_service
 from feature_pipeline.domain.models import (
     ConceptGroup,
     DatasetManifest,
@@ -185,7 +185,7 @@ def is_training_active() -> bool:
             return False
         if training_runner.is_process_alive(run.pid):
             return True
-        training_repo.update_training_run_status(conn, run.training_run_id, "failed")
+        training_service.finalize_dead_run(conn, run, fallback_status="failed")
         return False
 
 

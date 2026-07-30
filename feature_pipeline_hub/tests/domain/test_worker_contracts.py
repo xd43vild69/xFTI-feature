@@ -9,7 +9,9 @@ from feature_pipeline.domain.worker_contracts import (
     FailedEvent,
     PrecacheSettings,
     TrainSettings,
+    WorkerLifecycleEvent,
     recaption_event_adapter,
+    worker_lifecycle_event_adapter,
 )
 
 VALID_TRAIN = {
@@ -74,3 +76,40 @@ def test_unknown_fields_on_a_known_event_are_tolerated():
         {"event": "caption", "path": "/data/a.png", "caption": "x", "model_revision": "abc"}
     )
     assert isinstance(event, CaptionEvent)
+
+
+def test_recaption_events_carry_timestamp_and_run_id():
+    event = recaption_event_adapter.validate_python(
+        {
+            "event": "caption",
+            "path": "/data/a.png",
+            "caption": "a red car",
+            "seconds": 2.0,
+            "timestamp": 1_700_000_000.0,
+            "run_id": "batch-1",
+        }
+    )
+    assert isinstance(event, CaptionEvent)
+    assert event.timestamp == 1_700_000_000.0
+    assert event.run_id == "batch-1"
+
+
+def test_worker_lifecycle_events_parse():
+    event = worker_lifecycle_event_adapter.validate_python(
+        {
+            "event": "worker_finished",
+            "worker": "precache",
+            "run_id": "precache-abc",
+            "timestamp": 1_700_000_000.0,
+            "duration_seconds": 42.5,
+            "gpu_seconds": 42.5,
+        }
+    )
+    assert isinstance(event, WorkerLifecycleEvent)
+    assert event.worker == "precache"
+    assert event.duration_seconds == 42.5
+
+
+def test_worker_lifecycle_event_rejects_an_unknown_kind():
+    with pytest.raises(ValidationError):
+        worker_lifecycle_event_adapter.validate_python({"event": "worker_paused"})

@@ -123,8 +123,8 @@ def test_events_stream_back_and_noise_is_dropped(stub_environment):
 ECHO_WORKER = """
 import json, sys
 job = json.load(sys.stdin)
-print(json.dumps({"event": "job", "images": job["images"],
-                  "detailed": job["detailed"], "text_encoder_dir": job["text_encoder_dir"]}), flush=True)
+print(json.dumps({"event": "job", "images": job["images"], "detailed": job["detailed"],
+                  "text_encoder_dir": job["text_encoder_dir"], "run_id": job["run_id"]}), flush=True)
 """
 
 
@@ -136,6 +136,25 @@ def test_the_job_reaches_the_worker_on_stdin(stub_environment):
     assert events[0]["images"] == ["/data/a.png"]
     assert events[0]["detailed"] is True
     assert events[0]["text_encoder_dir"] == str(env.model_dir)
+
+
+def test_each_call_mints_its_own_run_id(stub_environment):
+    env = stub_environment(ECHO_WORKER)
+
+    first = list(run_recaption(["/data/a.png"], detailed=False, environment=env))
+    second = list(run_recaption(["/data/a.png"], detailed=False, environment=env))
+
+    assert first[0]["run_id"]
+    assert second[0]["run_id"]
+    assert first[0]["run_id"] != second[0]["run_id"]
+
+
+def test_a_failed_event_carries_the_run_id_that_was_sent(stub_environment):
+    env = stub_environment(CRASHING_WORKER)
+
+    events = list(run_recaption(["/data/a.png"], detailed=False, environment=env))
+
+    assert events[-1]["run_id"]
 
 
 def test_a_crashing_worker_yields_a_failed_event_with_stderr(stub_environment):

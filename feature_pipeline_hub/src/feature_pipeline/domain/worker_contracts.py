@@ -60,6 +60,8 @@ class LoadedEvent(BaseModel):
     event: Literal["loaded"]
     device: str = ""
     seconds: float = 0.0
+    timestamp: float = 0.0
+    run_id: str = ""
 
 
 class CaptionEvent(BaseModel):
@@ -67,18 +69,24 @@ class CaptionEvent(BaseModel):
     path: str
     caption: str = ""
     seconds: float = 0.0
+    timestamp: float = 0.0
+    run_id: str = ""
 
 
 class ErrorEvent(BaseModel):
     event: Literal["error"]
     path: str = ""
     message: str = "Unknown error"
+    timestamp: float = 0.0
+    run_id: str = ""
 
 
 class DoneEvent(BaseModel):
     event: Literal["done"]
     captioned: int = 0
     failed: int = 0
+    timestamp: float = 0.0
+    run_id: str = ""
 
 
 class FailedEvent(BaseModel):
@@ -86,6 +94,7 @@ class FailedEvent(BaseModel):
 
     event: Literal["failed"]
     message: str = ""
+    run_id: str = ""
 
 
 RecaptionEvent = Annotated[
@@ -94,3 +103,25 @@ RecaptionEvent = Annotated[
 ]
 
 recaption_event_adapter: TypeAdapter[RecaptionEvent] = TypeAdapter(RecaptionEvent)
+
+
+# --- worker lifecycle telemetry (precache_worker.py / train_worker.py) --------
+# precache_worker.py and train_worker.py are vendored byte-for-byte from
+# LoRAlab (see their own docstrings), so nothing inside their bodies emits
+# structured events the way recaption_worker.py does. workers/_telemetry.py
+# wraps only their `if __name__ == "__main__":` entrypoint — untouched
+# otherwise — to emit these three events around the vendored call, on the
+# same stdout stream that already carries the free-text log.
+
+
+class WorkerLifecycleEvent(BaseModel):
+    event: Literal["worker_started", "worker_finished", "worker_failed"]
+    worker: str = ""
+    run_id: str = ""
+    timestamp: float = 0.0
+    duration_seconds: float = 0.0
+    gpu_seconds: float = 0.0
+    error: str = ""
+
+
+worker_lifecycle_event_adapter: TypeAdapter[WorkerLifecycleEvent] = TypeAdapter(WorkerLifecycleEvent)

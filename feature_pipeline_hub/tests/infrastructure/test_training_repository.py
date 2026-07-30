@@ -100,3 +100,41 @@ def test_find_running_training_run_finds_the_active_one(conn):
 
     assert found is not None
     assert found.training_run_id == running
+
+
+def test_a_fresh_run_has_no_telemetry_yet(conn):
+    training_run_id = _create(conn)
+
+    run = get_training_run(conn, training_run_id)
+
+    assert run.duration_seconds is None
+    assert run.gpu_seconds is None
+    assert run.cost_estimate is None
+    assert run.error_message == ""
+
+
+def test_status_update_can_attach_telemetry(conn):
+    training_run_id = _create(conn)
+
+    update_training_run_status(
+        conn,
+        training_run_id,
+        "completed",
+        duration_seconds=125.4,
+        gpu_seconds=125.4,
+        cost_estimate=0.05,
+    )
+
+    run = get_training_run(conn, training_run_id)
+    assert run.status == "completed"
+    assert run.duration_seconds == 125.4
+    assert run.gpu_seconds == 125.4
+    assert run.cost_estimate == 0.05
+
+
+def test_status_update_can_attach_an_error_message(conn):
+    training_run_id = _create(conn)
+
+    update_training_run_status(conn, training_run_id, "failed", error_message="CUDA OOM")
+
+    assert get_training_run(conn, training_run_id).error_message == "CUDA OOM"
