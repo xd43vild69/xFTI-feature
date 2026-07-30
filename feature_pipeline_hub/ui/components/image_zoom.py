@@ -23,17 +23,30 @@ _STYLES = """
 [class*="st-key-zoomframe_"] {
     position: relative;
 }
+/* `inset: 0` alone leaves the hit area the width of the empty button, so pin the
+   size explicitly. Streamlit's own rules set both, hence `!important` throughout. */
 [class*="st-key-zoomhit_"] {
     position: absolute;
     inset: 0;
+    width: 100% !important;
+    height: 100% !important;
     z-index: 1;
 }
-[class*="st-key-zoomhit_"] > div,
+[class*="st-key-zoomhit_"] > div {
+    width: 100% !important;
+    height: 100% !important;
+}
+/* Stretching the button by inheritance does not survive the wrapper chain: a
+   `height: 100%` resolved against an auto-height wrapper collapses, leaving a
+   1px-tall strip that only catches clicks along the very top edge. The hit box is
+   already positioned, so size the button against that instead of its parent. */
 [class*="st-key-zoomhit_"] button {
-    width: 100%;
-    height: 100%;
-    min-height: 0;
-    padding: 0;
+    position: absolute !important;
+    inset: 0 !important;
+    width: 100% !important;
+    height: 100% !important;
+    min-height: 0 !important;
+    padding: 0 !important;
 }
 [class*="st-key-zoomhit_"] button,
 [class*="st-key-zoomhit_"] button:hover,
