@@ -100,20 +100,20 @@ def _ingest(from_folder: bool, typed_path: str | None, uploaded_files: list | No
             )
     except NotADirectoryError as exc:
         st.error(str(exc))
-        step_telemetry.record_step(run_id, "import", time.time() - started, error_count=1)
         return
 
     if not run.concept.samples:
         st.warning("No PNG/JPG/WebP images found.")
+        state.save_run(run)
         step_telemetry.record_step(run_id, "import", time.time() - started, error_count=1)
         return
 
-    # Record import telemetry
-    error_count = sum(1 for s in run.concept.samples if not s.is_valid)
-    step_telemetry.record_step(run_id, "import", time.time() - started, error_count=error_count)
-
     state.save_run(run)
     state.set_active_run(run.run_id)
+
+    # Record import telemetry after saving the run to DB
+    error_count = sum(1 for s in run.concept.samples if not s.is_valid)
+    step_telemetry.record_step(run_id, "import", time.time() - started, error_count=error_count)
     # Rerun so the context bar picks up the new dataset right away.
     st.session_state["ingest_message"] = f"Imported {len(run.concept.samples)} image(s)."
     st.rerun()
