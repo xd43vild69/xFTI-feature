@@ -312,6 +312,48 @@ def render_thumbnail(image_path: str, *, width: int | str = "stretch", size: int
     st.image(thumbnail, width=width)
 
 
+# `st.image` degrades what it serves in two separate ways, and a full-size preview
+# hits both: it downscales anything wider than 1460px with BILINEAR resampling, and
+# it re-encodes to JPEG quality 90 whenever the source format differs from the one
+# it picks itself (which catches every PNG without alpha, and every WEBP). Naming
+# the source format here keeps the re-encode from firing; PNG is the fallback
+# because it is lossless for formats Streamlit cannot pass through verbatim.
+_PASSTHROUGH_OUTPUT_FORMAT = {"JPEG": "JPEG", "JPG": "JPEG", "PNG": "PNG", "GIF": "auto"}
+
+
+def render_original_image(image_path: str, *, show_facts: bool = True) -> None:
+    """Render an image at its original quality, scaled to fit only by the browser.
+
+    Passing the image's own pixel width as `width` is what avoids the server-side
+    resample: Streamlit only resizes when the source is *wider* than the target, and
+    it clamps an oversized width to the container in CSS anyway. So the browser
+    receives the untouched file and does the fitting itself, which is both a better
+    resample than BILINEAR and correct on high-DPI screens.
+    """
+    path = Path(image_path)
+    if not path.exists():
+        st.error(f"Missing file: {path.name}")
+        return
+
+    try:
+        facts = image_service.describe_original(str(path))
+    except Exception:
+        st.error(f"Could not read image: {path.name}")
+        return
+
+    st.image(
+        str(path),
+        width=facts.width,
+        output_format=_PASSTHROUGH_OUTPUT_FORMAT.get(facts.image_format, "PNG"),
+    )
+
+    if show_facts:
+        megabytes = facts.byte_size / 1_048_576
+        st.caption(
+            f"{facts.width} × {facts.height} px · {facts.image_format} · {megabytes:.1f} MB"
+        )
+
+
 OBSERVABILITY_STEP = "steps/observability_step.py"
 IMPORT_STEP = "steps/import_step.py"
 CURATE_STEP = "steps/curate_step.py"

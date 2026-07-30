@@ -9,6 +9,7 @@ from feature_pipeline.application.image_service import (
     compute_dhash,
     compute_image_metrics,
     compute_sharpness,
+    describe_original,
     hamming_distance,
     make_square_thumbnail,
 )
@@ -222,3 +223,25 @@ def test_classify_orientation_rolls_up_to_three_buckets():
     assert classify_orientation(9 / 16) == "portrait"
     assert classify_orientation(1.0) == "square"
     assert classify_orientation(1.02) == "square"
+
+
+def test_describe_original_reports_the_file_as_it_is_on_disk(tmp_path: Path):
+    image_path = tmp_path / "photo.png"
+    _make_image(image_path, (1280, 720), "blue")
+
+    facts = describe_original(str(image_path))
+
+    assert (facts.width, facts.height) == (1280, 720)
+    assert facts.image_format == "PNG"
+    assert facts.byte_size == image_path.stat().st_size
+
+
+def test_describe_original_reads_the_real_format_not_the_extension(tmp_path: Path):
+    """The preview label must reflect the actual encoding, since that is the thing
+    the user is trying to confirm — a misleading suffix should not win."""
+    image_path = tmp_path / "actually_a_png.jpg"
+    Image.new("RGB", (64, 64), color="green").save(image_path, format="PNG")
+
+    facts = describe_original(str(image_path))
+
+    assert facts.image_format == "PNG"

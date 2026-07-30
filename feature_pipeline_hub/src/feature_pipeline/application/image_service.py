@@ -1,6 +1,7 @@
 """Image analysis: dimensions, perceptual hashing, sharpness, and aspect-ratio bucketing."""
 
 from pathlib import Path
+from typing import NamedTuple
 
 import imagehash
 import numpy as np
@@ -93,6 +94,30 @@ def make_square_thumbnail(image_path: str, size: int = THUMBNAIL_SIZE) -> Image.
         offset = ((size - img.width) // 2, (size - img.height) // 2)
         canvas.paste(img, offset, img)
         return canvas
+
+
+class OriginalImageFacts(NamedTuple):
+    """What an image is on disk, before any viewer gets a chance to resample it."""
+
+    width: int
+    height: int
+    image_format: str
+    byte_size: int
+
+
+def describe_original(image_path: str) -> OriginalImageFacts:
+    """Read an image's real dimensions, format, and file size without decoding pixels.
+
+    `Image.open` is lazy, so `.size` and `.format` come from the header alone. This
+    is the ground truth shown next to a full-size preview: the point is to let the
+    user confirm what they actually imported rather than infer it from how the
+    preview happens to render.
+    """
+    path = Path(image_path)
+    with Image.open(path) as img:
+        width, height = img.size
+        image_format = (img.format or path.suffix.lstrip(".")).upper()
+    return OriginalImageFacts(width, height, image_format, path.stat().st_size)
 
 
 def compute_dhash(image_path: str) -> str:

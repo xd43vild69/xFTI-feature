@@ -26,7 +26,13 @@ THUMBNAIL_WIDTH = 150
 
 @st.dialog(" ", width="large")
 def _render_zoom_dialog(image_path: str) -> None:
-    st.image(image_path, width="stretch")
+    """Full-size inspection view: the original file, never a re-encoded copy.
+
+    This is where the user judges focus and compression artefacts, so it goes
+    through `render_original_image` rather than `st.image` directly — the latter
+    would quietly resample and recompress anything over 1460px wide.
+    """
+    state.render_original_image(image_path)
 
 
 def _zoom_button(image_path: str, key: str) -> None:
