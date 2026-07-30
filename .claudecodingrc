@@ -1,0 +1,70 @@
+# Claude Coding Rules for xFTI-feature Project
+# Reference: feature_pipeline_hub/CONTRIBUTING.md
+# These rules ensure consistent workflow and maintain user control over repository history
+
+[workflow]
+# Git Branch Strategy
+branch_strategy = "single-branch"
+description = "All work happens on the current branch — no worktrees or parallel branches. Changes are committed to the active branch as they progress, keeping a single focused context for iterative development."
+enforcement = "critical"
+
+[commits]
+# Commit Policy
+commit_policy = "manual-only"
+description = "Commits are made ONLY with explicit user instruction. Claude stages and prepares changes but WAITS for 'commit this now' or equivalent before creating a commit. Never commit automatically or assume permission."
+enforcement = "critical"
+
+# Commit Content
+commit_content = "atomic"
+description = "Each commit should represent a logical, reviewable unit of work. Avoid mixing unrelated changes."
+enforcement = "high"
+
+# Commit Messages
+commit_messages = "clear-and-descriptive"
+description = "Commit messages must be clear, meaningful, and concise. They should explain the 'why' and 'what' in plain English."
+enforcement = "high"
+
+[git_operations]
+# Push Policy
+push_policy = "explicit-only"
+description = "Push to remote ONLY when user explicitly requests it ('push this', 'send to origin', etc.). Never push automatically or assume permission."
+enforcement = "critical"
+
+# Review Before Action
+review_before_staging = true
+description = "Before staging files for commit, show the user what will be staged and ask for confirmation."
+enforcement = "high"
+
+[project_structure]
+# Follow Clean Architecture
+follow_clean_architecture = true
+description = "Respect the domain/application/infrastructure/ui separation. Business logic stays in 'application/', never in UI code."
+enforcement = "high"
+
+# Avoid Premature Optimization
+premature_features = "forbidden"
+description = "Don't add features, refactor, or introduce abstractions beyond what the task requires. No half-finished implementations."
+enforcement = "medium"
+
+[development_practices]
+# Comments and Documentation
+comments_minimum = true
+description = "Default to writing NO comments. Only add one when the WHY is non-obvious: hidden constraints, subtle invariants, workarounds for specific bugs."
+enforcement = "medium"
+
+# Error Handling
+error_handling_scope = "system-boundaries-only"
+description = "Only validate at system boundaries (user input, external APIs). Trust internal code and framework guarantees."
+enforcement = "medium"
+
+# Testing
+run_tests_before_finishing = true
+description = "Run the full test suite (uv run pytest) before declaring work complete to ensure no regressions."
+enforcement = "high"
+
+[key_reminders]
+reminder_1 = "User owns the repository history. Respect their explicit control over commits and pushes."
+reminder_2 = "When unsure about commit policy or push permission, ASK explicitly rather than assuming."
+reminder_3 = "Review CLAUDE.md first for codebase context before making changes."
+reminder_4 = "Atomic commits are better than automatic ones. Wait for the user's signal."
+reminder_5 = "Single branch, focused context, manual commits — this is the project's philosophy."
