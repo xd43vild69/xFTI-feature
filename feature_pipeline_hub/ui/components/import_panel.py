@@ -4,12 +4,14 @@ Concept name and trigger word live here rather than in a persistent sidebar —
 they only matter while creating an ingestion.
 """
 
+import time
 import uuid
 from pathlib import Path
 
 import streamlit as st
 
 import state
+import step_telemetry
 from feature_pipeline.application.dataset_service import create_ingestion_run
 from feature_pipeline.infrastructure.storage import run_upload_dir, save_uploaded_files
 
@@ -86,6 +88,7 @@ def _ingest(from_folder: bool, typed_path: str | None, uploaded_files: list | No
         st.warning("Set concept name and trigger word above first.")
         return
 
+    started = time.time()
     try:
         with st.spinner("Analyzing images..."):
             run = create_ingestion_run(
@@ -97,11 +100,17 @@ def _ingest(from_folder: bool, typed_path: str | None, uploaded_files: list | No
             )
     except NotADirectoryError as exc:
         st.error(str(exc))
+        step_telemetry.record_step(run_id, "import", time.time() - started, error_count=1)
         return
 
     if not run.concept.samples:
         st.warning("No PNG/JPG/WebP images found.")
+        step_telemetry.record_step(run_id, "import", time.time() - started, error_count=1)
         return
+
+    # Record import telemetry
+    error_count = sum(1 for s in run.concept.samples if not s.is_valid)
+    step_telemetry.record_step(run_id, "import", time.time() - started, error_count=error_count)
 
     state.save_run(run)
     state.set_active_run(run.run_id)

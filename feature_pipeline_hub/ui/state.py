@@ -266,6 +266,7 @@ def render_thumbnail(image_path: str) -> None:
     st.image(thumbnail, width="stretch")
 
 
+OBSERVABILITY_STEP = "steps/observability_step.py"
 IMPORT_STEP = "steps/import_step.py"
 CURATE_STEP = "steps/curate_step.py"
 QUALITY_STEP = "steps/quality_step.py"
