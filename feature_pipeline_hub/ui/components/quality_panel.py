@@ -11,6 +11,7 @@ import pandas as pd
 import streamlit as st
 
 import state
+from components import image_zoom
 from feature_pipeline.application import quality_service as quality
 from feature_pipeline.domain.models import DatasetSample, DuplicateCluster, IngestionRun
 from feature_pipeline.domain.validators import find_unpaired_files
@@ -24,45 +25,12 @@ from feature_pipeline.infrastructure.storage import scan_caption_files
 THUMBNAIL_WIDTH = 150
 
 
-@st.dialog(" ", width="large")
-def _render_zoom_dialog(image_path: str) -> None:
-    """Full-size inspection view: the original file, never a re-encoded copy.
-
-    This is where the user judges focus and compression artefacts, so it goes
-    through `render_original_image` rather than `st.image` directly — the latter
-    would quietly resample and recompress anything over 1460px wide.
-
-    The toggle is a widget inside a dialog, so it reruns only this function rather
-    than the whole page, and the dialog stays open across the switch.
-    """
-    actual_size = st.toggle(
-        "Tamaño real (100 %)",
-        key="zoom_actual_size",
-        help="Ver los píxeles sin escalar, con scroll, en lugar de ajustar la imagen al diálogo",
-    )
-    state.render_original_image(image_path, actual_size=actual_size)
-
-
-def _zoom_button(image_path: str, key: str) -> None:
-    """Icon button that opens `image_path` at full size in a modal.
-
-    Streamlit has no double-click event to bind to, so a click on this icon is
-    the closest equivalent for "inspect this one image up close".
-    """
-    if st.button(
-        "",
-        icon=":material/zoom_in:",
-        type="tertiary",
-        help="Ver en tamaño grande",
-        key=f"zoom_{key}",
-    ):
-        _render_zoom_dialog(image_path)
-
-
 def render() -> None:
     run = state.require_active_run()
     if run is None:
         return
+
+    image_zoom.inject_styles()
 
     _render_duplicates(run)
     _render_sharpness(run)
@@ -122,10 +90,13 @@ def _render_cluster(index: int, cluster: DuplicateCluster, run: IngestionRun) ->
         entries = [(cluster.kept, None), *cluster.duplicates]
         for column, (sample, distance) in zip(st.columns(len(entries)), entries):
             with column:
-                state.render_thumbnail(sample.image_path, width=THUMBNAIL_WIDTH)
+                image_zoom.clickable_thumbnail(
+                    sample.image_path,
+                    f"cluster_{run.run_id}_{sample.sample_id}",
+                    width=THUMBNAIL_WIDTH,
+                )
                 with st.container(horizontal=True, vertical_alignment="center"):
                     st.caption("kept" if distance is None else f"distance {distance}")
-                    _zoom_button(sample.image_path, f"cluster_{run.run_id}_{sample.sample_id}")
                     if distance is not None and st.button(
                         "",
                         icon=":material/block:",
@@ -149,9 +120,12 @@ def _render_excluded_samples(run: IngestionRun) -> None:
 
         for column, sample in zip(st.columns(min(len(excluded), 6)), excluded):
             with column:
-                state.render_thumbnail(sample.image_path, width=THUMBNAIL_WIDTH)
+                image_zoom.clickable_thumbnail(
+                    sample.image_path,
+                    f"excluded_{run.run_id}_{sample.sample_id}",
+                    width=THUMBNAIL_WIDTH,
+                )
                 with st.container(horizontal=True, vertical_alignment="center"):
-                    _zoom_button(sample.image_path, f"excluded_{run.run_id}_{sample.sample_id}")
                     if st.button(
                         "",
                         icon=":material/undo:",
@@ -183,10 +157,13 @@ def _render_sharpness(run: IngestionRun) -> None:
 
     for column, sample in zip(st.columns(len(softest)), softest):
         with column:
-            state.render_thumbnail(sample.image_path, width=THUMBNAIL_WIDTH)
+            image_zoom.clickable_thumbnail(
+                sample.image_path,
+                f"blur_{run.run_id}_{sample.sample_id}",
+                width=THUMBNAIL_WIDTH,
+            )
             with st.container(horizontal=True, vertical_alignment="center"):
                 st.caption(f"{sample.metrics.sharpness:.0f}")
-                _zoom_button(sample.image_path, f"blur_{run.run_id}_{sample.sample_id}")
                 if st.button(
                     "",
                     icon=":material/block:",
@@ -246,8 +223,11 @@ def _render_missing_captions(run: IngestionRun) -> None:
     for sample in pending:
         col_image, col_caption = st.columns([1, 6], vertical_alignment="center")
         with col_image:
-            state.render_thumbnail(sample.image_path, width=THUMBNAIL_WIDTH)
-            _zoom_button(sample.image_path, f"missing_{run.run_id}_{sample.sample_id}")
+            image_zoom.clickable_thumbnail(
+                sample.image_path,
+                f"missing_{run.run_id}_{sample.sample_id}",
+                width=THUMBNAIL_WIDTH,
+            )
         with col_caption:
             description_key = f"missing_caption_{run.run_id}_{sample.sample_id}"
             st.text_input(

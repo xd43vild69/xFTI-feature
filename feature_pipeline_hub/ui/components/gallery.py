@@ -9,7 +9,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 import state
-from components import recaption_panel
+from components import image_zoom, recaption_panel
 from feature_pipeline.application import quality_service as quality
 from feature_pipeline.domain.models import DatasetSample, IngestionRun
 
@@ -69,6 +69,8 @@ def render() -> None:
     run = state.require_active_run()
     if run is None:
         return
+
+    image_zoom.inject_styles()
 
     # Keyboard shortcut listener for F2
     components.html(
@@ -136,7 +138,11 @@ def render() -> None:
 
 
 def _render_card(sample: DatasetSample, run: IngestionRun, thumbnail_size: int) -> None:
-    state.render_thumbnail(sample.image_path, size=thumbnail_size)
+    image_zoom.clickable_thumbnail(
+        sample.image_path,
+        f"gallery_{run.run_id}_{sample.sample_id}",
+        size=thumbnail_size,
+    )
 
     with st.container(horizontal=True, vertical_alignment="center"):
         st.checkbox(
