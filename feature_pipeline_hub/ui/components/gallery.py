@@ -127,15 +127,16 @@ def render() -> None:
         ):
             _render_rename_dialog(run)
 
+    thumbnail_size = state.thumbnail_size_for_columns(columns_per_row)
     for row_start in range(0, len(samples), columns_per_row):
         row = samples[row_start : row_start + columns_per_row]
         for column, sample in zip(st.columns(columns_per_row), row):
             with column:
-                _render_card(sample, run)
+                _render_card(sample, run, thumbnail_size)
 
 
-def _render_card(sample: DatasetSample, run: IngestionRun) -> None:
-    state.render_thumbnail(sample.image_path)
+def _render_card(sample: DatasetSample, run: IngestionRun, thumbnail_size: int) -> None:
+    state.render_thumbnail(sample.image_path, size=thumbnail_size)
 
     with st.container(horizontal=True, vertical_alignment="center"):
         st.checkbox(

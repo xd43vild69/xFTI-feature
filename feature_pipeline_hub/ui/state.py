@@ -274,22 +274,37 @@ def _cached_thumbnail(image_path: str, mtime: float, size: int) -> Image.Image:
     return image_service.make_square_thumbnail(image_path, size)
 
 
-def render_thumbnail(image_path: str, *, width: int | str = "stretch") -> None:
+# Grid cards render at `width="stretch"`, so a card's on-screen size grows as
+# columns_per_row shrinks. Without a matching bump here, a fixed 512px thumbnail
+# gets upscaled by the browser to fill a wider card and looks blurry. Keyed on the
+# same options as the gallery's column slider (curate_step.py / gallery.py).
+THUMBNAIL_SIZE_BY_COLUMNS: dict[int, int] = {2: 896, 3: 704, 4: 576, 5: 512, 6: 512}
+
+
+def thumbnail_size_for_columns(columns_per_row: int) -> int:
+    """Thumbnail resolution matched to how wide a grid card will render at this column count."""
+    return THUMBNAIL_SIZE_BY_COLUMNS.get(columns_per_row, image_service.THUMBNAIL_SIZE)
+
+
+def render_thumbnail(image_path: str, *, width: int | str = "stretch", size: int | None = None) -> None:
     """Render a square, theme-adaptive thumbnail, or an error if it's missing/unreadable.
 
     `mtime` is part of the cache key so an image edited or re-ingested on the same
     path invalidates its cached thumbnail automatically. `width` defaults to filling
     the container (right for a fixed-column grid like the curate gallery); pass a
     pixel value where the surrounding column width varies, so the thumbnail stays a
-    consistent size regardless of how many items share the row.
+    consistent size regardless of how many items share the row. `size` overrides the
+    generated resolution (default `image_service.THUMBNAIL_SIZE`) — use
+    `thumbnail_size_for_columns` when the display width varies with a column count.
     """
     path = Path(image_path)
     if not path.exists():
         st.error(f"Missing file: {path.name}")
         return
 
+    resolved_size = size or image_service.THUMBNAIL_SIZE
     try:
-        thumbnail = _cached_thumbnail(str(path), path.stat().st_mtime, image_service.THUMBNAIL_SIZE)
+        thumbnail = _cached_thumbnail(str(path), path.stat().st_mtime, resolved_size)
     except Exception:
         st.error(f"Could not read image: {path.name}")
         return
