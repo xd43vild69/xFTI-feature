@@ -12,7 +12,10 @@ cd feature_pipeline_hub
 # Run the app
 uv run streamlit run ui/app.py     # or: uv run python main.py
 
-# Tests (207 tests, pytest, no markers/config beyond testpaths=["tests"])
+# Run the MCP server (stdio transport, for agent tool-calling — see mcp_server/server.py)
+uv run python -m mcp_server
+
+# Tests (pytest, no markers/config beyond testpaths=["tests"])
 uv run pytest
 uv run pytest tests/infrastructure/test_ingestion_repository.py
 uv run pytest tests/infrastructure/test_ingestion_repository.py::test_saving_a_run_registers_its_concept -v
@@ -35,13 +38,14 @@ Streamlit app for curating LoRA training datasets (Krea 2 / Qwen3-VL), structure
 - **`infrastructure/`** — SQLite persistence (`database.py`, `ingestion_repository.py`, `training_repository.py`, `version_repository.py`), filesystem (`storage.py`, `hf_exporter.py`), and subprocess launchers (`recaption_runner.py`, `training_runner.py`).
 - **`ui/`** — Streamlit-only code: `app.py` wires top-level navigation, `state.py` is the sole bridge between UI session state and the SQLite-backed application layer (every DB read/write from the UI goes through `state.py`), `steps/` are thin page wrappers, `components/` hold the actual panel logic.
 - **`workers/`** — standalone scripts run as **separate processes in a different Python environment** (`training_runtime/venv`, not the hub's own env): `precache_worker.py` and `train_worker.py` are ported byte-for-byte from the upstream LoRAlab project and must stay diffable against it — don't add instrumentation inside their bodies. `_telemetry.py` wraps their `__main__` entrypoints from the outside to emit structured JSON-lines lifecycle events without touching the vendored code. `recaption_worker.py` / `caption_qwen3vl.py` run Qwen3-VL captioning the same way.
+- **`mcp_server/`** (hub root, not under `src/`) — a `FastMCP` server exposing the pipeline as tools for autonomous agents (LangGraph etc.), stdio transport, no auth (the app has none anywhere). `server.py` tools are thin wrappers over `application/`/`infrastructure/` — never reimplement business logic here. Runs as its own process against the same SQLite DB, same per-operation-connection convention as `ui/state.py`.
 
 ### Two process boundaries, two purposes
 
 - **`recaption_runner.py`**: short-lived, streaming. Launches the recaption worker with `subprocess.Popen` + pipes, yields parsed JSON-line events as they arrive, blocks until exit. Used for interactive per-batch captioning (seconds to ~1-2s/image).
 - **`training_runner.py`**: long-lived, detached. Launches pre-cache/train with `start_new_session=True`, output redirected to a log file, returns `(pid, log_path)` immediately without waiting. Designed to survive Streamlit restarting or the browser closing. Progress is recovered later by tailing the log file and reading a `training_run_id` row from SQLite — never by holding anything in memory. `read_lifecycle_event()` reads only the last ~4KB of the log to find the final `worker_finished`/`worker_failed` JSON line cheaply, even for multi-hour logs.
 
-Pre-cache runs blocking (`training_service._run_precache_blocking`, minutes, has a timeout) before training is launched detached (`_launch_train`) — see `training_service.start_training`.
+Pre-cache runs blocking (`training_service._run_precache_blocking`, minutes, has a timeout) before training is launched detached (`_launch_train`) — see `training_service.start_training`, used by the UI. The MCP server can't block a tool call for that long, so it uses the non-blocking split instead: `launch_precache` (fire-and-forget) + `precache_status` (poll) + `launch_train` (the public wrapper around `_launch_train`) — same underlying subprocess launch, just not chained together in one call.
 
 ### Runs, concepts, and versions (SQLite: `feature_pipeline.db`)
 

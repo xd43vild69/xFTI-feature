@@ -27,8 +27,6 @@ from feature_pipeline.domain.models import (
 )
 from feature_pipeline.domain.naming import next_standard_index
 from feature_pipeline.infrastructure import ingestion_repository as repo
-from feature_pipeline.infrastructure import training_repository as training_repo
-from feature_pipeline.infrastructure import training_runner
 from feature_pipeline.infrastructure import version_repository as version_repo
 from feature_pipeline.infrastructure.database import get_connection
 from feature_pipeline.infrastructure.storage import (
@@ -69,16 +67,8 @@ def revalidate_all_runs() -> int:
     otherwise never reaches datasets that already existed. Returns how many
     samples' verdicts actually changed.
     """
-    total_changed = 0
-    for summary in list_runs():
-        run = load_run(summary.run_id)
-        if run is None:
-            continue
-        changed = dataset_service.revalidate_samples(run.concept.samples)
-        if changed:
-            save_run(run)
-            total_changed += changed
-    return total_changed
+    with _db() as conn:
+        return dataset_service.revalidate_all_runs(conn)
 
 
 def save_run(run: IngestionRun) -> None:
@@ -110,10 +100,8 @@ def append_images(run: IngestionRun, uploaded_files: list) -> list[DatasetSample
     )
     images = [path for path in written if Path(path).suffix.lower() in IMAGE_EXTENSIONS]
 
-    added = dataset_service.append_images_to_run(run, images)
-    if added:
-        save_run(run)
-    return added
+    with _db() as conn:
+        return dataset_service.append_images(conn, run, images)
 
 
 def _inventory_fingerprint() -> tuple:
@@ -266,13 +254,7 @@ def is_training_active() -> bool:
     restart) is corrected to 'failed' here rather than blocking the GPU forever.
     """
     with _db() as conn:
-        run = training_repo.find_running_training_run(conn)
-        if run is None:
-            return False
-        if training_runner.is_process_alive(run.pid):
-            return True
-        training_service.finalize_dead_run(conn, run, fallback_status="failed")
-        return False
+        return training_service.is_training_active(conn)
 
 
 def mark_duplicates(run_id: str, sample_ids: list[str]) -> None:

@@ -127,7 +127,81 @@ def start_training(
     )
 
 
-def _run_precache_blocking(
+def launch_precache(
+    conn: sqlite3.Connection,
+    *,
+    dataset_run_id: str,
+    dataset_name: str,
+    trigger_word: str,
+) -> str:
+    """Launch pre-cache detached and return its training_run_id immediately.
+
+    The non-blocking counterpart to `start_training`'s first phase, for callers
+    (like the MCP server) that cannot afford to block a request thread for up to
+    `PRECACHE_TIMEOUT_SECONDS`. Poll completion with `precache_status`.
+    """
+    dataset_path = dataset_dir_for(dataset_name)
+    cache_dir = cache_dir_for(dataset_name)
+    model_dir = training_runner.resolve_environment().model_dir
+    return _launch_precache(
+        conn,
+        dataset_run_id=dataset_run_id,
+        model_dir=model_dir,
+        dataset_path=dataset_path,
+        cache_dir=cache_dir,
+        trigger_word=trigger_word,
+    )
+
+
+def precache_status(conn: sqlite3.Connection, training_run_id: str) -> str:
+    """Poll a pre-cache job launched via `launch_precache`.
+
+    Returns "running", "completed", or "failed". The first call to observe the
+    process has exited self-heals the stored row (same telemetry backfill as
+    `finalize_dead_run`) so later calls just read back the settled status.
+    """
+    run = repo.get_training_run(conn, training_run_id)
+    if run is None:
+        raise ValueError(f"No such training run: {training_run_id}")
+    if run.status != "running":
+        return run.status
+    if training_runner.is_process_alive(run.pid):
+        return "running"
+
+    log_text, _ = training_runner.read_log_tail(run.log_path)
+    if "Pre-caching finished" in log_text:
+        finalize_dead_run(conn, run, fallback_status="completed")
+        return "completed"
+    finalize_dead_run(conn, run, fallback_status="failed")
+    return "failed"
+
+
+def is_training_active(conn: sqlite3.Connection) -> bool:
+    """Whether a training-runtime job (pre-cache/train/progressive/curate) is
+    running right now — the GPU can only do one heavy job at a time.
+
+    Self-healing: a 'running' row whose process actually died (crash, machine
+    restart) is corrected to 'failed' here rather than blocking the GPU forever.
+    """
+    run = repo.find_running_training_run(conn)
+    if run is None:
+        return False
+    if training_runner.is_process_alive(run.pid):
+        return True
+    finalize_dead_run(conn, run, fallback_status="failed")
+    return False
+
+
+def stop_training(conn: sqlite3.Connection, training_run_id: str) -> None:
+    """Send SIGINT to a running job's process and mark its row 'stopped'."""
+    run = repo.get_training_run(conn, training_run_id)
+    if run is None:
+        raise ValueError(f"No such training run: {training_run_id}")
+    training_runner.stop_process(run.pid)
+    repo.update_training_run_status(conn, training_run_id, "stopped")
+
+
+def _launch_precache(
     conn: sqlite3.Connection,
     *,
     dataset_run_id: str,
@@ -135,7 +209,7 @@ def _run_precache_blocking(
     dataset_path: Path,
     cache_dir: Path,
     trigger_word: str,
-) -> None:
+) -> str:
     precache_run_id = str(uuid.uuid4())
     run_dir = training_runtime_dir() / "runs" / f"precache-{precache_run_id}"
     settings = PrecacheSettings(
@@ -152,7 +226,7 @@ def _run_precache_blocking(
         PRECACHE_SETTINGS_ENV,
         extra_env={"FTI_RUN_ID": precache_run_id},
     )
-    training_run_id = repo.create_training_run(
+    return repo.create_training_run(
         conn,
         dataset_run_id=dataset_run_id,
         kind="precache",
@@ -161,25 +235,68 @@ def _run_precache_blocking(
         config=settings,
     )
 
+
+def _run_precache_blocking(
+    conn: sqlite3.Connection,
+    *,
+    dataset_run_id: str,
+    model_dir: Path,
+    dataset_path: Path,
+    cache_dir: Path,
+    trigger_word: str,
+) -> None:
+    training_run_id = _launch_precache(
+        conn,
+        dataset_run_id=dataset_run_id,
+        model_dir=model_dir,
+        dataset_path=dataset_path,
+        cache_dir=cache_dir,
+        trigger_word=trigger_word,
+    )
+    run = repo.get_training_run(conn, training_run_id)
+    assert run is not None
+
     deadline = time.monotonic() + PRECACHE_TIMEOUT_SECONDS
-    while training_runner.is_process_alive(pid):
+    while training_runner.is_process_alive(run.pid):
         if time.monotonic() > deadline:
-            training_runner.stop_process(pid)
+            training_runner.stop_process(run.pid)
             repo.update_training_run_status(conn, training_run_id, "failed")
             raise PrecacheFailed(f"Pre-cache did not finish within {PRECACHE_TIMEOUT_SECONDS}s")
         time.sleep(0.5)
 
-    log_text, _ = training_runner.read_log_tail(log_path)
-    run = repo.get_training_run(conn, training_run_id)
-    if "Pre-caching finished" not in log_text:
-        if run is not None:
-            finalize_dead_run(conn, run, fallback_status="failed")
-        else:
-            repo.update_training_run_status(conn, training_run_id, "failed")
+    status = precache_status(conn, training_run_id)
+    if status != "completed":
+        log_text, _ = training_runner.read_log_tail(run.log_path)
         tail = "\n".join(log_text.splitlines()[-15:])
         raise PrecacheFailed(f"Pre-cache did not report success. Last log lines:\n{tail}")
 
-    finalize_dead_run(conn, run, fallback_status="completed")
+
+def launch_train(
+    conn: sqlite3.Connection,
+    *,
+    dataset_run_id: str,
+    dataset_name: str,
+    trigger_word: str,
+    config: TrainingConfig,
+) -> str:
+    """Launch the training phase detached, given pre-cache has already completed.
+
+    The public counterpart to `_launch_train`'s internal use from `start_training`,
+    for callers (like the MCP server) that split pre-cache and train into two
+    separate steps instead of running them back-to-back in one blocking call.
+    """
+    dataset_path = dataset_dir_for(dataset_name)
+    cache_dir = cache_dir_for(dataset_name)
+    model_dir = training_runner.resolve_environment().model_dir
+    return _launch_train(
+        conn,
+        dataset_run_id=dataset_run_id,
+        model_dir=model_dir,
+        dataset_path=dataset_path,
+        cache_dir=cache_dir,
+        trigger_word=trigger_word,
+        config=config,
+    )
 
 
 def _launch_train(

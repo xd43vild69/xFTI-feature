@@ -141,9 +141,8 @@ def _render_progress(training_run_id: str) -> None:
 
     if run.status == "running":
         if st.button("Stop training", icon=":material/stop:"):
-            training_runner.stop_process(run.pid)
             with _db() as conn:
-                training_repo.update_training_run_status(conn, training_run_id, "stopped")
+                training_service.stop_training(conn, training_run_id)
             st.rerun()
     else:
         if st.button("Back to config"):

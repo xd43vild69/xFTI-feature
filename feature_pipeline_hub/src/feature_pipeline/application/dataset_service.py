@@ -1,6 +1,7 @@
 """Feature Store assembly, versioning, and snapshotting."""
 
 import hashlib
+import sqlite3
 import uuid
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from feature_pipeline.domain.models import (
     IngestionRun,
 )
 from feature_pipeline.domain.validators import validate_sample
+from feature_pipeline.infrastructure import ingestion_repository as repo
 from feature_pipeline.infrastructure.storage import read_caption_for_image, scan_raw_folder
 
 
@@ -135,6 +137,44 @@ def revalidate_samples(samples: list[DatasetSample]) -> int:
             sample.validation_errors = errors
             changed += 1
     return changed
+
+
+def revalidate_all_runs(conn: sqlite3.Connection) -> int:
+    """Re-check every sample of every stored run against the current validation rules.
+
+    A one-off correction for a validation rule change: samples keep the verdict
+    computed when they were imported, so a rule made stricter or looser afterward
+    otherwise never reaches datasets that already existed. Returns how many
+    samples' verdicts actually changed.
+    """
+    total_changed = 0
+    for summary in repo.list_ingestion_runs(conn):
+        run = repo.load_ingestion_run(conn, summary.run_id)
+        if run is None:
+            continue
+        changed = revalidate_samples(run.concept.samples)
+        if changed:
+            repo.save_ingestion_run(conn, run)
+            total_changed += changed
+    return total_changed
+
+
+def append_images(
+    conn: sqlite3.Connection,
+    run: IngestionRun,
+    image_paths: list[str],
+    duplicate_threshold: int = quality_service.DEFAULT_PHASH_THRESHOLD,
+) -> list[DatasetSample]:
+    """`append_images_to_run`, persisted: adds images to `run` in place and saves it.
+
+    Image files must already exist on disk at `image_paths` (a caller that receives
+    uploads or raw bytes is responsible for writing them first — this only assembles
+    samples and persists the run).
+    """
+    added = append_images_to_run(run, image_paths, duplicate_threshold)
+    if added:
+        repo.save_ingestion_run(conn, run)
+    return added
 
 
 def _resolved(image_path: str) -> str:

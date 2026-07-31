@@ -9,6 +9,7 @@ dependencies = [
     "imagehash>=4.3",
     "numpy>=1.26",
     "streamlit>=1.35",
+    "mcp>=1.9,<2.0",
 ]
 
 [dependency-groups]

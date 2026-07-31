@@ -1,6 +1,6 @@
 # xFTI-feature (Feature Pipeline Hub)
 
-**Feature Pipeline Hub** is an end-to-end, interactive Streamlit application designed for **LoRA (Low-Rank Adaptation) model training dataset curation and training execution**. It provides a unified pipeline for importing raw images and captions, visually curating and AI-recaptioning samples, performing perceptual deduplication and quality analytics, exporting versioned clean datasets, and launching/monitoring LoRA model training — with cross-dataset health and cost observability throughout.
+**Feature Pipeline Hub** is an end-to-end **LoRA (Low-Rank Adaptation) model training dataset curation and training execution** pipeline, usable two ways: interactively, through a Streamlit application with top-level page navigation, and programmatically, through an [MCP server](#-mcp-server-agent-integration) that exposes the same pipeline as tools for autonomous agents. It provides a unified pipeline for importing raw images and captions, visually curating and AI-recaptioning samples, performing perceptual deduplication and quality analytics, exporting versioned clean datasets, and launching/monitoring LoRA model training — with cross-dataset health and cost observability throughout.
 
 ---
 
@@ -97,6 +97,56 @@ Recaptioning uses a related but separate JSON-lines protocol (`LoadedEvent` / `C
 
 ---
 
+## 🔌 MCP Server: Agent Integration
+
+Alongside the Streamlit UI, `mcp_server/` exposes the same pipeline as [Model Context
+Protocol](https://modelcontextprotocol.io/) tools, so an autonomous agent (e.g. a
+LangGraph graph) can inspect dataset inventory and drive LoRA training end-to-end
+without a human clicking through the 5 steps. It's a separate process talking to the
+same SQLite DB (`feature_pipeline.db`) and `training_runtime/` — the same "separate
+process, shared state" pattern already used by `workers/`.
+
+### Running it
+
+```bash
+cd feature_pipeline_hub
+uv run python -m mcp_server
+```
+
+This starts the server on **stdio** — the transport MCP clients (LangGraph's
+`langchain-mcp-adapters`, Claude Desktop, the `mcp` CLI inspector, etc.) launch as a
+subprocess and talk to over stdin/stdout. There is no network listener and no
+authentication layer (this app has none anywhere — it was built as a local,
+single-user tool), so **do not** put this server behind an HTTP/SSE transport or
+expose it beyond a trusted local agent without adding an auth layer first.
+
+### Available tools
+
+| Tool | What it does |
+|---|---|
+| `list_dataset_runs` | Every stored ingestion run, newest first (no samples loaded — cheap). |
+| `get_dataset_health` | Fleet-wide health: counts, duplicates, median sharpness per dataset. |
+| `get_run_detail` | Full detail of one run, including every sample's caption/metrics/flags. |
+| `import_dataset` | Ingest a new dataset from a local folder of images (+ optional `.txt` captions). |
+| `revalidate_run` | Re-check samples against current validation rules (one run, or every run). |
+| `export_dataset` | Materialize a run's active samples as a flat training folder (Step 4's job). |
+| `quality_summary` | Headline quality counts (active/excluded/duplicate/missing-caption/invalid). |
+| `start_lora_training` | Launch pre-cache for a run; returns immediately (non-blocking). |
+| `get_training_status` | Poll a pre-cache or train job by `training_run_id`. |
+| `continue_lora_training` | Once pre-cache is `completed`, launch the training phase (detached). |
+| `stop_training` | Send a graceful stop (SIGINT) to a running job. |
+
+Training is intentionally split into `start_lora_training` → poll
+`get_training_status` → `continue_lora_training`, rather than one call: the UI's
+`start_training` blocks the caller for up to 20 minutes while pre-cache runs
+(`PRECACHE_TIMEOUT_SECONDS`), which is fine for a Streamlit button but not for an MCP
+tool call. Every tool call opens and closes its own SQLite connection — same
+convention `ui/state.py` uses — and `start_lora_training` refuses to launch if a
+training-runtime job is already active, whether it was started from the UI or another
+agent call.
+
+---
+
 ## 🛠️ Setup & Provisioning
 
 ### Training Runtime Provisioning
@@ -114,8 +164,9 @@ FTI_LORALAB_ROOT=/path/to/AcademiaSD_LoRAlab-Krea2 ./scripts/setup_training_runt
 That checkout is only needed for this one-time copy — once `training_runtime/` exists,
 neither recaptioning nor training reach back out to it, and the app runs standalone
 against its own local model + venv. The hub app's own dependencies (`pyproject.toml`)
-are deliberately lightweight — Streamlit, Pydantic, Pillow, imagehash, numpy — none of
-the PyTorch/Diffusers/training stack is installed into the app's own environment.
+are deliberately lightweight — Streamlit, Pydantic, Pillow, imagehash, numpy, the `mcp`
+SDK — none of the PyTorch/Diffusers/training stack is installed into the app's own
+environment.
 
 ---
 
@@ -176,6 +227,9 @@ feature_pipeline_hub/
 │   ├── steps/                      # Thin page wrappers: Import, Curate, Quality, Export, Train, Metrics
 │   └── components/                 # UI panels: Import, Gallery, Image Zoom, Recaption, Quality,
 │                                    #   Export, Train, Context Bar, Inventory, Observability
+├── mcp_server/                     # MCP server: pipeline tools for autonomous agents (stdio transport)
+│   ├── server.py                   # FastMCP tool definitions, thin wrappers over application/
+│   └── __main__.py                 # `uv run python -m mcp_server` entrypoint
 ├── workers/                        # Worker scripts, run as separate processes in a different venv
 │   ├── recaption_worker.py         # Qwen3-VL recaption worker
 │   ├── caption_qwen3vl.py          # Vendored Qwen3-VL loading/captioning (ported from LoRAlab)
