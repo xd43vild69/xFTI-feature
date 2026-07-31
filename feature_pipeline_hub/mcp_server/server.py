@@ -12,6 +12,8 @@ the per-operation-connection convention documented in ui/state.py and enforced b
 """
 
 import dataclasses
+import sqlite3
+from collections.abc import Iterator
 from contextlib import contextmanager
 
 from mcp.server.fastmcp import FastMCP
@@ -23,6 +25,7 @@ from feature_pipeline.application import (
     quality_service,
     training_service,
 )
+from feature_pipeline.domain.models import IngestionRun
 from feature_pipeline.infrastructure import ingestion_repository as repo
 from feature_pipeline.infrastructure import training_repository as training_repo
 from feature_pipeline.infrastructure import training_runner
@@ -32,7 +35,7 @@ mcp = FastMCP("feature-pipeline-hub")
 
 
 @contextmanager
-def _db():
+def _db() -> Iterator[sqlite3.Connection]:
     conn = get_connection()
     try:
         yield conn
@@ -40,7 +43,7 @@ def _db():
         conn.close()
 
 
-def _require_run(conn, run_id: str):
+def _require_run(conn: sqlite3.Connection, run_id: str) -> IngestionRun:
     run = repo.load_ingestion_run(conn, run_id)
     if run is None:
         raise ValueError(f"No such dataset run: {run_id}")
@@ -235,7 +238,9 @@ def get_training_status(training_run_id: str) -> dict:
 
         if run.status == "running" and not training_runner.is_process_alive(run.pid):
             training_service.finalize_dead_run(conn, run, fallback_status="failed")
-            run = training_repo.get_training_run(conn, training_run_id)
+            refreshed = training_repo.get_training_run(conn, training_run_id)
+            if refreshed is not None:
+                run = refreshed
 
         return {"phase": "train", **_training_run_dict(run)}
 

@@ -171,6 +171,8 @@ def read_lifecycle_event(log_path: str) -> dict | None:
             data = json.loads(line)
         except json.JSONDecodeError:
             continue
+        if not isinstance(data, dict):
+            continue
         if data.get("event") in ("worker_finished", "worker_failed"):
             return data
     return None

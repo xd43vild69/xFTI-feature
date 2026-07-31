@@ -19,9 +19,12 @@ uv run python -m mcp_server
 uv run pytest
 uv run pytest tests/infrastructure/test_ingestion_repository.py
 uv run pytest tests/infrastructure/test_ingestion_repository.py::test_saving_a_run_registers_its_concept -v
+
+# Type-check (mypy, strict, Pydantic-aware — [tool.mypy] in pyproject.toml)
+uv run mypy
 ```
 
-There is no configured linter/formatter/type-checker (no ruff/black/mypy in `pyproject.toml`) — don't invent lint commands.
+There is no configured linter/formatter (no ruff/black in `pyproject.toml`) — don't invent lint commands. `mypy` **is** configured (`[tool.mypy]`, with the `pydantic.mypy` plugin) and scoped to `src/feature_pipeline` and `mcp_server` only — not `ui/` (Streamlit typing is noisy) and not `workers/` (vendored byte-for-byte, must stay diffable against upstream). CI (`.github/workflows/python-app.yml`) runs both `mypy` and `pytest` on every push/PR to `main`; a red mypy run blocks the same as a red test run.
 
 One-time provisioning of the training runtime (large model copy + dedicated venv), only needed before Step 5 (Train) or AI recaptioning in Step 2 work:
 

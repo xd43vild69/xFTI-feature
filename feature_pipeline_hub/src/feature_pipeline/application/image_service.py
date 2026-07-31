@@ -40,7 +40,7 @@ def compute_sharpness(img: Image.Image) -> float:
     means "blurry" across datasets.
     """
     grey = img.convert("L")
-    grey.thumbnail((SHARPNESS_SAMPLE_SIZE, SHARPNESS_SAMPLE_SIZE), Image.LANCZOS)
+    grey.thumbnail((SHARPNESS_SAMPLE_SIZE, SHARPNESS_SAMPLE_SIZE), Image.Resampling.LANCZOS)
 
     pixels = np.asarray(grey, dtype=np.float64)
     if pixels.shape[0] < 3 or pixels.shape[1] < 3:
@@ -88,11 +88,11 @@ def make_square_thumbnail(image_path: str, size: int = THUMBNAIL_SIZE) -> Image.
     background show through, so the thumbnail adapts to light/dark theme for free.
     """
     with Image.open(image_path) as img:
-        img = img.convert("RGBA")
-        img.thumbnail((size, size), Image.LANCZOS)
+        rgba = img.convert("RGBA")
+        rgba.thumbnail((size, size), Image.Resampling.LANCZOS)
         canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-        offset = ((size - img.width) // 2, (size - img.height) // 2)
-        canvas.paste(img, offset, img)
+        offset = ((size - rgba.width) // 2, (size - rgba.height) // 2)
+        canvas.paste(rgba, offset, rgba)
         return canvas
 
 

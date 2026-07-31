@@ -279,6 +279,23 @@ uv run pytest
 
 ---
 
+## ⚙️ Continuous Integration
+
+`.github/workflows/python-app.yml` runs on every push and pull request to `main`:
+
+1. **`uv sync --locked`** — installs the exact dependency set from `uv.lock`.
+2. **`mypy`** — strict, Pydantic-aware type-checking (`pydantic.mypy` plugin) over
+   `src/feature_pipeline/` and `mcp_server/`, where the domain models and the tools an
+   agent calls actually live. `ui/` (Streamlit) and `workers/` (vendored byte-for-byte
+   from upstream LoRAlab) are deliberately out of scope.
+3. **`pytest`** — the full test suite (caption normalization, validation rules,
+   deduplication, export integrity, MCP tools, and more), the gate against a change
+   silently breaking caption quality or a dataset export.
+
+Both steps must pass before a change can be considered safe to merge.
+
+---
+
 ## 🤝 Contributing
 
 See [`feature_pipeline_hub/CONTRIBUTING.md`](feature_pipeline_hub/CONTRIBUTING.md) for git branch strategy, commit conventions, and workflow. `.claudecodingrc` at the repo root encodes the same conventions for AI coding agents working in this repo.

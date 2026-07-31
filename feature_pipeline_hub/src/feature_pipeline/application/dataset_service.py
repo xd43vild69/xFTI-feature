@@ -13,6 +13,7 @@ from feature_pipeline.domain.models import (
     DatasetManifest,
     DatasetSample,
     IngestionRun,
+    SourceKind,
 )
 from feature_pipeline.domain.validators import validate_sample
 from feature_pipeline.infrastructure import ingestion_repository as repo
@@ -54,7 +55,7 @@ def create_ingestion_run(
     folder_path: str,
     concept_name: str,
     trigger_word: str,
-    source_kind: str,
+    source_kind: SourceKind,
     run_id: str | None = None,
     concept_id: str | None = None,
 ) -> IngestionRun:
