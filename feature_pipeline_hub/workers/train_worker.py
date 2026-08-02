@@ -24,9 +24,6 @@ import gc
 import csv
 import time
 import random
-import json
-import shutil
-import signal
 import sys
 import zlib
 import collections
@@ -57,7 +54,6 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # The trainer's pieces live in the krea2 package. It is importable because this file is
 # launched as a script, which puts workers/ on sys.path — the same reason
 # `from _telemetry import ...` works below.
-from krea2 import checkpoints as _checkpoints   # noqa: E402
 from krea2 import config as _config             # noqa: E402
 from krea2 import curation as _curation         # noqa: E402
 from krea2 import dataset as _dataset           # noqa: E402
@@ -68,6 +64,7 @@ from krea2 import preview as _preview           # noqa: E402
 from krea2 import quantization as _quant        # noqa: E402
 from krea2 import sampling as _sampling         # noqa: E402
 from krea2 import schedule as _schedule         # noqa: E402
+from krea2 import state as _state               # noqa: E402
 
 
 def from_root(path):
@@ -249,9 +246,6 @@ STEP_FILE    = CFG.step_file
 RUN_ID_FILE  = CFG.run_id_file
 
 
-def checkpoint_belongs_to_this_run():
-    """True when the checkpoint in this output dir belongs to the current pipeline run."""
-    return _checkpoints.belongs_to_run(RUN_ID_FILE, RUN_ID)
 
 
 torch.manual_seed(SEED)
@@ -355,19 +349,10 @@ def _export_lora(model, path, step=None, epoch=None, num_images=None):
 
 # ── UTILIDADES DE ESTADO / STATE UTILITIES ──────────────────────────────────
 
-def _atomic_write(path, writer):
-    """Write through a temp file then `os.replace` — atomic on POSIX and Windows."""
-    _checkpoints.atomic_write(path, writer)
 
 
-def rotate_checkpoints(output_dir, keep):
-    """Keep only the `keep` most recent per-step checkpoints; `keep <= 0` keeps all."""
-    _checkpoints.rotate(output_dir, keep)
 
 
-def _curation_group(score, threshold, override, mode="face"):
-    """Effective curation group for one image: "good" or "bad"."""
-    return _curation.resolve_group(score, threshold, override, mode=mode)
 
 
 def load_curation_weights(dataset_path, cache_names):
@@ -527,179 +512,26 @@ def train_krea2():
 
     FINGERPRINT = _lora_io.fingerprint(CFG)
 
-    # ── RESTAURACIÓN EXACTA DE CHECKPOINT / CHECKPOINT RESUME ─────────────────
-    start_step = 0
-    pending_state = None       # sampler/EMA/RNG: se aplican tras construirlos
-    lora_weights_path = os.path.join(RESUME_DIR, "adapter_model.safetensors")
-    have_checkpoint = (os.path.exists(STEP_FILE) and os.path.exists(OPT_FILE)
-                       and os.path.exists(lora_weights_path))
-    if have_checkpoint and not checkpoint_belongs_to_this_run():
-        print("=" * 65)
-        print("[i] Checkpoint from a previous pipeline run; discarding it / "
-              "Checkpoint de una corrida anterior del pipeline; se descarta.")
-        print(f"    {RESUME_DIR}")
-        print("=" * 65)
-        have_checkpoint = False
-
-    if have_checkpoint:
-        print("=" * 65)
-        print("¡Checkpoint detected! Restoring state... / ¡Checkpoint detectado! Restaurando estado...")
-        try:
-            state = torch.load(OPT_FILE, weights_only=True)
-            if not isinstance(state, dict) or "format_version" not in state:
-                # Formato antiguo: optimizer.pt era el state_dict pelado y el paso
-                # vivía sólo en current_step.txt. Se sigue aceptando para no
-                # romper los runs que ya estén en vuelo.
-                print("[i] Legacy checkpoint format / formato antiguo: no RNG or sampler state.")
-                with open(STEP_FILE, "r", encoding="utf-8") as f:
-                    start_step = int(f.read().strip())
-                optimizer.load_state_dict(state)
-            else:
-                start_step = int(state["step"])
-                if state.get("fingerprint") != FINGERPRINT:
-                    print("[!] WARNING: checkpoint fingerprint differs from current config.")
-                    print(f"    ckpt = {state.get('fingerprint')}")
-                    print(f"    now  = {FINGERPRINT}")
-                optimizer.load_state_dict(state["optimizer"])
-                if ema is not None and state.get("ema"):
-                    ema.load_state_dict(state["ema"])
-                pending_state = state
-
-            with open(lora_weights_path, "rb") as f:
-                load_lora_weights(model, f.read(), lora_weights_path)
-            print(f"Resuming training from step / Reanudando entrenamiento desde el paso {start_step}...")
-        except Exception as exc:
-            # Antes esto ponía start_step = 0 *después* de haber cargado pesos: al
-            # cambiar lora_rank y reanudar, entrenabas en silencio un run entero
-            # sobre pesos ya entrenados y con el LR reiniciado desde el warmup.
-            print(f"[!] ERROR: checkpoint exists but could not be restored / "
-                  f"existe pero no se pudo restaurar: {exc}")
-            if RESUME_ON_CORRUPT != "restart":
-                print("[!] Refusing to silently restart from step 0. Delete the checkpoint or set "
-                      "resume_on_corrupt='restart' / Me niego a reiniciar en silencio desde 0.")
-                sys.exit(2)
-            print("[!] resume_on_corrupt='restart': starting from step 0 / empezando desde 0.")
-            start_step = 0
-            pending_state = None
-        print("=" * 65)
-
-        if start_step >= TOTAL_STEPS:
-            print(f"[!] Checkpoint step {start_step} >= total_steps {TOTAL_STEPS}; nothing to do "
-                  f"/ nada que hacer. Increase total_steps to continue.")
-            return
-
-    # ── HAND-OFF ENTRE FASES (resolución progresiva) ──────────────────────────
-    # Cuando no hay checkpoint propio de esta fase pero se indica init_lora_from,
-    # se cargan SÓLO los pesos del adapter de la fase anterior. El optimizador
-    # queda fresco (momentos de Adam reiniciados) y start_step=0: cada fase re-warmea
-    # sobre la nueva escala de gradientes en vez de arrastrar la inercia anterior.
-    if start_step == 0 and INIT_LORA_FROM:
-        prev_adapter = os.path.join(INIT_LORA_FROM, "adapter_model.safetensors")
-        if os.path.exists(prev_adapter):
-            print("=" * 65)
-            print(f"Phase hand-off: loading LoRA weights from previous phase / Cargando LoRA de la fase previa:\n  {prev_adapter}")
-            with open(prev_adapter, "rb") as f:
-                load_lora_weights(model, f.read(), prev_adapter)
-            print("[OK] LoRA initialized from previous phase; optimizer starts fresh / LoRA inicializada; optimizador desde cero.")
-            print("=" * 65)
-        else:
-            print(f"[!] init_lora_from set but adapter not found / adapter no encontrado: {prev_adapter}")
-            sys.exit(1)
+    # ── RESTAURACIÓN DE CHECKPOINT Y HAND-OFF ENTRE FASES ────────────────────
+    ckpt = _state.CheckpointManager(CFG, model, optimizer)
+    FINGERPRINT = ckpt.fingerprint
+    restored = ckpt.restore(ema)
+    if restored.already_complete:
+        return
+    start_step = restored.start_step
+    pending_state = restored.pending
+    if start_step == 0:
+        ckpt.load_previous_phase()
 
     last_step_executed = start_step
     sampler = None             # lo construye el cargador de caché, más abajo
     saving = {"busy": False, "done_on_exit": False}
 
     def save_checkpoint_now(current_s):
-        """Save the full resumable state atomically, and non-reentrantly.
+        """Save the full resumable state atomically, and non-reentrantly."""
+        ckpt.save(current_s, sampler=sampler, ema=ema, num_images=len(cache_data))
 
-        Deliberate ordering: adapter weights first, then optimizer/RNG/sampler state,
-        and `current_step.txt` last. That file is the commit marker — if it exists,
-        everything it refers to exists too.
-        """
-        if current_s <= 0 or saving["busy"]:
-            return
-        saving["busy"] = True
-        try:
-            print(f"\nSaving checkpoint state at step / Guardando estado en paso {current_s}...")
-
-            # save_pretrained escribe in-place: si el proceso muere a mitad, deja
-            # un adapter_model.safetensors truncado. Se escribe a un staging y se
-            # publica fichero a fichero con os.replace.
-            stage = RESUME_DIR + ".stage"
-            shutil.rmtree(stage, ignore_errors=True)
-            os.makedirs(stage, exist_ok=True)
-            model.save_pretrained(stage)
-            os.makedirs(RESUME_DIR, exist_ok=True)
-            for name in os.listdir(stage):
-                os.replace(os.path.join(stage, name), os.path.join(RESUME_DIR, name))
-            shutil.rmtree(stage, ignore_errors=True)
-
-            _py_rng = random.getstate()
-            state = {
-                "format_version": 2,
-                "step": int(current_s),
-                "optimizer": optimizer.state_dict(),
-                "sampler": sampler.state_dict() if sampler is not None else None,
-                "ema": ema.state_dict() if ema is not None else None,
-                # El RNG de python va como JSON y el de torch como ByteTensor,
-                # para que torch.load(weights_only=True) siga funcionando.
-                "rng_python": json.dumps([_py_rng[0], list(_py_rng[1]), _py_rng[2]]),
-                "rng_torch": torch.get_rng_state(),
-                "rng_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
-                "fingerprint": FINGERPRINT,
-            }
-            _atomic_write(OPT_FILE, lambda p: torch.save(state, p))
-
-            if RUN_ID:
-                _atomic_write(RUN_ID_FILE, lambda p: open(p, "w", encoding="utf-8").write(RUN_ID))
-
-            ckpt = os.path.join(OUTPUT_DIR, f"Krea2_LoRA_step_{current_s}.safetensors")
-            # El LoRA que se entrega es el EMA; el resume_checkpoint conserva los
-            # pesos crudos para no doble-suavizar en cada reinicio.
-            if ema is not None:
-                ema.apply()
-            try:
-                _atomic_write(ckpt, lambda p: _export_lora(
-                    model, p, step=current_s,
-                    epoch=sampler.epoch if sampler is not None else 0,
-                    num_images=len(cache_data)))
-            finally:
-                if ema is not None:
-                    ema.restore()
-
-            # Commit: el paso se escribe el último.
-            _atomic_write(STEP_FILE, lambda p: open(p, "w", encoding="utf-8").write(str(current_s)))
-            rotate_checkpoints(OUTPUT_DIR, MAX_CKPT_KEEP)
-            print(f"✓ Checkpoint saved successfully at step / Checkpoint guardado en paso {current_s}: {ckpt}")
-        finally:
-            saving["busy"] = False
-
-    def handle_signal(sig, frame):
-        """Checkpoint the current step and exit cleanly on SIGTERM/SIGINT/SIGHUP.
-
-        Lets the UI stop a run, or an SSH session drop, without losing progress back
-        to the last periodic save.
-        """
-        print(f"\n[!] Signal received / Señal de detención recibida ({sig}).")
-        save_checkpoint_now(last_step_executed)
-        # El handler externo también guardaría al capturar SystemExit; esta marca
-        # evita el doble guardado.
-        saving["done_on_exit"] = True
-        sys.exit(0)
-
-    try:
-        signal.signal(signal.SIGTERM, handle_signal)
-        signal.signal(signal.SIGINT, handle_signal)
-        if hasattr(signal, "SIGBREAK"):
-            signal.signal(signal.SIGBREAK, handle_signal)
-        # Lanzado a mano por SSH sin tmux, el cierre de la terminal manda SIGHUP:
-        # guardar checkpoint en vez de morir sin más. (Vía server no llega: el
-        # proceso corre en su propia sesión.)
-        if hasattr(signal, "SIGHUP"):
-            signal.signal(signal.SIGHUP, handle_signal)
-    except Exception:
-        pass
+    ckpt.install_signal_handlers(lambda: last_step_executed, save_checkpoint_now)
 
     model.train()
     optimizer.zero_grad(set_to_none=True)
@@ -762,20 +594,7 @@ def train_krea2():
             print(f"\n{warning}")
 
     # ── A6: restaurar RNG y estado del sampler tras un resume ────────────────
-    if pending_state is not None:
-        try:
-            if pending_state.get("sampler"):
-                sampler.load_state_dict(pending_state["sampler"])
-            raw = json.loads(pending_state["rng_python"])
-            random.setstate((raw[0], tuple(raw[1]), raw[2]))
-            torch.set_rng_state(pending_state["rng_torch"].to(torch.uint8))
-            if torch.cuda.is_available() and pending_state.get("rng_cuda"):
-                torch.cuda.set_rng_state_all([s.to(torch.uint8) for s in pending_state["rng_cuda"]])
-            print(f"[OK] RNG and sampler state restored (epoch {sampler.epoch}) / "
-                  f"estado RNG y del sampler restaurado.")
-        except Exception as exc:
-            print(f"[!] Could not restore RNG/sampler state: {exc} — continuing with a fresh "
-                  f"stream / continuando con un flujo nuevo.")
+    ckpt.apply_pending(pending_state, sampler)
 
     # ── C1: loss de validación ───────────────────────────────────────────────
     @torch.no_grad()
@@ -1099,7 +918,7 @@ def train_krea2():
         save_checkpoint_now(last_step_executed)
         raise
     except (KeyboardInterrupt, SystemExit):
-        if not saving["done_on_exit"]:
+        if not ckpt.saved_on_exit:
             save_checkpoint_now(last_step_executed)
         return
 
@@ -1124,15 +943,8 @@ def train_krea2():
     # Guardar también el resume_checkpoint al terminar: en el pipeline progresivo
     # es el hand-off de pesos que carga la fase siguiente vía init_lora_from.
     save_checkpoint_now(TOTAL_STEPS)
-    final = os.path.join(OUTPUT_DIR, "Krea2_FINAL_LoRA.safetensors")
-    if ema is not None:
-        ema.apply()
-    try:
-        _atomic_write(final, lambda p: _export_lora(
-            model, p, step=TOTAL_STEPS, epoch=sampler.epoch, num_images=len(cache_data)))
-    finally:
-        if ema is not None:
-            ema.restore()
+    final = ckpt.export_final(TOTAL_STEPS, sampler=sampler, ema=ema,
+                              num_images=len(cache_data))
     print(f"✓ Final LoRA saved to / Tu LoRA definitivo está en: {final}")
 
 

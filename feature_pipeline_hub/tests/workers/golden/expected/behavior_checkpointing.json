@@ -1,0 +1,62 @@
+{
+  "adapter_loads": [
+    "adapter_model.safetensors",
+    "adapter_model.safetensors",
+    "adapter_model.safetensors"
+  ],
+  "after_save": {
+    "files": [
+      "Krea2_LoRA_step_50.safetensors",
+      "current_step.txt",
+      "optimizer.pt",
+      "resume_checkpoint"
+    ],
+    "has_checkpoint": true,
+    "resume_files": [
+      "adapter_config.json",
+      "adapter_model.safetensors"
+    ],
+    "step_file": "50"
+  },
+  "before_save": {
+    "has_checkpoint": false
+  },
+  "corrupt_with_restart": {
+    "pending": null,
+    "start_step": 0
+  },
+  "exhausted": {
+    "already_complete": true,
+    "start_step": 50
+  },
+  "reentrant_save_blocked": {
+    "has_checkpoint": false
+  },
+  "restore": {
+    "already_complete": false,
+    "pending_keys": [
+      "ema",
+      "fingerprint",
+      "format_version",
+      "optimizer",
+      "rng_cuda",
+      "rng_python",
+      "rng_torch",
+      "sampler",
+      "step"
+    ],
+    "start_step": 50
+  },
+  "rotation_on_save": [
+    "Krea2_FINAL_LoRA.safetensors",
+    "Krea2_LoRA_step_30.safetensors",
+    "Krea2_LoRA_step_40.safetensors"
+  ],
+  "run_id_gating": {
+    "other_run_discards": 0,
+    "same_run_resumes": 20
+  },
+  "step_zero_is_noop": {
+    "has_checkpoint": false
+  }
+}

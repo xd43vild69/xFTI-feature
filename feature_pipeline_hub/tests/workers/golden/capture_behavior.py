@@ -242,8 +242,11 @@ def capture_curation():
 
 
 def capture_rotation():
-    """rotate_checkpoints must prune by parsed step number and never touch FINAL."""
+    """Rotation must prune by parsed step number and never touch FINAL."""
     import tempfile
+
+    from krea2.checkpoints import rotate
+
     out = {}
     for keep in (0, 1, 3, 10):
         with tempfile.TemporaryDirectory() as tmp:
@@ -252,20 +255,22 @@ def capture_rotation():
                 (d / f"Krea2_LoRA_step_{step}.safetensors").write_text("x")
             (d / "Krea2_FINAL_LoRA.safetensors").write_text("x")
             (d / "unrelated.txt").write_text("x")
-            tw.rotate_checkpoints(str(d), keep)
+            rotate(str(d), keep, log=lambda _m: None)
             out[f"keep_{keep}"] = sorted(p.name for p in d.iterdir())
     return out
 
 
 def capture_curation_group():
-    """_curation_group's decision table, including the None and override paths."""
+    """The group decision table, including the None and override paths."""
+    from krea2.curation import resolve_group
+
     out = {}
     for mode in ("face", "style"):
         for score in (None, 0.2, 0.5, 0.8):
             for thr in (None, 0.5):
                 for ovr in (None, "good", "bad", "garbage"):
                     key = f"{mode}_s{score}_t{thr}_o{ovr}"
-                    out[key] = tw._curation_group(score, thr, ovr, mode=mode)
+                    out[key] = resolve_group(score, thr, ovr, mode=mode)
     return out
 
 
@@ -339,6 +344,179 @@ def capture_noise_offset():
     return out
 
 
+class _FakeModel(torch.nn.Module):
+    """Stands in for the PEFT-wrapped transformer: just enough for save/export."""
+
+    def __init__(self, scale: float = 1.0):
+        super().__init__()
+        self.lora_A = torch.nn.Parameter(torch.full((4, 3), scale))
+        self.lora_B = torch.nn.Parameter(torch.full((3, 4), scale * 2))
+        self.saved_to = None
+
+    def state_dict(self, *a, **k):
+        return {
+            "base_model.model.blk.lora_A.default.weight": self.lora_A.data,
+            "base_model.model.blk.lora_B.default.weight": self.lora_B.data,
+            "base_model.model.blk.base_layer.weight": torch.zeros(2, 2),  # not exported
+        }
+
+    def save_pretrained(self, directory):
+        os.makedirs(directory, exist_ok=True)
+        from safetensors.torch import save_file
+        save_file({k: v.contiguous() for k, v in self.state_dict().items()},
+                  os.path.join(directory, "adapter_model.safetensors"))
+        with open(os.path.join(directory, "adapter_config.json"), "w") as f:
+            json.dump({"r": 16}, f)
+        self.saved_to = directory
+
+
+class _FakeOptimizer:
+    def __init__(self):
+        self.state = {"step": 0}
+
+    def state_dict(self):
+        return dict(self.state)
+
+    def load_state_dict(self, state):
+        self.state = dict(state)
+
+
+def capture_checkpointing():
+    """A full save/restore cycle, plus the failure paths, as observable outcomes.
+
+    CheckpointManager is the riskiest thing the split touches — write ordering is a
+    commit protocol and a partial restore is worse than none — so this records what
+    actually lands on disk and what comes back, using stand-ins for the model and
+    optimizer so no GPU or real adapter is needed.
+
+    Adapter weight loading is stubbed out for the duration: `load_lora_weights` exits
+    the process when a load lands on nothing, which is correct behavior and exactly what
+    a fake model triggers. It has its own coverage in behavior_lora_metadata and in the
+    Stage 5 smoke run; what is under test here is the bookkeeping around it.
+    """
+    import tempfile
+
+    from krea2 import config as kconfig
+    from krea2 import state as kstate
+
+    loads: list[str] = []
+    real_load = kstate.lora_io.load_lora_weights
+    kstate.lora_io.load_lora_weights = (
+        lambda model, blob, src, log=None: loads.append(os.path.basename(src)) or 1.0)
+
+    def make_cfg(root, **settings):
+        path = pathlib.Path(root) / "settings.json"
+        path.write_text(json.dumps(settings))
+        return kconfig.load_config(
+            root, settings_path=str(path), advanced_path=str(pathlib.Path(root) / "none.json"),
+            cache_root=os.path.join(root, "c"), output_root=os.path.join(root, "o"),
+            env={}, log=lambda _m: None)
+
+    out: dict[str, Any] = {}
+    try:
+        _capture_checkpoint_cases(out, make_cfg, kstate, loads)
+    finally:
+        kstate.lora_io.load_lora_weights = real_load
+    return out
+
+
+def _capture_checkpoint_cases(out, make_cfg, kstate, loads):
+    import tempfile
+
+    # ── a clean save, then a restore that picks it back up ──────────────────
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = make_cfg(tmp, output_dir="./out", total_steps=100, max_checkpoints_to_keep=2)
+        os.makedirs(cfg.output_dir, exist_ok=True)
+        model, opt = _FakeModel(), _FakeOptimizer()
+        manager = kstate.CheckpointManager(cfg, model, opt, log=lambda _m: None)
+
+        out["before_save"] = {"has_checkpoint": manager.has_checkpoint()}
+        opt.state = {"step": 42, "momentum": 0.9}
+        manager.save(50, sampler=None, ema=None, num_images=7)
+
+        out["after_save"] = {
+            "has_checkpoint": manager.has_checkpoint(),
+            "files": sorted(p.name for p in pathlib.Path(cfg.output_dir).iterdir()),
+            "resume_files": sorted(p.name for p in pathlib.Path(cfg.resume_dir).iterdir()),
+            "step_file": pathlib.Path(cfg.step_file).read_text(),
+        }
+
+        restored = kstate.CheckpointManager(
+            cfg, _FakeModel(scale=0.0), _FakeOptimizer(), log=lambda _m: None).restore()
+        out["restore"] = {
+            "start_step": restored.start_step,
+            "already_complete": restored.already_complete,
+            "pending_keys": sorted(restored.pending) if restored.pending else None,
+        }
+
+    # ── rotation happens on save, and FINAL is never pruned ─────────────────
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = make_cfg(tmp, output_dir="./out", total_steps=500, max_checkpoints_to_keep=2)
+        os.makedirs(cfg.output_dir, exist_ok=True)
+        manager = kstate.CheckpointManager(cfg, _FakeModel(), _FakeOptimizer(),
+                                           log=lambda _m: None)
+        for step in (10, 20, 30, 40):
+            manager.save(step, num_images=3)
+        manager.export_final(40, num_images=3)
+        out["rotation_on_save"] = sorted(p.name for p in pathlib.Path(cfg.output_dir).iterdir()
+                                         if p.name.endswith(".safetensors"))
+
+    # ── a step 0 save is a no-op, and re-entrancy is blocked ────────────────
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = make_cfg(tmp, output_dir="./out")
+        os.makedirs(cfg.output_dir, exist_ok=True)
+        manager = kstate.CheckpointManager(cfg, _FakeModel(), _FakeOptimizer(),
+                                           log=lambda _m: None)
+        manager.save(0, num_images=1)
+        out["step_zero_is_noop"] = {"has_checkpoint": manager.has_checkpoint()}
+        manager._busy = True
+        manager.save(10, num_images=1)
+        out["reentrant_save_blocked"] = {"has_checkpoint": manager.has_checkpoint()}
+
+    # ── a checkpoint past total_steps reports nothing left to do ────────────
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = make_cfg(tmp, output_dir="./out", total_steps=30)
+        os.makedirs(cfg.output_dir, exist_ok=True)
+        kstate.CheckpointManager(cfg, _FakeModel(), _FakeOptimizer(),
+                                 log=lambda _m: None).save(50, num_images=1)
+        result = kstate.CheckpointManager(cfg, _FakeModel(), _FakeOptimizer(),
+                                          log=lambda _m: None).restore()
+        out["exhausted"] = {"start_step": result.start_step,
+                            "already_complete": result.already_complete}
+
+    # ── a run_id from an earlier pipeline run is discarded ──────────────────
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = make_cfg(tmp, output_dir="./out", total_steps=100, run_id="run-A")
+        os.makedirs(cfg.output_dir, exist_ok=True)
+        kstate.CheckpointManager(cfg, _FakeModel(), _FakeOptimizer(),
+                                 log=lambda _m: None).save(20, num_images=1)
+        same = make_cfg(tmp, output_dir="./out", total_steps=100, run_id="run-A")
+        other = make_cfg(tmp, output_dir="./out", total_steps=100, run_id="run-B")
+        out["run_id_gating"] = {
+            "same_run_resumes": kstate.CheckpointManager(
+                same, _FakeModel(), _FakeOptimizer(), log=lambda _m: None
+            ).restore().start_step,
+            "other_run_discards": kstate.CheckpointManager(
+                other, _FakeModel(), _FakeOptimizer(), log=lambda _m: None
+            ).restore().start_step,
+        }
+
+    # ── a corrupt optimizer.pt aborts unless told to restart ────────────────
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = make_cfg(tmp, output_dir="./out", total_steps=100,
+                       resume_on_corrupt="restart")
+        os.makedirs(cfg.output_dir, exist_ok=True)
+        kstate.CheckpointManager(cfg, _FakeModel(), _FakeOptimizer(),
+                                 log=lambda _m: None).save(20, num_images=1)
+        pathlib.Path(cfg.optimizer_state_file).write_bytes(b"corrupt")
+        result = kstate.CheckpointManager(cfg, _FakeModel(), _FakeOptimizer(),
+                                          log=lambda _m: None).restore()
+        out["corrupt_with_restart"] = {"start_step": result.start_step,
+                                       "pending": result.pending}
+
+    out["adapter_loads"] = loads
+
+
 CAPTURES = {
     "behavior_latent_packing": capture_latent_packing,
     "behavior_shift": capture_shift,
@@ -353,6 +531,7 @@ CAPTURES = {
     "behavior_lora_metadata": capture_lora_metadata,
     "behavior_ema_horizon": capture_ema_horizon,
     "behavior_noise_offset": capture_noise_offset,
+    "behavior_checkpointing": capture_checkpointing,
 }
 
 
