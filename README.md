@@ -242,6 +242,140 @@ feature_pipeline_hub/
 
 ---
 
+## 🏋️ Training Architecture & Orchestration
+
+The training phase (Step 5) is orchestrated by `workers/train_worker.py:train_krea2()` — a ~450-line function that manages model loading, dataset batching, the micro-step loop, checkpointing, and LoRA export. Below is the complete flow:
+
+### Diagram: Training Orchestration
+
+![Training Architecture](docs/training-architecture.svg)
+
+### Four Phases
+
+#### **Phase 1: Setup (Lines 403–514)**
+1. **Config Resolution** (`config.load_config()`)
+   - Reads `train_settings.json`, `train_advanced.json`, optional preset, and DEFAULTS
+   - Returns an immutable `TrainConfig` object; all 60+ parameters live here
+   - Resolves paths, validates enums, and computes derived values (e.g., `total_updates = total_steps / grad_accum_steps`)
+
+2. **Model & Quantization**
+   - Download Krea-2-NF4 from HuggingFace (if not already local)
+   - Load the 12B transformer and scheduler into GPU memory
+   - Quantize to NF4 in-place, OR load a cached NF4 snapshot (~3 minutes vs. ~1 hour)
+
+3. **LoRA Attachment**
+   - Wrap the frozen base transformer with PEFT LoRA adapters
+   - Set LoRA dtype (bf16 for speed, fp32 for precision)
+   - Build the optimizer (AdamW8bit paged, AdamW8bit, or AdamW)
+
+4. **Optional EMA**
+   - If `use_ema=True`, create an Exponential Moving Average shadow of LoRA weights
+   - Used for validation loss and preview generation (smoother, more stable)
+
+#### **Phase 2: Load Data (Lines 515–594)**
+1. **Checkpoint Manager** (`state.CheckpointManager`)
+   - Attempt to restore a previous checkpoint (if resuming a run)
+   - If starting fresh (`start_step == 0`), load weights from a prior phase (multi-phase training)
+
+2. **Dataset Loading** (`dataset.load()`)
+   - Read all pre-cached VAE latents + text embeddings into RAM
+   - Bucket images by resolution `(H, W)` to respect model constraints
+   - Optional validation/training split (holdout for quality measurement)
+
+3. **Curation Weights** (`curation.load_weights()`)
+   - Load per-image training weights from `curation_report.json`
+   - Allow manual overrides from `curation_overrides.json`
+   - If all weights = 1.0, skip (for bit-identical reproducibility with uncurated runs)
+
+4. **Sampler Construction** (`sampling.build_sampler()`)
+   - **EpochSampler** (recommended): every image seen exactly once per epoch; fair coverage
+   - **LegacySampler** (legacy): uniform over buckets; can bias small buckets
+
+#### **Phase 3: Training Loop (Lines 674–909)**
+Each micro-step (`for step in 1..TOTAL_STEPS`):
+
+1. **Batch & Sigma Sampling**
+   - `sampler.next()` → fetch a batch of image names from the current bucket
+   - `math_ops.sample_sigma()` → sample flow-matching timestep (σ ∈ [0, 1]) per image
+     - Modes: logit_normal, content (favor fine detail), style (favor composition)
+
+2. **Forward Pass**
+   - Pack latents into token sequences: `[B, C, H, W] → [B, (H/2)*(W/2), C*4]`
+   - Generate position IDs for RoPE (row, col coordinates)
+   - Add Gaussian noise scaled by σ: `x_noisy = (1 - σ) * x + σ * noise`
+   - Predict noise residual through the transformer
+
+3. **Loss Computation**
+   - Base loss: MSE between predicted and target noise
+   - **Timestep weighting** (optional): bell/half_bell curves favor σ ≈ 0.5
+   - **Curation weights**: scale per-image loss (per-image learning rate)
+   - **Gradient accumulation**: defer optimizer step for `grad_accum_steps` micro-steps
+
+4. **Guards & Metric Collection**
+   - **NaN Guard**: detect non-finite loss → skip batch, track count, abort after N
+   - **OOM Guard**: catch CUDA OOM → free VRAM, retry, abort after N consecutive
+   - **Max Loss**: outlier detection; discard window if loss exceeds threshold
+   - **Validation Loss** (every `validate_every` steps): hold-out MSE at fixed sigmas
+   - **Preview Generation** (every `preview_every` steps): sample an image with current weights
+
+5. **Optimizer & State Updates**
+   - After `grad_accum_steps` accumulated backwards:
+     - `torch.nn.utils.clip_grad_norm_()` with `max_grad_norm`
+     - Update learning rate per schedule: cosine, constant, linear, step, or cosine_with_restarts
+     - `optimizer.step()` + `optimizer.zero_grad()`
+     - EMA weight update (if enabled)
+
+6. **Logging & Checkpointing**
+   - Write to CSV: step, loss, grad_norm, LR, sigma, bucket size, VRAM peak, seconds/step
+   - Console output: progress bar with running loss, gradient norm, LR, epoch number
+   - Save full checkpoint atomically every `save_every` steps (model, optimizer, sampler RNG, EMA state)
+
+#### **Phase 4: Finalization (Lines 889–912)**
+1. **Flush Partial Accumulation**
+   - If `total_steps` is not a multiple of `grad_accum_steps`, apply leftover accumulated gradients
+
+2. **Final Checkpoint & Hand-Off**
+   - Save `resume_checkpoint/` (for multi-phase continuity)
+   - Export `Krea2_FINAL_LoRA.safetensors` (flattened, safe-tensor format)
+   - Emit telemetry: `worker_finished` with duration + GPU-seconds
+
+### Utility Classes
+
+| Class | Module | Purpose |
+|-------|--------|---------|
+| **TrainConfig** | `config.py` | Immutable dataclass holding all 60+ resolved training parameters |
+| **EpochSampler** / **LegacySampler** | `sampling.py` | Batch generator that respects resolution buckets |
+| **CheckpointManager** | `state.py` | Atomic save/restore of model, optimizer, sampler, EMA; handles SIGINT/SIGTERM |
+| **EMA** | `ema.py` | Exponential moving average of LoRA weights for stable validation/preview |
+| **CsvLogs** | `metrics.py` | Structured CSV logging of loss, LR, grad_norm, sigma, VRAM, timing |
+| **DatasetHolder** | `dataset.py` | Loader returning `{name: (latent, embedding, mask)}` + buckets |
+| **math_ops*** | `math_ops.py` | Tensor operations: sigma sampling, timestep weighting, latent packing |
+| **schedule*** | `schedule.py` | Learning rate schedule evaluation per step |
+| **curation*** | `curation.py` | Per-image loss scaling from curation report + overrides |
+
+### Checkpoint Format
+
+A checkpoint saves:
+- **Model weights** (LoRA adapter state)
+- **Optimizer state** (AdamW momentum, variance, step counter)
+- **Current step** and epoch
+- **Sampler RNG state** (JSON-serializable for reproducibility on resume)
+- **EMA weights** (if enabled)
+
+Checkpoints are deterministic: restoring `step=1000` and re-training from there produces identical results (same RNG seeds, same batch order, same gradient flow).
+
+### Multi-Phase Training
+
+When `phase_count > 1`, each phase:
+1. Uses explicit `TRAIN_SETTINGS_PATH` / `TRAIN_ADVANCED_PATH` (set by orchestrator)
+2. Begins by loading previous phase's LoRA as initialization (`init_lora_from`)
+3. Runs its configured `total_steps` (often at a different resolution/batch size)
+4. Saves its own checkpoint; next phase loads from `resume_checkpoint/`
+
+The orchestrator (external to this file) manages `phase_index`, `global_step_offset`, and `global_total_steps` for progress tracking and cost estimation.
+
+---
+
 ## 🚀 How to Run
 
 ### Prerequisites
