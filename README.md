@@ -91,7 +91,7 @@ The application is organized into **five sequential pipeline steps** plus a stan
 Two independent mechanisms feed the Metrics page and keep it honest without the UI having to poll a live process:
 
 * **Step telemetry** (`ui/step_telemetry.py`): each UI step (Import, Recaption, Quality, Export) times itself and records duration + error count into that run's `ingestion_runs` row.
-* **Worker lifecycle events**: `workers/precache_worker.py` and `workers/train_worker.py` are ported byte-for-byte from the upstream LoRAlab project and are never instrumented directly — `workers/_telemetry.py` wraps only their `__main__` entrypoints from the outside, emitting one structured JSON line per lifecycle transition (`worker_started` / `worker_finished` / `worker_failed`, with duration and GPU-seconds) to the same stdout the training log already streams to. `training_runner.py` reads the last ~4KB of a (possibly multi-hour) log file to find that final line cheaply, and `training_service.finalize_dead_run()` uses it to backfill `training_runs.gpu_seconds` / `cost_estimate`.
+* **Worker lifecycle events**: `workers/precache_worker.py` and `workers/train_worker.py` are ported from the upstream LoRAlab project and are never instrumented directly — `workers/_telemetry.py` wraps only their `__main__` entrypoints from the outside, emitting one structured JSON line per lifecycle transition (`worker_started` / `worker_finished` / `worker_failed`, with duration and GPU-seconds) to the same stdout the training log already streams to. `training_runner.py` reads the last ~4KB of a (possibly multi-hour) log file to find that final line cheaply, and `training_service.finalize_dead_run()` uses it to backfill `training_runs.gpu_seconds` / `cost_estimate`.
 
 Recaptioning uses a related but separate JSON-lines protocol (`LoadedEvent` / `CaptionEvent` / `ErrorEvent` / `DoneEvent`) defined in `domain/worker_contracts.py`, streamed live rather than tailed after the fact, since that worker runs blocking in the foreground.
 
@@ -234,7 +234,7 @@ feature_pipeline_hub/
 │   ├── recaption_worker.py         # Qwen3-VL recaption worker
 │   ├── caption_qwen3vl.py          # Vendored Qwen3-VL loading/captioning (ported from LoRAlab)
 │   ├── precache_worker.py          # VAE & text embedding pre-cache worker (vendored, byte-for-byte)
-│   ├── train_worker.py             # LoRA training execution worker (vendored, byte-for-byte)
+│   ├── train_worker.py             # LoRA training execution worker (vendored logic; docstrings rewritten locally)
 │   └── _telemetry.py               # Wraps precache/train's __main__ with lifecycle JSON events
 ```
 
@@ -286,7 +286,7 @@ uv run pytest
 1. **`uv sync --locked`** — installs the exact dependency set from `uv.lock`.
 2. **`mypy`** — strict, Pydantic-aware type-checking (`pydantic.mypy` plugin) over
    `src/feature_pipeline/` and `mcp_server/`, where the domain models and the tools an
-   agent calls actually live. `ui/` (Streamlit) and `workers/` (vendored byte-for-byte
+   agent calls actually live. `ui/` (Streamlit) and `workers/` (ported
    from upstream LoRAlab) are deliberately out of scope.
 3. **`pytest`** — the full test suite (caption normalization, validation rules,
    deduplication, export integrity, MCP tools, and more), the gate against a change

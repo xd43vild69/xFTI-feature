@@ -1,18 +1,23 @@
 # -*- coding: utf-8 -*-
 """
-train_worker.py — Entrenamiento LoRA para Krea 2 (RAW) con NF4 / LoRA Training for Krea 2
+train_worker.py — LoRA training for Krea 2 (RAW) on an NF4-quantized base.
 
-Ported verbatim from AcademiaSD_LoRAlab-Krea2's 2_train_lora_krea2.py, run here
-against feature_pipeline_hub's own training_runtime/ instead of that checkout.
-The only change from the original is PROJECT_ROOT's directory depth below —
-this file lives one level shallower (workers/ vs scripts/python/) than the
-original. Everything else — the training loop, guards, checkpointing,
-curation weighting, progressive-phase handling, and the bilingual log
-messages — is untouched, so the two stay easy to diff against each other as
-LoRAlab evolves.
+Runs as a detached process in the training runtime's own virtualenv, reading
+VAE latents and text embeddings that the pre-cache stage already wrote to disk,
+and emitting LoRA checkpoints plus a final `Krea2_FINAL_LoRA.safetensors`.
 
-Lee configuración desde train_settings.json si existe.
-Reads configuration from train_settings.json if present.
+Originally ported from AcademiaSD_LoRAlab-Krea2's `2_train_lora_krea2.py` and
+still tracks it for *logic* — the training loop, guards, checkpointing, curation
+weighting and progressive-phase handling are unchanged, so behavioral drift
+against upstream stays reviewable. The documentation has deliberately diverged:
+docstrings here are English-only and describe each function at its definition.
+Two other local changes: PROJECT_ROOT is one directory shallower (this file
+lives in workers/, not scripts/python/), and __main__ is wrapped by _telemetry
+to emit lifecycle events. Inline comments and log messages remain as upstream
+wrote them, bilingual.
+
+Configuration is read from train_settings.json when present, layered over
+train_advanced.json, an optional preset, and DEFAULTS — in that precedence.
 """
 import os
 import gc
@@ -59,7 +64,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def from_root(path):
-    """Resuelve una ruta relativa contra la raíz del proyecto (absolutas intactas)."""
+    """Resolve a relative path against the project root; absolute paths pass through."""
     return path if os.path.isabs(path) else os.path.normpath(os.path.join(PROJECT_ROOT, path))
 
 
@@ -236,7 +241,12 @@ _CFG_SOURCE = {}
 
 
 def _cfg(key, default=None):
-    """Resuelve una clave y anota su procedencia para el bloque EFFECTIVE CONFIG."""
+    """Resolve one config key and record where it came from.
+
+    Precedence is train_settings.json > train_advanced.json > preset > DEFAULTS.
+    The source is stashed in `_CFG_SOURCE` so `_print_effective_config` can show
+    why each value won.
+    """
     if key in cfg:
         src, val = "json", cfg[key]
     elif key in adv:
@@ -342,6 +352,11 @@ if VAL_CACHE_DIR:
 
 
 def _validate_choice(name, value, allowed, fallback):
+    """Return `value` if it is one of `allowed`, else warn and return `fallback`.
+
+    A bad enum never aborts the run: a multi-hour training job should not die on
+    a typo in one optional setting.
+    """
     if value not in allowed:
         print(f"[!] Invalid {name} '{value}'. Using '{fallback}' / valor inválido. Usando '{fallback}'.")
         return fallback
@@ -409,11 +424,11 @@ if WARMUP_UPDATES >= TOTAL_UPDATES:
 
 
 def _print_effective_config():
-    """Vuelca cada valor resuelto con su procedencia.
+    """Dump every resolved setting with the layer it came from.
 
-    Con precedencia en cuatro niveles (json > advanced > preset > default) y todo
-    siendo opt-in, esto es lo único que hace depurable "por qué no se aplicó lo
-    que puse". Va a stdout, así que la UI web lo muestra sin cambios.
+    With four levels of precedence and every feature opt-in, this block is the
+    only thing that makes "why didn't my setting apply?" debuggable. It goes to
+    stdout, so the web UI surfaces it as-is.
     """
     rows = [
         ("model_id",             MODEL_ID),
@@ -483,11 +498,12 @@ RUN_ID_FILE  = os.path.join(OUTPUT_DIR, "run_id.txt")
 
 
 def checkpoint_belongs_to_this_run():
-    """¿El checkpoint de esta carpeta es de la corrida actual del pipeline?
+    """True when the checkpoint in this output dir belongs to the current pipeline run.
 
-    Sin RUN_ID (entrenador suelto) siempre se acepta. Con RUN_ID, un checkpoint de
-    una corrida anterior debe descartarse: si no, la fase lo restauraría con
-    start_step == total_steps, ignoraría init_lora_from y correría un bucle vacío.
+    Without a RUN_ID (standalone trainer) any checkpoint is accepted. With one, a
+    checkpoint from an earlier run must be discarded: otherwise the phase would
+    restore it with start_step == total_steps, ignore `init_lora_from`, and run an
+    empty loop.
     """
     if not RUN_ID:
         return True
@@ -510,15 +526,16 @@ def free_vram():
 
 
 def patch_attention_for_low_vram():
-    """Evita el backend `math` de SDPA cuando hay que conservar la máscara.
+    """Monkey-patch Krea2 attention to avoid SDPA's `math` backend when a mask is used.
 
-    PyTorch no admite `attn_mask` junto con `enable_gqa=True` ni en flash ni en
-    mem-efficient, así que recae en `math`, que materializa la matriz completa
-    [B, heads, S, S]. Expandiendo K/V al número de cabezas de Q se puede pasar
-    `enable_gqa=False` y mem-efficient vuelve a estar disponible: el coste son
-    unas decenas de MB de K/V frente a cientos de MB de scores.
+    PyTorch rejects `attn_mask` together with `enable_gqa=True` on both the flash
+    and mem-efficient kernels, falling back to `math`, which materializes the full
+    [B, heads, S, S] score matrix. Expanding K/V to Q's head count lets us pass
+    `enable_gqa=False` and get mem-efficient back — tens of MB of K/V instead of
+    hundreds of MB of scores.
 
-    Sin máscara (ver COMPACT_TEXT) flash ya funciona con GQA y esto no actúa.
+    A no-op when captions are compacted (see COMPACT_TEXT), since flash already
+    handles GQA once there is no mask.
     """
     from diffusers.models.transformers import transformer_krea2
 
@@ -537,6 +554,12 @@ def patch_attention_for_low_vram():
 
 
 def ensure_model_downloaded(local_path, repo_id):
+    """Return a usable model directory, pulling it from Hugging Face if absent.
+
+    A non-empty `local_path` is trusted as-is; otherwise the full repo is
+    snapshot-downloaded, which is a multi-GB, multi-minute operation. Returns the
+    resolved path.
+    """
     if os.path.exists(local_path) and os.path.isdir(local_path):
         has_content = any(
             os.path.exists(os.path.join(local_path, f))
@@ -574,17 +597,24 @@ def ensure_model_downloaded(local_path, repo_id):
 
 def calculate_shift(image_seq_len, base_seq_len=256, max_seq_len=6400,
                     base_shift=0.5, max_shift=1.15):
+    """Interpolate the flow-matching timestep shift for a given latent sequence length.
+
+    Higher resolutions need more of the schedule spent at high sigma, so the shift
+    ramps linearly from `base_shift` at `base_seq_len` to `max_shift` at
+    `max_seq_len`. Feeds `sample_sigma` and the preview scheduler.
+    """
     m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
     b = base_shift - m * base_seq_len
     return image_seq_len * m + b
 
 
 def sample_sigma(batch_size, image_seq_len, device, shift_cfg):
-    """Muestrea sigma para flow-matching, con el shift dependiente de resolución.
+    """Sample a flow-matching sigma per batch item, shifted by resolution.
 
-    `content_or_style` sesga la uniforme antes del shift (arXiv 2302.08453 §3.4):
-    `content` (u³) concentra en sigma baja = detalle fino y parecido; `style`
-    (1−u³) en sigma alta = composición y color.
+    `content_or_style` skews the underlying uniform before the shift is applied
+    (arXiv 2302.08453 §3.4): `content` (u³) concentrates on low sigma — fine detail
+    and likeness — while `style` (1−u³) concentrates on high sigma — composition
+    and color.
     """
     if TIMESTEP_SAMPLING == "logit_normal":
         u = torch.sigmoid(LOGIT_NORMAL_MU + LOGIT_NORMAL_SIGMA
@@ -613,11 +643,11 @@ _HALF_BELL_MEAN = 0.9278121959460491
 
 
 def timestep_weight(sigma):
-    """Ponderación BSMNTW/HBSMNTW de ai-toolkit, reexpresada sobre sigma ∈ (0,1).
+    """ai-toolkit's BSMNTW/HBSMNTW loss weighting, re-expressed over sigma ∈ (0,1).
 
-    Normalizado, el peso va de 0.709 a 1.169: con batch 1 es una modulación de
-    ±20% del LR por paso, y su efecto real viene de reponderar los micro-batches
-    dentro de la ventana de acumulación de gradientes.
+    Normalized the weight spans 0.709 to 1.169, so at batch 1 it is a ±20% per-step
+    modulation of the LR; its real effect comes from re-weighting micro-batches
+    against each other inside the gradient-accumulation window.
     """
     if TIMESTEP_WEIGHTING == "bell":
         return torch.exp(-2.0 * (sigma - 0.5) ** 2) / _BELL_MEAN
@@ -628,18 +658,33 @@ def timestep_weight(sigma):
 
 
 def pack_latents(x):
+    """Patchify [B, C, H, W] latents into the [B, (H/2)*(W/2), C*4] sequence the transformer takes.
+
+    Each 2x2 spatial block becomes one token carrying all four of its values per
+    channel. `unpack_latents` is the exact inverse.
+    """
     B, C, H, W = x.shape
     x = x.view(B, C, H // 2, 2, W // 2, 2).permute(0, 2, 4, 1, 3, 5)
     return x.reshape(B, (H // 2) * (W // 2), C * 4)
 
 
 def unpack_latents(x, H, W):
+    """Inverse of `pack_latents`: rebuild [B, C, H, W] latents from the token sequence.
+
+    `H` and `W` are the latent-space dimensions, not pixels.
+    """
     B, _, C = x.shape
     x = x.view(B, H // 2, W // 2, C // 4, 2, 2).permute(0, 3, 1, 4, 2, 5)
     return x.reshape(B, C // 4, H, W)
 
 
 def prepare_position_ids(text_seq_len, grid_h, grid_w, device):
+    """Build the concatenated [text; image] RoPE position ids for one forward pass.
+
+    Text tokens all get position (0, 0, 0) — they carry no positional signal, which
+    is what makes caption compaction in `compact` exact — while image tokens get
+    their (row, col) coordinate on the patch grid.
+    """
     text_ids = torch.zeros(text_seq_len, 3, device=device)
     image_ids = torch.zeros(grid_h, grid_w, 3, device=device)
     image_ids[..., 1] = torch.arange(grid_h, device=device)[:, None]
@@ -651,6 +696,13 @@ SKIP_QUANT = ("img_in", "time_embed", "time_mod_proj", "txt_in", "final_layer")
 
 
 def quantize_to_nf4_(module, prefix=""):
+    """Recursively swap `nn.Linear` layers for 4-bit NF4 ones, in place.
+
+    Layers whose qualified name contains any `SKIP_QUANT` fragment stay in bf16:
+    they are the small embedding and projection layers at the model's edges, where
+    quantization costs accuracy but saves almost no VRAM. Slow — prefer
+    `load_nf4_cache_` when a pre-quantized cache exists.
+    """
     from bitsandbytes.nn import Linear4bit, Params4bit
     for name, child in list(module.named_children()):
         full = f"{prefix}.{name}" if prefix else name
@@ -671,6 +723,14 @@ def quantize_to_nf4_(module, prefix=""):
 
 
 def load_nf4_cache_(transformer, cache_dir):
+    """Rebuild NF4 layers from a pre-quantized on-disk cache instead of quantizing.
+
+    `index.json` lists every quantized layer and the safetensors file holding its
+    packed weight plus the `QuantState` tensors (absmax, quant maps, and their
+    nested second-level counterparts). Each is reassembled into a `Linear4bit` and
+    swapped into the tree. Every rebuilt layer is then re-checked for a live
+    quant_state; a mismatch raises rather than training on silently broken weights.
+    """
     index_path = os.path.join(cache_dir, "index.json")
 
     if not os.path.exists(index_path):
@@ -684,6 +744,7 @@ def load_nf4_cache_(transformer, cache_dir):
     replaced = 0
 
     def get_parent_module(root, module_name):
+        """Walk a dotted module path, returning (owning module, final attribute name)."""
         parts = module_name.split(".")
         parent = root
         for part in parts[:-1]:
@@ -762,8 +823,11 @@ def load_nf4_cache_(transformer, cache_dir):
 
 
 def _lora_b_norm(model):
-    """‖lora_B‖ global. PEFT inicializa lora_B a cero exacto, así que un valor > 0
-    demuestra que una carga de pesos aterrizó de verdad sobre el adapter."""
+    """Global ‖lora_B‖ across the adapter.
+
+    PEFT initializes lora_B to exactly zero, so any value > 0 proves a weight load
+    actually landed on the adapter rather than silently matching nothing.
+    """
     total = 0.0
     for name, p in model.named_parameters():
         if "lora_B" in name:
@@ -772,12 +836,12 @@ def _lora_b_norm(model):
 
 
 def load_lora_weights(model, blob, src):
-    """Carga pesos LoRA en el adapter y verifica que la carga surtió efecto.
+    """Load LoRA weights into the adapter and verify the load actually took effect.
 
-    set_peft_model_state_dict usa load_state_dict(strict=False): si las claves no
-    encajaran (rank/alpha/lora_target distintos a los del checkpoint) no lanzaría
-    ningún error y la fase entrenaría desde init aleatorio en silencio. Preferimos
-    fallar duro: el orquestador aborta el pipeline ante un código de salida != 0.
+    `set_peft_model_state_dict` uses load_state_dict(strict=False): if the keys did
+    not match — a different rank, alpha or lora_target than the checkpoint — nothing
+    would raise and the phase would train from random init in silence. This exits
+    non-zero instead, which aborts the orchestrator's pipeline.
     """
     res = set_peft_model_state_dict(model, load(blob))
     unexpected = list(getattr(res, "unexpected_keys", []) or [])
@@ -797,12 +861,11 @@ def load_lora_weights(model, blob, src):
 
 
 def _export_lora(model, path, step=None, epoch=None, num_images=None):
-    """Exporta el LoRA en formato plano bf16, con metadata de entrenamiento.
+    """Export the adapter as a flat bf16 safetensors file with training metadata.
 
-    La metadata de safetensors es un mapa str→str: ningún loader que itere
-    tensores puede tropezar con ella. Los tensores `.alpha` por módulo sí son
-    opt-in, porque añadir claves que no sean `lora_*` puede confundir a loaders
-    que esperan sólo pares A/B.
+    safetensors metadata is a plain str→str map, so no loader that iterates tensors
+    can trip over it. Per-module `.alpha` tensors stay opt-in, since adding keys
+    that are not `lora_*` can confuse loaders expecting only A/B pairs.
     """
     clean = {}
     for k, v in model.state_dict().items():
@@ -853,7 +916,11 @@ def _export_lora(model, path, step=None, epoch=None, num_images=None):
 # ── UTILIDADES DE ESTADO / STATE UTILITIES ──────────────────────────────────
 
 def _atomic_write(path, writer):
-    """Escribe vía fichero temporal + os.replace (atómico en POSIX y Windows)."""
+    """Write through a temp file then `os.replace` — atomic on POSIX and Windows.
+
+    `writer` is called with the temp path. A crash mid-write leaves the previous
+    file intact rather than a truncated one.
+    """
     tmp = f"{path}.tmp"
     try:
         writer(tmp)
@@ -867,10 +934,11 @@ def _atomic_write(path, writer):
 
 
 def rotate_checkpoints(output_dir, keep):
-    """Conserva sólo los `keep` checkpoints por paso más recientes.
+    """Keep only the `keep` most recent per-step checkpoints; `keep <= 0` keeps all.
 
-    Ordena por el número de paso parseado del nombre, no por ctime: el ctime
-    miente tras una copia o un rsync, el número de paso no. Nunca toca el FINAL.
+    Ordering comes from the step number parsed out of the filename, not ctime —
+    ctime lies after a copy or an rsync, the step number does not. Never touches
+    the FINAL export.
     """
     if keep <= 0:
         return
@@ -889,9 +957,10 @@ def rotate_checkpoints(output_dir, keep):
 
 
 def _curation_group(score, threshold, override, mode="face"):
-    """Grupo efectivo de una imagen: "good" o "bad".
+    """Effective curation group for one image: "good" or "bad".
 
-    Réplica exacta de resolve_curation_group() en scripts/python/server.py.
+    A manual override wins over the score/threshold verdict. Exact replica of
+    `resolve_curation_group()` in scripts/python/server.py — keep the two in sync.
     """
     if override in ("good", "bad"):
         return override
@@ -902,15 +971,15 @@ def _curation_group(score, threshold, override, mode="face"):
 
 
 def load_curation_weights(dataset_path, cache_names):
-    """Peso por entrada de caché a partir de la curaduría del dataset.
+    """Per-cache-entry training weights derived from the dataset's curation report.
 
-    Devuelve (pesos, resumen) o (None, None) si no hay nada que aplicar: sin
-    informe, con la opción desactivada o si todos los pesos salen a 1.0 — en
-    esos casos el entrenamiento debe quedar bit a bit como antes de existir esto.
+    Returns `(weights, summary)`, or `(None, None)` when there is nothing to apply —
+    no report, the option disabled, or every weight resolving to 1.0. In those cases
+    training stays bit-for-bit identical to a run with curation absent.
 
-    El informe lo escribe 0_curate_dataset.py y se regenera en cada scan; el
-    umbral efectivo y las reasignaciones manuales viven en curation_overrides.json,
-    propiedad de la UI, y mandan sobre el veredicto automático.
+    The report is written by 0_curate_dataset.py and regenerated on every scan; the
+    effective threshold and any manual regroupings live in curation_overrides.json,
+    owned by the UI, and win over the automatic verdict.
     """
     if not CURATION_WEIGHTS:
         return None, None
@@ -987,14 +1056,14 @@ def load_curation_weights(dataset_path, cache_names):
 
 
 class EpochSampler:
-    """Muestreo por épocas: cada imagen se ve exactamente una vez por época.
+    """Epoch-based sampling: every image is seen exactly once per epoch.
 
-    Sustituye al `random.choice(bucket)` + `random.choice(imagen)` original, que
-    daba a cada *bucket* la misma probabilidad independientemente de cuántas
-    imágenes contuviera: un bucket de 1 imagen recibía tanta masa como uno de 16.
-    Medido en este repo, seis imágenes sueltas se llevaban el 67% de los pasos.
+    Replaces the original `random.choice(bucket)` + `random.choice(image)`, which
+    gave every *bucket* equal probability regardless of how many images it held —
+    a 1-image bucket got as much mass as a 16-image one. Measured in this repo, six
+    stray images were taking 67% of all steps.
 
-    Los batches nunca mezclan buckets porque shapes distintas no concatenan.
+    Batches never mix buckets, since differing shapes cannot be concatenated.
     """
 
     def __init__(self, buckets, batch_size, seed, repeats=None):
@@ -1006,6 +1075,12 @@ class EpochSampler:
         self.epoch = 0
 
     def _refill(self):
+        """Rebuild the shuffled batch queue for one full epoch over every bucket.
+
+        Images are repeated per `repeats`, and a bucket's trailing short batch is
+        padded from that same bucket — pulling from another would break `torch.cat`.
+        Batches are then shuffled so resolutions interleave across the epoch.
+        """
         self.epoch += 1
         batches = []
         for size, names in sorted(self.buckets.items()):
@@ -1024,6 +1099,7 @@ class EpochSampler:
         self.queue = batches
 
     def next(self):
+        """Return the next `(bucket_size, sample_names)` batch, starting a new epoch if needed."""
         if not self.queue:
             self._refill()
         return self.queue.pop()
@@ -1044,10 +1120,9 @@ class EpochSampler:
 
 
 class LegacySampler:
-    """Muestreo histórico: uniforme sobre buckets, con reemplazo.
+    """Historical sampling: uniform over buckets, with replacement.
 
-    Se conserva sólo para reproducir runs antiguos. Ver `EpochSampler` para el
-    sesgo que introduce.
+    Kept only to reproduce old runs. See `EpochSampler` for the bias this introduces.
     """
 
     def __init__(self, buckets, batch_size, seed):
@@ -1057,6 +1132,7 @@ class LegacySampler:
         self.epoch = 0
 
     def next(self):
+        """Return a `(bucket_size, sample_names)` batch drawn uniformly at random."""
         size = self.rng.choice(list(self.buckets))
         return size, [self.rng.choice(self.buckets[size]) for _ in range(self.batch_size)]
 
@@ -1070,10 +1146,10 @@ class LegacySampler:
 
 
 class EMA:
-    """Media móvil exponencial de los pesos entrenables, en shadow fp32.
+    """Exponential moving average of the trainable weights, kept in an fp32 shadow copy.
 
-    `update()` debe llamarse SÓLO en updates reales del optimizador: hacerlo por
-    micro-batch convertiría el decay efectivo en `decay ** grad_accum_steps`.
+    Use it around an export with `apply()` / `restore()`; the shipped LoRA is the
+    smoothed copy while the resume checkpoint keeps the raw weights.
     """
 
     def __init__(self, params, decay=0.99, device="cpu"):
@@ -1086,6 +1162,12 @@ class EMA:
 
     @torch.no_grad()
     def update(self):
+        """Fold the current weights into the shadow copy. Call once per optimizer update.
+
+        Calling this per micro-batch instead would make the effective decay
+        `decay ** grad_accum_steps`. The decay is warmed up over the first updates,
+        otherwise the initialization dominates the shadow for hundreds of steps.
+        """
         self.updates += 1
         # Warmup del decay: sin esto los primeros updates dominan el shadow
         # durante cientos de pasos y el EMA arranca sesgado a la inicialización.
@@ -1096,7 +1178,7 @@ class EMA:
 
     @torch.no_grad()
     def apply(self):
-        """Instala los pesos EMA en el modelo, guardando los vivos."""
+        """Install the EMA weights into the model, stashing the live ones for `restore`."""
         self.backup = [p.detach().clone() for p in self.params]
         for shadow, param in zip(self.shadow, self.params):
             param.copy_(shadow.to(param.device, param.dtype))
@@ -1125,6 +1207,12 @@ class EMA:
 
 
 class VaeHolder:
+    """Lazy singleton for the VAE, which only previews need.
+
+    Training runs entirely on cached latents, so the decoder is loaded on first
+    preview and moved back to CPU afterwards rather than occupying VRAM throughout.
+    """
+
     vae = None
     @classmethod
     def get(cls):
@@ -1137,6 +1225,13 @@ class VaeHolder:
 
 def run_preview(model, scheduler, embed, mask, neg, size, step, shift_cfg,
                 steps=None, cfg_scale=None, seed=None):
+    """Generate one preview image from the current weights and save it to OUTPUT_DIR.
+
+    A full denoising loop — optionally CFG-guided when a negative embedding was
+    cached — followed by a VAE decode. Runs under `no_grad` in eval mode and
+    restores the previous training mode on the way out. Bucket dimensions are
+    snapped to multiples of 16.
+    """
     H, W = size
     # El bucket debe ser múltiplo de 16: gh/gw son H/16 y W/16, y pack_latents
     # divide las dimensiones latentes entre 2.
@@ -1196,6 +1291,17 @@ def run_preview(model, scheduler, embed, mask, neg, size, step, shift_cfg,
 
 # ── ENTRENAMIENTO / TRAINING ─────────────────────────────────────────────────
 def train_krea2():
+    """Run one full training phase, from model load to final LoRA export.
+
+    In order: load the transformer and get it onto the GPU in NF4, attach the LoRA
+    adapter and optimizer, restore a checkpoint or hand off weights from a previous
+    phase, load every cached latent into RAM and bucket it by resolution, then run
+    the micro-step loop — sample a batch, add noise at a sampled sigma, predict,
+    accumulate gradients, and step the optimizer every `grad_accum_steps`.
+
+    Exits non-zero on a missing cache, an unusable checkpoint, or a failed weight
+    hand-off, since the progressive orchestrator treats that as an abort signal.
+    """
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
     patch_attention_for_low_vram()
@@ -1263,6 +1369,7 @@ def train_krea2():
                    if isinstance(m, (torch.nn.Linear, bnb.nn.Linear4bit))]
 
     def keep(name):
+        """True when this linear layer should receive a LoRA adapter, per `lora_target`."""
         # 'all' incluye también los bloques de text_fusion; los presets reducidos
         # se limitan a los transformer_blocks de imagen, que es donde el LoRA rinde.
         if LORA_TARGET == "all":
@@ -1310,6 +1417,12 @@ def train_krea2():
     print(f"LoRA master dtype / dtype de los pesos LoRA: {LORA_DTYPE_NAME}")
 
     def _make_inputs_require_grad(module, input, output):
+        """Re-open the autograd chain at the model's input projection.
+
+        The NF4 base is entirely frozen, so activations would reach the first LoRA
+        layer with requires_grad=False and no gradient would ever flow. Required for
+        gradient checkpointing to work at all here.
+        """
         output.requires_grad_(True)
 
     transformer.img_in.register_forward_hook(_make_inputs_require_grad)
@@ -1338,6 +1451,12 @@ def train_krea2():
         print(f"[OK] EMA enabled / activada: decay {EMA_DECAY} on {EMA_DEVICE}")
 
     def lr_at(step):
+        """Learning rate for a given micro-step, after warmup and the configured decay.
+
+        `step` is a micro-step but the schedule runs in optimizer updates, so it is
+        divided by `grad_accum_steps` first — mixing the two units is the most common
+        way to misconfigure this file. `WARMUP_UPDATES` is already normalized.
+        """
         # El LR sólo se aplica en actualizaciones reales del optimizador (1 de cada
         # GRAD_ACCUM_STEPS pasos de bucle), así que el schedule se mide en updates,
         # no en pasos de bucle. WARMUP_UPDATES ya viene normalizado a updates.
@@ -1450,10 +1569,11 @@ def train_krea2():
     saving = {"busy": False, "done_on_exit": False}
 
     def save_checkpoint_now(current_s):
-        """Guarda el estado completo de forma atómica y no reentrante.
+        """Save the full resumable state atomically, and non-reentrantly.
 
-        Orden deliberado: primero los pesos, luego el estado, y `current_step.txt`
-        el último. Ese fichero es el commit: si existe, todo lo anterior existe.
+        Deliberate ordering: adapter weights first, then optimizer/RNG/sampler state,
+        and `current_step.txt` last. That file is the commit marker — if it exists,
+        everything it refers to exists too.
         """
         if current_s <= 0 or saving["busy"]:
             return
@@ -1514,6 +1634,11 @@ def train_krea2():
             saving["busy"] = False
 
     def handle_signal(sig, frame):
+        """Checkpoint the current step and exit cleanly on SIGTERM/SIGINT/SIGHUP.
+
+        Lets the UI stop a run, or an SSH session drop, without losing progress back
+        to the last periodic save.
+        """
         print(f"\n[!] Signal received / Señal de detención recibida ({sig}).")
         save_checkpoint_now(last_step_executed)
         # El handler externo también guardaría al capturar SystemExit; esta marca
@@ -1541,14 +1666,13 @@ def train_krea2():
     cache_data, buckets = {}, defaultdict(list)
 
     def compact(emb, msk):
-        """Se queda sólo con los tokens reales del caption y descarta la máscara.
+        """Drop a caption's padding tokens and its mask, returning `(embeds, None)`.
 
-        Es exacto: los tokens de texto no llevan RoPE (prepare_position_ids les
-        asigna la posición 0 a todos) ni en text_fusion, así que la atención es
-        equivariante a permutación sobre ellos, y sus salidas se descartan en
-        `hidden_states[:, text_seq_len:]`. La máscara sólo servía como
-        key-padding, de modo que eliminar los tokens de relleno equivale a
-        enmascararlos, y sin máscara SDPA puede usar flash attention.
+        Exact, not an approximation: text tokens carry no RoPE — `prepare_position_ids`
+        assigns them all position 0 — so attention is permutation-equivariant over
+        them, and their outputs are discarded at `hidden_states[:, text_seq_len:]`.
+        The mask was only key-padding, so removing the padded tokens is equivalent to
+        masking them, and with no mask SDPA can use flash attention.
         """
         idx = msk[0].nonzero(as_tuple=True)[0]
         if idx.numel() == 0:      # caption sin tokens válidos: dejarlo como estaba
@@ -1556,6 +1680,11 @@ def train_krea2():
         return emb[:, idx].contiguous(), None
 
     def load_cache_entry(directory, name):
+        """Load one sample's `(latent, embedding, mask)` triple from the pre-cache.
+
+        Casts to bf16, optionally compacts the caption, and pins the tensors so the
+        training loop's host-to-device copies can be async.
+        """
         lat = torch.load(f"{directory}/{name}_latent.pt", weights_only=True)
         emb = torch.load(f"{directory}/{name}_embed.pt",  weights_only=True)
         msk = torch.load(f"{directory}/{name}_mask.pt",   weights_only=True).bool()
@@ -1704,6 +1833,11 @@ def train_krea2():
     all_preview_names = sorted(cache_data.keys())
 
     def get_preview_sample(step):
+        """Pick which cached caption to render a preview from, per `preview_caption_mode`.
+
+        "random" picks freely, "rotate4" cycles the first four, anything else pins
+        the first sample so previews stay comparable across steps.
+        """
         if PREVIEW_CAPTION_MODE == "random":
             return random.choice(all_preview_names)
         elif PREVIEW_CAPTION_MODE == "rotate4":
@@ -1746,10 +1880,11 @@ def train_krea2():
     # ── C1: loss de validación ───────────────────────────────────────────────
     @torch.no_grad()
     def validation_loss():
-        """Loss en sigmas fijas y ruido fijo por imagen.
+        """Mean holdout loss at fixed sigmas with fixed per-image noise.
 
-        Fijar ambos es todo el truco: convierte un escalar dominado por la
-        varianza de sigma en una curva legible para decidir early stopping.
+        Pinning both is the whole trick: it turns a scalar otherwise dominated by
+        sigma variance into a curve readable enough to decide early stopping.
+        Evaluated on the EMA weights when EMA is enabled.
         """
         if ema is not None:
             ema.apply()
@@ -1807,9 +1942,10 @@ def train_krea2():
     accum_count = 0
 
     def on_oom(step, size):
-        """Descarta la ventana, libera VRAM y decide si hay que rendirse.
+        """Discard the accumulation window, free VRAM, and decide whether to give up.
 
-        Devuelve True si el OOM debe propagarse (demasiados consecutivos).
+        Returns True when too many OOMs have hit consecutively and the error should
+        propagate; a checkpoint is saved first in that case.
         """
         nonlocal oom_streak, accum_count
         oom_streak += 1

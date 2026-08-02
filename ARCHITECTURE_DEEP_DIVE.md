@@ -215,9 +215,11 @@ minutos) usa el split explícito: `launch_precache` (fire-and-forget) +
 encadenarlos en una sola llamada síncrona.
 
 **Los workers no saben que los observan.** `workers/precache_worker.py` y
-`workers/train_worker.py` están *"ported byte-for-byte from the upstream LoRAlab
-project"* y deben permanecer diffables contra el original — no se les añade
-instrumentación por dentro. `workers/_telemetry.py` envuelve sus entrypoints `__main__`
+`workers/train_worker.py` están portados desde el proyecto upstream LoRAlab y deben
+permanecer diffables contra el original — no se les añade instrumentación por dentro.
+`precache_worker.py` sigue siendo byte a byte idéntico; `train_worker.py` conserva la
+**lógica** exacta del upstream pero sus docstrings se reescribieron aquí (sólo en
+inglés, uno por función no obvia), así que se compara por AST, no por bytes. `workers/_telemetry.py` envuelve sus entrypoints `__main__`
 **desde afuera** para emitir eventos JSON-lines de ciclo de vida
 (`worker_started`, `worker_finished`, `worker_failed`) sin tocar el código vendorizado.
 `training_runner.read_lifecycle_event` lee únicamente los últimos ~4KB del log para
@@ -232,7 +234,7 @@ encontrar esa línea final barato, incluso en logs de horas de duración.
 **Python 3.11+** (`requires-python = ">=3.11"` en `pyproject.toml`), tipado
 estrictamente con `mypy --strict` sobre `src/feature_pipeline` y `mcp_server`
 (deliberadamente excluidos: `ui/` porque el tipado de Streamlit es ruidoso, y
-`workers/` porque deben permanecer byte-a-byte diffables contra el upstream).
+`workers/` porque deben permanecer diffables contra el upstream).
 
 **Pydantic ≥2.7** no es solo para (de)serialización — es la capa de validación de
 esquema del dominio. Cada modelo en `domain/models.py` encierra invariantes que de
