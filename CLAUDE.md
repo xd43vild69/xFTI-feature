@@ -41,7 +41,29 @@ Streamlit app for curating LoRA training datasets (Krea 2 / Qwen3-VL), structure
 - **`infrastructure/`** — SQLite persistence (`database.py`, `ingestion_repository.py`, `training_repository.py`, `version_repository.py`), filesystem (`storage.py`, `hf_exporter.py`), and subprocess launchers (`recaption_runner.py`, `training_runner.py`).
 - **`ui/`** — Streamlit-only code: `app.py` wires top-level navigation, `state.py` is the sole bridge between UI session state and the SQLite-backed application layer (every DB read/write from the UI goes through `state.py`), `steps/` are thin page wrappers, `components/` hold the actual panel logic.
 - **`workers/`** — standalone scripts run as **separate processes in a different Python environment** (`training_runtime/venv`, not the hub's own env): `precache_worker.py` is byte-for-byte upstream and must stay that way — don't add instrumentation inside its body. `train_worker.py` has diverged deliberately: it is being split into the `krea2/` package (see below), so it no longer diffs against upstream at all. `_telemetry.py` wraps their `__main__` entrypoints from the outside to emit structured JSON-lines lifecycle events without touching the vendored code. `recaption_worker.py` / `caption_qwen3vl.py` run Qwen3-VL captioning the same way.
-- **`workers/krea2/`** — the trainer, being split out of `train_worker.py` in stages. `train_worker.py` stays put as the entrypoint (`training_service.py` launches it by path, and running it as a script is what puts `workers/` on `sys.path` so `krea2` and `_telemetry` import). The package splits by whether a module imports torch: `config.py`, `sampling.py`, `curation.py` and `checkpoints.py` are torch-free and therefore covered by mypy and `tests/workers/`; everything else needs the training runtime. Keep that line — it is the only reason any of this code is testable in CI. `config.load_config()` returns a frozen `TrainConfig`; pass it explicitly rather than reintroducing module globals (the original reassigned 21 of them after first definition, which is exactly the bug the dataclass makes unrepresentable). Behavior is pinned by `tests/workers/golden/` — run both `capture_*.py --check` scripts under `training_runtime/venv/bin/python` after touching anything here.
+- **`workers/krea2/`** — the trainer, split out of `train_worker.py` (2264 → 935 lines). `train_worker.py` stays put as the entrypoint: `training_service.py` launches it by path, and running it as a *script* is what puts `workers/` on `sys.path` so `krea2` and `_telemetry` resolve — don't turn it into a module or move it.
+
+  The package splits by **whether a module imports torch**, not by theme. Torch-free (`config`, `cache_index`, `curation`, `sampling`, `schedule`, `metrics`, `checkpoints`) are listed individually in mypy's `files` and tested by `tests/workers/`; the rest (`dataset`, `math_ops`, `quantization`, `lora_io`, `ema`, `preview`, `state`) need the training runtime. Keep that line — it is the only reason any of this is reachable from CI.
+
+  `config.load_config()` returns a **frozen** `TrainConfig`; pass it explicitly rather than reintroducing module globals. The original reassigned 21 of them after first definition, so any `from ... import COMPACT_TEXT` captured whichever value existed at import time with nothing failing loudly — the dataclass makes that unrepresentable. `train_worker.py` still keeps read-only aliases onto it for the loop's benefit.
+
+### Verifying a change to the trainer
+
+Nothing under `workers/` runs in CI beyond the torch-free modules, so these are run by hand — all three, after any change to `krea2/` or the loop:
+
+```bash
+training_runtime/venv/bin/python tests/workers/golden/capture_config.py --check
+```
+```bash
+training_runtime/venv/bin/python tests/workers/golden/capture_behavior.py --check
+```
+```bash
+./tests/workers/golden/smoke_run.sh check
+```
+
+The first two compare ~100 recorded values (config resolution, tensor math, samplers, EMA, curation, checkpointing) against baselines captured before the refactor. The third runs 12 real training steps on the GPU and compares `train_log.csv` — it is the only thing covering the loop itself. Drop `--check` / use `record` to re-baseline, and only when a behavior change is intended and understood.
+
+The smoke run compares by tolerance, not diff: the loop is **not bit-reproducible against itself** (`cudnn.benchmark` picks kernels by timing, TF32 is on, reductions are unordered). Measured drift on unchanged code is ~3e-4 on loss and ~2% on grad_norm. See `tests/workers/golden/compare_smoke.py`.
 - **`mcp_server/`** (hub root, not under `src/`) — a `FastMCP` server exposing the pipeline as tools for autonomous agents (LangGraph etc.), stdio transport, no auth (the app has none anywhere). `server.py` tools are thin wrappers over `application/`/`infrastructure/` — never reimplement business logic here. Runs as its own process against the same SQLite DB, same per-operation-connection convention as `ui/state.py`.
 
 ### Two process boundaries, two purposes
