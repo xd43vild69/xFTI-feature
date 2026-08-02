@@ -1,0 +1,50 @@
+{
+  "all_ones_collapses": {
+    "summary": null,
+    "weights": null
+  },
+  "auto_threshold": {
+    "summary": {
+      "bad": 1,
+      "good": 4,
+      "priority": 1,
+      "threshold": 0.6,
+      "w_bad": 0.5,
+      "w_good": 1.0,
+      "w_priority": 1.5
+    },
+    "weights": {
+      "bad1": 0.5,
+      "edge": 1.0,
+      "good1": 1.0,
+      "good1__flip": 1.0,
+      "hero": 1.5,
+      "not_in_report": 1.0,
+      "nulls": 1.0
+    }
+  },
+  "no_report": {
+    "summary": null,
+    "weights": null
+  },
+  "with_overrides": {
+    "summary": {
+      "bad": 3,
+      "good": 2,
+      "priority": 1,
+      "threshold": 0.85,
+      "w_bad": 0.5,
+      "w_good": 1.0,
+      "w_priority": 1.5
+    },
+    "weights": {
+      "bad1": 1.0,
+      "edge": 0.5,
+      "good1": 0.5,
+      "good1__flip": 0.5,
+      "hero": 1.5,
+      "not_in_report": 1.0,
+      "nulls": 1.0
+    }
+  }
+}

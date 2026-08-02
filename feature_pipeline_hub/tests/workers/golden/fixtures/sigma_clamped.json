@@ -1,0 +1,7 @@
+{
+  "sigma_min": 0.2,
+  "sigma_max": 0.8,
+  "timestep_sampling": "logit_normal",
+  "logit_normal_mu": 0.5,
+  "logit_normal_sigma": 1.5
+}

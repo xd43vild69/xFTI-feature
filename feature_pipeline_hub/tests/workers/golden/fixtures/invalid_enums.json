@@ -1,0 +1,14 @@
+{
+  "lora_target": "nope",
+  "lora_dtype": "fp8",
+  "sampler": "chaos",
+  "resume_on_corrupt": "maybe",
+  "warmup_units": "furlongs",
+  "optimizer": "sgd",
+  "timestep_weighting": "gong",
+  "content_or_style": "vibes",
+  "ema_device": "tpu",
+  "lr_scheduler": "spiral",
+  "loss_display": "interpretive",
+  "preview_source": "vibes"
+}

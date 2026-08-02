@@ -1,0 +1,9 @@
+{
+  "run_id": "run-abc",
+  "phase_index": 1,
+  "phase_count": 3,
+  "phase_label": "768",
+  "global_step_offset": 400,
+  "global_total_steps": 3600,
+  "total_steps": 1200
+}

@@ -1,0 +1,17 @@
+{
+  "use_ema": true,
+  "ema_decay": 0.999,
+  "ema_device": "cuda",
+  "val_split": 0.2,
+  "validate_every": 50,
+  "val_seed": 99,
+  "csv_log": true,
+  "loss_display": "window",
+  "loss_window": 50,
+  "max_checkpoints_to_keep": 3,
+  "caption_dropout_rate": 0.1,
+  "curation_weights": true,
+  "noise_offset": 0.05,
+  "lr_scheduler": "cosine_with_restarts",
+  "lr_num_cycles": 5
+}

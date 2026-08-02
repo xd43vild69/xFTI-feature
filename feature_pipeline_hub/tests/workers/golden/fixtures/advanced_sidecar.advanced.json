@@ -1,0 +1,5 @@
+{
+  "lora_rank": 8,
+  "lora_alpha": 64,
+  "sampler": "epoch"
+}

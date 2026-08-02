@@ -1,0 +1,6 @@
+{
+  "warmup_steps": 400,
+  "warmup_units": "micro_steps",
+  "total_steps": 1200,
+  "grad_accum_steps": 4
+}

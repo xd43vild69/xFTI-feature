@@ -1,0 +1,5 @@
+{
+  "preset": "stable_v2",
+  "sampler": "legacy",
+  "lora_dtype": "bf16"
+}
