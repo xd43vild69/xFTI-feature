@@ -21,7 +21,6 @@ train_advanced.json, an optional preset, and DEFAULTS — in that precedence.
 """
 import os
 import gc
-import re
 import csv
 import math
 import time
@@ -56,371 +55,124 @@ try:
 except Exception:
     pass
 
-# Raíz del proyecto (este worker vive en workers/, un nivel más superficial que
-# scripts/python/ en LoRAlab — de ahí que aquí sean 2 dirname(), no 3). Todas
-# las rutas se anclan aquí en vez de al directorio de trabajo, para que
-# funcione invocado desde cualquier sitio.
+# Project root. This worker lives in workers/, one level shallower
+# than scripts/python/ in LoRAlab — hence 2 dirname() here, not 3. Every path is
+# anchored here rather than to the working directory, so it works invoked from
+# anywhere.
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# Settings resolution, the DEFAULTS/PRESETS tables and the validated enums all live in
+# krea2.config now. It is importable because this file is launched as a script, which
+# puts workers/ on sys.path — the same reason `from _telemetry import ...` works below.
+from krea2 import checkpoints as _checkpoints   # noqa: E402
+from krea2 import config as _config             # noqa: E402
+from krea2 import curation as _curation         # noqa: E402
+from krea2 import sampling as _sampling         # noqa: E402
 
 
 def from_root(path):
     """Resolve a relative path against the project root; absolute paths pass through."""
-    return path if os.path.isabs(path) else os.path.normpath(os.path.join(PROJECT_ROOT, path))
+    return _config.from_root(PROJECT_ROOT, path)
 
 
-# Carpetas contenedoras: todo lo generado se agrupa aquí en vez de en la raíz.
-# En Docker, usar variables de entorno; en local, usar defaults.
-CACHE_ROOT  = os.getenv("CACHE_DIR", os.path.join(PROJECT_ROOT, "cached_data_local"))
-OUTPUT_ROOT = os.getenv("OUTPUT_DIR", os.path.join(PROJECT_ROOT, "output_local"))
+# One frozen object, resolved once. The module-level names below are read-only aliases
+# onto it, kept so the rest of this file reads as it always has; they are retired as
+# each section moves into the package.
+CFG = _config.load_config(PROJECT_ROOT)
 
-# ── DEFAULTS / VALORES POR DEFECTO ──────────────────────────────────────────
-# Todo lo añadido tras el bloque original es aditivo y opt-in: con el sidecar
-# vacío y sin preset, estos valores reproducen el comportamiento histórico.
-DEFAULTS = {
-    "model_id": "Krea-2-NF4",
-    "cache_dir": f"{CACHE_ROOT}/default",
-    "output_dir": f"{OUTPUT_ROOT}/default",
-    "total_steps": 1200,
-    "batch_size": 1,
-    "grad_accum_steps": 4,
-    "lr": 1e-4,
-    "min_lr_ratio": 0.1,
-    "warmup_steps": 100,
-    "lora_rank": 16,
-    "lora_alpha": 32,
-    "weight_decay": 0.0,
-    "max_grad_norm": 1.0,
-    "save_every": 25,
-    "seed": 42,
-    "timestep_sampling": "krea2_shift",
-    "preview_every": 0,
-    "preview_steps": 28,
-    "preview_cfg": 3.5,
-    "preview_caption_mode": "first",
-    "project_name": "",
-    "trigger_word": "",
-    "lora_target": "all",
-    "compact_text": True,
-    "init_lora_from": "",
-    "gradient_checkpointing": True,
+MODEL_ID           = CFG.model_id
+TOTAL_STEPS        = CFG.total_steps
+BATCH_SIZE         = CFG.batch_size
+GRAD_ACCUM_STEPS   = CFG.grad_accum_steps
+LR                 = CFG.lr
+MIN_LR_RATIO       = CFG.min_lr_ratio
+WARMUP_STEPS       = CFG.warmup_steps
+LORA_RANK          = CFG.lora_rank
+LORA_ALPHA         = CFG.lora_alpha
+WEIGHT_DECAY       = CFG.weight_decay
+MAX_GRAD_NORM      = CFG.max_grad_norm
+SAVE_EVERY         = CFG.save_every
+SEED               = CFG.seed
+TIMESTEP_SAMPLING  = CFG.timestep_sampling
+PREVIEW_EVERY      = CFG.preview_every
+PREVIEW_STEPS      = CFG.preview_steps
+PREVIEW_CFG        = CFG.preview_cfg
+PREVIEW_CAPTION_MODE = CFG.preview_caption_mode
+TRIGGER_WORD       = CFG.trigger_word
+PROJECT_NAME       = CFG.project_name
+LORA_TARGET        = CFG.lora_target
+COMPACT_TEXT       = CFG.compact_text
+INIT_LORA_FROM     = CFG.init_lora_from
+GRAD_CHECKPOINTING = CFG.gradient_checkpointing
+RUN_ID             = CFG.run_id
+PHASE_INDEX        = CFG.phase_index
+PHASE_COUNT        = CFG.phase_count
+PHASE_LABEL        = CFG.phase_label
+GLOBAL_STEP_OFFSET = CFG.global_step_offset
+GLOBAL_TOTAL_STEPS = CFG.global_total_steps
+MULTIPHASE         = CFG.multiphase
 
-    # ── A1/A10: precisión ────────────────────────────────────────────────────
-    "lora_dtype": "bf16",              # "bf16" | "fp32" (fp32 = +235 MB VRAM)
-    "high_precision_targets": False,   # generar ruido y target en fp32
+LORA_DTYPE_NAME    = CFG.lora_dtype
+HIGH_PREC_TARGETS  = CFG.high_precision_targets
+SAMPLER_MODE       = CFG.sampler
+NAN_GUARD          = CFG.nan_guard
+NAN_ABORT_AFTER    = CFG.nan_abort_after
+MAX_LOSS           = CFG.max_loss
+OOM_GUARD          = CFG.oom_guard
+OOM_ABORT_AFTER    = CFG.oom_abort_after
+RESUME_ON_CORRUPT  = CFG.resume_on_corrupt
+WARMUP_UNITS       = CFG.warmup_units
+OPTIMIZER_NAME     = CFG.optimizer
+OPTIMIZER_EPS      = CFG.optimizer_eps
+OPTIMIZER_BETAS    = CFG.optimizer_betas
+TIMESTEP_WEIGHTING = CFG.timestep_weighting
+LOGIT_NORMAL_MU    = CFG.logit_normal_mu
+LOGIT_NORMAL_SIGMA = CFG.logit_normal_sigma
+SIGMA_MIN          = CFG.sigma_min
+SIGMA_MAX          = CFG.sigma_max
+CONTENT_OR_STYLE   = CFG.content_or_style
+NOISE_OFFSET       = CFG.noise_offset
+USE_EMA            = CFG.use_ema
+EMA_DECAY          = CFG.ema_decay
+EMA_DEVICE         = CFG.ema_device
+LR_SCHEDULER       = CFG.lr_scheduler
+LR_NUM_CYCLES      = CFG.lr_num_cycles
+LR_STEP_GAMMA      = CFG.lr_step_gamma
+LR_STEP_COUNT      = CFG.lr_step_count
+VAL_SPLIT          = CFG.val_split
+VAL_CACHE_DIR      = CFG.val_cache_dir
+VALIDATE_EVERY     = CFG.validate_every
+VALIDATION_SIGMAS  = list(CFG.validation_sigmas)
+VAL_SEED           = CFG.val_seed
+LOSS_WINDOW        = CFG.loss_window
+LOSS_DISPLAY       = CFG.loss_display
+CSV_LOG            = CFG.csv_log
+MAX_CKPT_KEEP      = CFG.max_checkpoints_to_keep
+EXPORT_METADATA    = CFG.export_metadata
+EXPORT_ALPHA_TENSORS = CFG.export_alpha_tensors
+PREVIEW_SOURCE     = CFG.preview_source
+PREVIEW_WALK_SEED  = CFG.preview_walk_seed
+CAPTION_DROPOUT    = CFG.caption_dropout_rate
+DATASET_PATH       = CFG.dataset_path
+CURATION_WEIGHTS   = CFG.curation_weights
 
-    # ── A2: muestreo del dataset ─────────────────────────────────────────────
-    "sampler": "legacy",               # "epoch" | "legacy"
+CACHE_DIR          = CFG.cache_dir
+OUTPUT_DIR         = CFG.output_dir
+TOTAL_UPDATES      = CFG.total_updates
+WARMUP_UPDATES     = CFG.warmup_updates
+PRESET_NAME        = CFG.preset_name
+_CFG_SOURCE        = dict(CFG.sources)
 
-    # ── A3/A8: guardas ───────────────────────────────────────────────────────
-    "nan_guard": True,
-    "nan_abort_after": 20,
-    "max_loss": 0.0,                   # 0 = desactivado
-    "oom_guard": True,
-    "oom_abort_after": 3,
-
-    # ── A4: checkpoints ──────────────────────────────────────────────────────
-    "resume_on_corrupt": "abort",      # "abort" | "restart"
-
-    # ── A5/A7: schedule y optimizador ────────────────────────────────────────
-    "warmup_units": "updates",         # "updates" | "micro_steps" | "ratio"
-    "optimizer": "adamw8bit_paged",    # | "adamw8bit" | "adamw"
-    "optimizer_eps": 1e-8,
-    "optimizer_betas": [0.9, 0.999],
-
-    # ── B1: timesteps ────────────────────────────────────────────────────────
-    "timestep_weighting": "none",      # "none" | "bell" | "half_bell"
-    "logit_normal_mu": 0.0,
-    "logit_normal_sigma": 1.0,
-    "sigma_min": 0.0,
-    "sigma_max": 1.0,
-    "content_or_style": "balanced",    # "balanced" | "content" | "style"
-    "noise_offset": 0.0,               # ver B3: desaconsejado en rectified flow
-
-    # ── B2: EMA ──────────────────────────────────────────────────────────────
-    "use_ema": False,
-    "ema_decay": 0.99,
-    "ema_device": "cpu",               # "cpu" | "cuda"
-
-    # ── B4: scheduler de LR ──────────────────────────────────────────────────
-    "lr_scheduler": "cosine",          # | "constant" | "linear" | "cosine_with_restarts" | "step"
-    "lr_num_cycles": 3,
-    "lr_step_gamma": 0.5,
-    "lr_step_count": 4,
-
-    # ── C1: validación ───────────────────────────────────────────────────────
-    "val_split": 0.0,
-    "val_cache_dir": "",
-    "validate_every": 0,
-    "validation_sigmas": [0.25, 0.5, 0.75, 1.0],
-    "val_seed": 1234,
-
-    # ── C2/C3/C4: observabilidad ─────────────────────────────────────────────
-    "loss_window": 100,
-    "loss_display": "cumulative",      # "window" | "cumulative"
-    "csv_log": True,
-    "max_checkpoints_to_keep": 0,      # 0 = conservar todos
-    "export_metadata": True,
-    "export_alpha_tensors": False,
-
-    # ── C5: previews ─────────────────────────────────────────────────────────
-    "preview_source": "caption",       # "caption" | "prompts"
-    "preview_walk_seed": False,
-
-    # ── D3: caption dropout ──────────────────────────────────────────────────
-    "caption_dropout_rate": 0.0,
-
-    # ── Curaduría de dataset ─────────────────────────────────────────────────
-    # 0_curate_dataset.py reparte el dataset en dos grupos por identidad facial;
-    # aquí cada grupo entrena con su propio peso. Sin curation_report.json en la
-    # carpeta del dataset esto es un no-op exacto, así que un run sin curar se
-    # comporta igual que antes de existir la opción.
-    "dataset_path": "./dataset",
-    "curation_weights": True,
-
-    # ── Progresivo / Multi-fase ───────────────────────────────────────────────
-    "run_id": "",
-    "phase_index": 0,
-    "phase_count": 1,
-    "phase_label": "",
-    "global_step_offset": 0,
-}
-
-# Bundles de valores recomendados. Cambian los *defaults*, nunca pisan una clave
-# explícita del usuario. Existen para que activar el conjunto sensato cueste una
-# sola tecla en vez de quince, manteniendo todo lo demás opt-in.
-PRESETS = {
-    "stable_v2": {
-        "sampler": "epoch",
-        "lora_dtype": "fp32",
-        "optimizer_eps": 1e-6,
-        "optimizer_betas": [0.9, 0.99],
-        "high_precision_targets": True,
-        "loss_display": "window",
-        "max_checkpoints_to_keep": 5,
-        "nan_guard": True,
-        "oom_guard": True,
-    },
-}
-
-# ── CARGAR CONFIGURACIÓN / LOAD CONFIG ──────────────────────────────────────
-# El orquestador de resolución progresiva pasa un fichero por fase vía esta
-# env-var para no pisar el train_settings.json del usuario.
-CONFIG_PATH = os.environ.get("TRAIN_SETTINGS_PATH",
-                             os.path.join(PROJECT_ROOT, "train_settings.json"))
-
-if os.path.exists(CONFIG_PATH):
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
-    print(f"[OK] Configuration loaded from {CONFIG_PATH} / Configuración cargada desde {CONFIG_PATH}")
-else:
-    cfg = {}
-    print(f"[!] {CONFIG_PATH} not found, using default values / No se encontró {CONFIG_PATH}, usando valores por defecto.")
-
-# Sidecar avanzado. La UI web reescribe train_settings.json con un objeto de
-# claves fijas, así que las opciones avanzadas viven aquí, fuera de su alcance.
-# Precedencia: train_settings.json > train_advanced.json > preset > DEFAULTS.
-ADVANCED_PATH = os.environ.get("TRAIN_ADVANCED_PATH",
-                               os.path.join(PROJECT_ROOT, "train_advanced.json"))
-adv = {}
-if os.path.exists(ADVANCED_PATH):
-    try:
-        with open(ADVANCED_PATH, "r", encoding="utf-8") as f:
-            adv = json.load(f)
-        print(f"[OK] Advanced settings merged from {ADVANCED_PATH} ({len(adv)} keys)")
-    except Exception as exc:
-        print(f"[!] Could not read {ADVANCED_PATH}: {exc} — ignoring / ignorando.")
-        adv = {}
-
-PRESET_NAME = str(cfg.get("preset", adv.get("preset", ""))).strip()
-if PRESET_NAME and PRESET_NAME not in PRESETS:
-    print(f"[!] Unknown preset '{PRESET_NAME}'. Valid: {', '.join(PRESETS)} — ignoring / ignorando.")
-    PRESET_NAME = ""
-preset_vals = PRESETS.get(PRESET_NAME, {})
-
-_CFG_SOURCE = {}
-
-
-def _cfg(key, default=None):
-    """Resolve one config key and record where it came from.
-
-    Precedence is train_settings.json > train_advanced.json > preset > DEFAULTS.
-    The source is stashed in `_CFG_SOURCE` so `_print_effective_config` can show
-    why each value won.
-    """
-    if key in cfg:
-        src, val = "json", cfg[key]
-    elif key in adv:
-        src, val = "advanced", adv[key]
-    elif key in preset_vals:
-        src, val = "preset", preset_vals[key]
-    elif key in DEFAULTS:
-        src, val = "default", DEFAULTS[key]
-    else:
-        src, val = "default", default
-    _CFG_SOURCE[key] = src
-    return val
-
-
-MODEL_ID          = _cfg("model_id")
-# El modelo local vive en la raíz del proyecto. Se ancla sólo si la carpeta
-# existe ahí, para no romper el caso de un repo-id de Hugging Face; sin esto,
-# ejecutar desde otro directorio dispararía una descarga completa del modelo.
-if not os.path.isabs(MODEL_ID) and os.path.isdir(from_root(MODEL_ID)):
-    MODEL_ID = from_root(MODEL_ID)
-TOTAL_STEPS       = _cfg("total_steps")
-BATCH_SIZE        = _cfg("batch_size")
-GRAD_ACCUM_STEPS  = _cfg("grad_accum_steps")
-LR                = _cfg("lr")
-MIN_LR_RATIO      = _cfg("min_lr_ratio")
-WARMUP_STEPS      = _cfg("warmup_steps")
-LORA_RANK         = _cfg("lora_rank")
-LORA_ALPHA        = _cfg("lora_alpha")
-WEIGHT_DECAY      = _cfg("weight_decay")
-MAX_GRAD_NORM     = _cfg("max_grad_norm")
-SAVE_EVERY        = _cfg("save_every")
-SEED              = _cfg("seed")
-TIMESTEP_SAMPLING = _cfg("timestep_sampling")
-PREVIEW_EVERY     = _cfg("preview_every")
-PREVIEW_STEPS     = _cfg("preview_steps")
-PREVIEW_CFG       = _cfg("preview_cfg")
-PREVIEW_CAPTION_MODE = _cfg("preview_caption_mode")
-TRIGGER_WORD      = _cfg("trigger_word")
-PROJECT_NAME      = _cfg("project_name").strip()
-LORA_TARGET       = str(_cfg("lora_target")).strip().lower()
-COMPACT_TEXT      = bool(_cfg("compact_text"))
-INIT_LORA_FROM    = str(_cfg("init_lora_from")).strip()
-if INIT_LORA_FROM:
-    INIT_LORA_FROM = from_root(INIT_LORA_FROM)
-GRAD_CHECKPOINTING = bool(_cfg("gradient_checkpointing"))
-# Identifica la corrida del pipeline progresivo a la que pertenece un checkpoint.
-# Vacío = entrenador suelto, sin comprobación (comportamiento clásico).
-RUN_ID            = str(_cfg("run_id")).strip()
-# Contexto de fase: sólo afecta a la línea de progreso.
-PHASE_INDEX       = int(_cfg("phase_index"))
-PHASE_COUNT       = int(_cfg("phase_count"))
-PHASE_LABEL       = str(_cfg("phase_label")).strip()
-GLOBAL_STEP_OFFSET = int(_cfg("global_step_offset"))
-GLOBAL_TOTAL_STEPS = int(cfg.get("global_total_steps", TOTAL_STEPS))
-MULTIPHASE        = PHASE_COUNT > 1
-
-# ── Claves añadidas (Fases A–D). Todas con default = comportamiento histórico ──
-LORA_DTYPE_NAME   = str(_cfg("lora_dtype")).strip().lower()
-HIGH_PREC_TARGETS = bool(_cfg("high_precision_targets"))
-SAMPLER_MODE      = str(_cfg("sampler")).strip().lower()
-NAN_GUARD         = bool(_cfg("nan_guard"))
-NAN_ABORT_AFTER   = int(_cfg("nan_abort_after"))
-MAX_LOSS          = float(_cfg("max_loss"))
-OOM_GUARD         = bool(_cfg("oom_guard"))
-OOM_ABORT_AFTER   = int(_cfg("oom_abort_after"))
-RESUME_ON_CORRUPT = str(_cfg("resume_on_corrupt")).strip().lower()
-WARMUP_UNITS      = str(_cfg("warmup_units")).strip().lower()
-OPTIMIZER_NAME    = str(_cfg("optimizer")).strip().lower()
-OPTIMIZER_EPS     = float(_cfg("optimizer_eps"))
-OPTIMIZER_BETAS   = tuple(_cfg("optimizer_betas"))
-TIMESTEP_WEIGHTING = str(_cfg("timestep_weighting")).strip().lower()
-LOGIT_NORMAL_MU   = float(_cfg("logit_normal_mu"))
-LOGIT_NORMAL_SIGMA = float(_cfg("logit_normal_sigma"))
-SIGMA_MIN         = float(_cfg("sigma_min"))
-SIGMA_MAX         = float(_cfg("sigma_max"))
-CONTENT_OR_STYLE  = str(_cfg("content_or_style")).strip().lower()
-NOISE_OFFSET      = float(_cfg("noise_offset"))
-USE_EMA           = bool(_cfg("use_ema"))
-EMA_DECAY         = float(_cfg("ema_decay"))
-EMA_DEVICE        = str(_cfg("ema_device")).strip().lower()
-LR_SCHEDULER      = str(_cfg("lr_scheduler")).strip().lower()
-LR_NUM_CYCLES     = int(_cfg("lr_num_cycles"))
-LR_STEP_GAMMA     = float(_cfg("lr_step_gamma"))
-LR_STEP_COUNT     = int(_cfg("lr_step_count"))
-VAL_SPLIT         = float(_cfg("val_split"))
-VAL_CACHE_DIR     = str(_cfg("val_cache_dir")).strip()
-VALIDATE_EVERY    = int(_cfg("validate_every"))
-VALIDATION_SIGMAS = list(_cfg("validation_sigmas"))
-VAL_SEED          = int(_cfg("val_seed"))
-LOSS_WINDOW       = int(_cfg("loss_window"))
-LOSS_DISPLAY      = str(_cfg("loss_display")).strip().lower()
-CSV_LOG           = bool(_cfg("csv_log"))
-MAX_CKPT_KEEP     = int(_cfg("max_checkpoints_to_keep"))
-EXPORT_METADATA   = bool(_cfg("export_metadata"))
-EXPORT_ALPHA_TENSORS = bool(_cfg("export_alpha_tensors"))
-PREVIEW_SOURCE    = str(_cfg("preview_source")).strip().lower()
-PREVIEW_WALK_SEED = bool(_cfg("preview_walk_seed"))
-CAPTION_DROPOUT   = float(_cfg("caption_dropout_rate"))
-DATASET_PATH      = from_root(str(_cfg("dataset_path")).strip())
-CURATION_WEIGHTS  = bool(_cfg("curation_weights"))
-if VAL_CACHE_DIR:
-    VAL_CACHE_DIR = from_root(VAL_CACHE_DIR)
-
-
-def _validate_choice(name, value, allowed, fallback):
-    """Return `value` if it is one of `allowed`, else warn and return `fallback`.
-
-    A bad enum never aborts the run: a multi-hour training job should not die on
-    a typo in one optional setting.
-    """
-    if value not in allowed:
-        print(f"[!] Invalid {name} '{value}'. Using '{fallback}' / valor inválido. Usando '{fallback}'.")
-        return fallback
-    return value
-
-
-LORA_TARGET       = _validate_choice("lora_target", LORA_TARGET, ("all", "attn", "attn+ff"), "all")
-LORA_DTYPE_NAME   = _validate_choice("lora_dtype", LORA_DTYPE_NAME, ("bf16", "fp32"), "bf16")
-SAMPLER_MODE      = _validate_choice("sampler", SAMPLER_MODE, ("epoch", "legacy"), "legacy")
-RESUME_ON_CORRUPT = _validate_choice("resume_on_corrupt", RESUME_ON_CORRUPT, ("abort", "restart"), "abort")
-WARMUP_UNITS      = _validate_choice("warmup_units", WARMUP_UNITS, ("updates", "micro_steps", "ratio"), "updates")
-OPTIMIZER_NAME    = _validate_choice("optimizer", OPTIMIZER_NAME,
-                                     ("adamw8bit_paged", "adamw8bit", "adamw"), "adamw8bit_paged")
-TIMESTEP_WEIGHTING = _validate_choice("timestep_weighting", TIMESTEP_WEIGHTING,
-                                      ("none", "bell", "half_bell"), "none")
-CONTENT_OR_STYLE  = _validate_choice("content_or_style", CONTENT_OR_STYLE,
-                                     ("balanced", "content", "style"), "balanced")
-EMA_DEVICE        = _validate_choice("ema_device", EMA_DEVICE, ("cpu", "cuda"), "cpu")
-LR_SCHEDULER      = _validate_choice("lr_scheduler", LR_SCHEDULER,
-                                     ("cosine", "constant", "linear", "cosine_with_restarts", "step"), "cosine")
-LOSS_DISPLAY      = _validate_choice("loss_display", LOSS_DISPLAY, ("window", "cumulative"), "cumulative")
-PREVIEW_SOURCE    = _validate_choice("preview_source", PREVIEW_SOURCE, ("caption", "prompts"), "caption")
-
+# A1: master dtype of the LoRA weights. In bf16 (8-bit mantissa) the relative epsilon
+# is ~0.0039, so any update smaller than 0.39% of the weight's magnitude rounds away:
+# late in the cosine, with the LR already low, a good share of updates simply never
+# land. PEFT casts the input to lora_A's dtype and the result back, so fp32 works over
+# the NF4 base without touching it (cost: ~+235 MB VRAM).
 LORA_DTYPE  = torch.float32 if LORA_DTYPE_NAME == "fp32" else torch.bfloat16
-# A1b: el dtype de cómputo del modelo es una constante conocida, no algo que se
-# deduzca de `next(model.parameters())` — ese orden depende del wrap de PEFT y de
-# la cuantización, y un día devolvería un Params4bit (uint8).
+# A1b: the model's compute dtype is a known constant, not something inferred from
+# `next(model.parameters())` — that order depends on PEFT's wrapping and on
+# quantization, and would one day hand back a Params4bit (uint8).
 MODEL_DTYPE = torch.bfloat16
-
-# La compactación de texto elimina los tokens de relleno de cada caption, lo que
-# permite prescindir de la máscara de atención. Con máscara + GQA, PyTorch no
-# puede usar ni flash ni mem-efficient y cae al backend `math`, que materializa
-# la matriz [B, heads, S, S] completa (~568 MB a 768x768). Sin máscara usa flash.
-# Sólo es aplicable con batch 1: al compactar, cada muestra queda con una
-# longitud de texto distinta y torch.cat dejaría de funcionar.
-if COMPACT_TEXT and BATCH_SIZE > 1:
-    print("[!] compact_text requires batch_size 1; disabling / compact_text requiere batch_size 1; desactivado.")
-    COMPACT_TEXT = False
-
-# Formato automático de carpetas según el nombre del proyecto.
-# Sin project_name se respetan cache_dir/output_dir explícitos: así es como
-# run_progressive.py apunta cada fase a su subdir de resolución y a phaseN_*.
-if PROJECT_NAME:
-    CACHE_DIR  = os.path.join(CACHE_ROOT,  PROJECT_NAME)
-    OUTPUT_DIR = os.path.join(OUTPUT_ROOT, PROJECT_NAME)
-else:
-    CACHE_DIR  = from_root(_cfg("cache_dir"))
-    OUTPUT_DIR = from_root(_cfg("output_dir"))
-
-# ── A5: unidades del warmup ─────────────────────────────────────────────────
-# El schedule se mide en updates del optimizador, pero `total_steps` está en
-# micro-pasos. Mezclar ambas unidades sin decirlo es la trampa de esta config:
-# con los defaults (100 / 1200 / GA=4) el warmup se come un tercio del run.
-TOTAL_UPDATES = max(1, TOTAL_STEPS / max(1, GRAD_ACCUM_STEPS))
-if WARMUP_UNITS == "micro_steps":
-    WARMUP_UPDATES = WARMUP_STEPS / max(1, GRAD_ACCUM_STEPS)
-elif WARMUP_UNITS == "ratio":
-    WARMUP_UPDATES = WARMUP_STEPS * TOTAL_UPDATES
-else:
-    WARMUP_UPDATES = float(WARMUP_STEPS)
-if WARMUP_UPDATES >= TOTAL_UPDATES:
-    print(f"[!] Warmup ({WARMUP_UPDATES:.0f} updates) >= total updates ({TOTAL_UPDATES:.0f}); "
-          f"clamping to 10% / recortando al 10%.")
-    WARMUP_UPDATES = 0.1 * TOTAL_UPDATES
 
 
 def _print_effective_config():
@@ -491,27 +243,15 @@ def _print_effective_config():
 _print_effective_config()
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-RESUME_DIR   = os.path.join(OUTPUT_DIR, "resume_checkpoint")
-OPT_FILE     = os.path.join(OUTPUT_DIR, "optimizer.pt")
-STEP_FILE    = os.path.join(OUTPUT_DIR, "current_step.txt")
-RUN_ID_FILE  = os.path.join(OUTPUT_DIR, "run_id.txt")
+RESUME_DIR   = CFG.resume_dir
+OPT_FILE     = CFG.optimizer_state_file
+STEP_FILE    = CFG.step_file
+RUN_ID_FILE  = CFG.run_id_file
 
 
 def checkpoint_belongs_to_this_run():
-    """True when the checkpoint in this output dir belongs to the current pipeline run.
-
-    Without a RUN_ID (standalone trainer) any checkpoint is accepted. With one, a
-    checkpoint from an earlier run must be discarded: otherwise the phase would
-    restore it with start_step == total_steps, ignore `init_lora_from`, and run an
-    empty loop.
-    """
-    if not RUN_ID:
-        return True
-    try:
-        with open(RUN_ID_FILE, "r", encoding="utf-8") as f:
-            return f.read().strip() == RUN_ID
-    except Exception:
-        return False
+    """True when the checkpoint in this output dir belongs to the current pipeline run."""
+    return _checkpoints.belongs_to_run(RUN_ID_FILE, RUN_ID)
 
 
 torch.manual_seed(SEED)
@@ -581,7 +321,7 @@ def ensure_model_downloaded(local_path, repo_id):
             "  pip install huggingface_hub"
         )
 
-    hf_token = cfg.get("hf_token") or os.environ.get("HF_TOKEN")
+    hf_token = CFG.hf_token or os.environ.get("HF_TOKEN")
     dl_kwargs = {
         "repo_id": repo_id,
         "local_dir": local_path,
@@ -916,233 +656,32 @@ def _export_lora(model, path, step=None, epoch=None, num_images=None):
 # ── UTILIDADES DE ESTADO / STATE UTILITIES ──────────────────────────────────
 
 def _atomic_write(path, writer):
-    """Write through a temp file then `os.replace` — atomic on POSIX and Windows.
-
-    `writer` is called with the temp path. A crash mid-write leaves the previous
-    file intact rather than a truncated one.
-    """
-    tmp = f"{path}.tmp"
-    try:
-        writer(tmp)
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
-        raise
+    """Write through a temp file then `os.replace` — atomic on POSIX and Windows."""
+    _checkpoints.atomic_write(path, writer)
 
 
 def rotate_checkpoints(output_dir, keep):
-    """Keep only the `keep` most recent per-step checkpoints; `keep <= 0` keeps all.
-
-    Ordering comes from the step number parsed out of the filename, not ctime —
-    ctime lies after a copy or an rsync, the step number does not. Never touches
-    the FINAL export.
-    """
-    if keep <= 0:
-        return
-    found = []
-    for name in os.listdir(output_dir):
-        match = re.fullmatch(r"Krea2_LoRA_step_(\d+)\.safetensors", name)
-        if match:
-            found.append((int(match.group(1)), os.path.join(output_dir, name)))
-    found.sort(key=lambda pair: pair[0])
-    for _, path in found[:-keep]:
-        try:
-            os.remove(path)
-            print(f"  ↳ pruned old checkpoint / checkpoint antiguo eliminado: {os.path.basename(path)}")
-        except OSError as exc:
-            print(f"  [!] Could not prune {os.path.basename(path)}: {exc}")
+    """Keep only the `keep` most recent per-step checkpoints; `keep <= 0` keeps all."""
+    _checkpoints.rotate(output_dir, keep)
 
 
 def _curation_group(score, threshold, override, mode="face"):
-    """Effective curation group for one image: "good" or "bad".
-
-    A manual override wins over the score/threshold verdict. Exact replica of
-    `resolve_curation_group()` in scripts/python/server.py — keep the two in sync.
-    """
-    if override in ("good", "bad"):
-        return override
-    default_group = "good" if mode == "face" else "bad"
-    if score is None or threshold is None:
-        return default_group
-    return "good" if score >= threshold else "bad"
+    """Effective curation group for one image: "good" or "bad"."""
+    return _curation.resolve_group(score, threshold, override, mode=mode)
 
 
 def load_curation_weights(dataset_path, cache_names):
-    """Per-cache-entry training weights derived from the dataset's curation report.
+    """Per-cache-entry training weights from the dataset's curation report.
 
-    Returns `(weights, summary)`, or `(None, None)` when there is nothing to apply —
-    no report, the option disabled, or every weight resolving to 1.0. In those cases
-    training stays bit-for-bit identical to a run with curation absent.
-
-    The report is written by 0_curate_dataset.py and regenerated on every scan; the
-    effective threshold and any manual regroupings live in curation_overrides.json,
-    owned by the UI, and win over the automatic verdict.
+    Returns `(weights, summary)`, or `(None, None)` when there is nothing to apply.
     """
-    if not CURATION_WEIGHTS:
-        return None, None
-    report_path = os.path.join(dataset_path, "curation_report.json")
-    if not os.path.exists(report_path):
-        return None, None
-    try:
-        with open(report_path, "r", encoding="utf-8") as f:
-            report = json.load(f)
-    except Exception as exc:
-        print(f"[!] curation_report.json ilegible ({exc}) — se entrena sin pesos / training unweighted.")
-        return None, None
-
-    overrides = {}
-    ovr_path = os.path.join(dataset_path, "curation_overrides.json")
-    if os.path.exists(ovr_path):
-        try:
-            with open(ovr_path, "r", encoding="utf-8") as f:
-                overrides = json.load(f) or {}
-        except Exception as exc:
-            print(f"[!] curation_overrides.json ilegible ({exc}) — se usa el umbral automático.")
-
-    images = report.get("images") or {}
-    if not images:
-        return None, None
-    manual = overrides.get("threshold")
-    threshold = manual if isinstance(manual, (int, float)) else report.get("auto_threshold")
-    group_ovr = overrides.get("groups") or {}
-    weights_cfg = report.get("weights") or {}
-    mode = report.get("mode") or "face"
-    w_priority = float(weights_cfg.get("priority", 1.5))
-    w_good = float(weights_cfg.get("good", 1.0))
-    w_bad = float(weights_cfg.get("bad", 0.5))
-
-    baselines_raw = report.get("baselines") or []
-    baselines_stems = set(b.split('.')[0] for b in baselines_raw)
-
-    weights, counts, unscored = {}, {"priority": 0, "good": 0, "bad": 0}, []
-    for name in cache_names:
-        # Con flip_x el caché guarda `img_001` E `img_001__flip` como entradas
-        # separadas, pero la curaduría puntuó la imagen fuente: sin quitar el
-        # sufijo, la mitad del dataset entrenaría a peso 1.0 en silencio. Mismo
-        # strip que usa el chequeo de huérfanos más abajo.
-        stem = name[:-6] if name.endswith("__flip") else name
-        entry = images.get(stem)
-        if entry is None:
-            # En el caché pero no en el informe: se añadió después del último
-            # scan. Peso completo (nunca penalizar por falta de datos) y aviso.
-            unscored.append(stem)
-            weights[name] = 1.0
-            continue
-
-        if stem in baselines_stems or (entry and entry.get("file") in baselines_raw):
-            counts["priority"] += 1
-            weights[name] = w_priority
-        else:
-            group = _curation_group(entry.get("score"), threshold, group_ovr.get(stem), mode=mode)
-            counts[group] += 1
-            weights[name] = w_good if group == "good" else w_bad
-
-    if unscored:
-        uniq = sorted(set(unscored))
-        print(f"[!] {len(uniq)} imagen(es) del caché no están en curation_report.json "
-              f"(añadidas tras el último scan) — entrenan a peso ×1.0: "
-              + ", ".join(uniq[:8]) + ("…" if len(uniq) > 8 else ""))
-        print("    Vuelve a curar el dataset para incluirlas / re-run curation to include them.")
-
-    if all(abs(w - 1.0) < 1e-9 for w in weights.values()):
-        return None, None
-
-    summary = {"priority": counts["priority"], "good": counts["good"], "bad": counts["bad"],
-               "w_priority": w_priority, "w_good": w_good, "w_bad": w_bad, "threshold": threshold}
-    return weights, summary
+    return _curation.load_weights(dataset_path, cache_names, enabled=CURATION_WEIGHTS)
 
 
-class EpochSampler:
-    """Epoch-based sampling: every image is seen exactly once per epoch.
-
-    Replaces the original `random.choice(bucket)` + `random.choice(image)`, which
-    gave every *bucket* equal probability regardless of how many images it held —
-    a 1-image bucket got as much mass as a 16-image one. Measured in this repo, six
-    stray images were taking 67% of all steps.
-
-    Batches never mix buckets, since differing shapes cannot be concatenated.
-    """
-
-    def __init__(self, buckets, batch_size, seed, repeats=None):
-        self.buckets = {k: sorted(v) for k, v in buckets.items()}
-        self.batch_size = max(1, int(batch_size))
-        self.repeats = repeats or {}
-        self.rng = random.Random(seed)
-        self.queue = []
-        self.epoch = 0
-
-    def _refill(self):
-        """Rebuild the shuffled batch queue for one full epoch over every bucket.
-
-        Images are repeated per `repeats`, and a bucket's trailing short batch is
-        padded from that same bucket — pulling from another would break `torch.cat`.
-        Batches are then shuffled so resolutions interleave across the epoch.
-        """
-        self.epoch += 1
-        batches = []
-        for size, names in sorted(self.buckets.items()):
-            pool = []
-            for name in names:
-                pool.extend([name] * max(1, int(self.repeats.get(name, 1))))
-            self.rng.shuffle(pool)
-            for i in range(0, len(pool), self.batch_size):
-                chunk = pool[i:i + self.batch_size]
-                if len(chunk) < self.batch_size:
-                    # Completar el último batch del bucket con muestras del propio
-                    # bucket: rellenar desde otro rompería el torch.cat.
-                    chunk = chunk + self.rng.choices(pool, k=self.batch_size - len(chunk))
-                batches.append((size, chunk))
-        self.rng.shuffle(batches)   # intercala resoluciones a lo largo de la época
-        self.queue = batches
-
-    def next(self):
-        """Return the next `(bucket_size, sample_names)` batch, starting a new epoch if needed."""
-        if not self.queue:
-            self._refill()
-        return self.queue.pop()
-
-    def state_dict(self):
-        state = self.rng.getstate()
-        return {
-            "epoch": self.epoch,
-            "rng": json.dumps([state[0], list(state[1]), state[2]]),
-            "queue": json.dumps([[list(size), names] for size, names in self.queue]),
-        }
-
-    def load_state_dict(self, sd):
-        self.epoch = int(sd["epoch"])
-        raw = json.loads(sd["rng"])
-        self.rng.setstate((raw[0], tuple(raw[1]), raw[2]))
-        self.queue = [(tuple(size), names) for size, names in json.loads(sd["queue"])]
+EpochSampler = _sampling.EpochSampler
 
 
-class LegacySampler:
-    """Historical sampling: uniform over buckets, with replacement.
-
-    Kept only to reproduce old runs. See `EpochSampler` for the bias this introduces.
-    """
-
-    def __init__(self, buckets, batch_size, seed):
-        self.buckets = {k: list(v) for k, v in buckets.items()}
-        self.batch_size = max(1, int(batch_size))
-        self.rng = random.Random(seed)
-        self.epoch = 0
-
-    def next(self):
-        """Return a `(bucket_size, sample_names)` batch drawn uniformly at random."""
-        size = self.rng.choice(list(self.buckets))
-        return size, [self.rng.choice(self.buckets[size]) for _ in range(self.batch_size)]
-
-    def state_dict(self):
-        state = self.rng.getstate()
-        return {"epoch": 0, "rng": json.dumps([state[0], list(state[1]), state[2]]), "queue": "[]"}
-
-    def load_state_dict(self, sd):
-        raw = json.loads(sd["rng"])
-        self.rng.setstate((raw[0], tuple(raw[1]), raw[2]))
+LegacySampler = _sampling.LegacySampler
 
 
 class EMA:
@@ -1770,16 +1309,7 @@ def train_krea2():
     # que el recuento por grupo refleje lo que de verdad recibe gradiente.
     curation_w, curation_summary = load_curation_weights(DATASET_PATH, cache_data.keys())
     if curation_summary:
-        thr = curation_summary["threshold"]
-        print(f"\n[OK] Curaduría activa / curation active — umbral "
-              f"{'auto' if thr is None else f'{thr * 100:.0f}%'}:")
-        if curation_summary.get("priority"):
-            print(f"     ⭐ Alta Prioridad (Baselines) : {curation_summary['priority']:>4} imagen(es) · "
-                  f"peso ×{curation_summary.get('w_priority', 1.5)}")
-        print(f"     Buena calificación           : {curation_summary['good']:>4} imagen(es) · "
-              f"peso ×{curation_summary['w_good']}")
-        print(f"     Baja calificación            : {curation_summary['bad']:>4} imagen(es) · "
-              f"peso ×{curation_summary['w_bad']}")
+        print(_curation.format_summary(curation_summary))
 
     neg = None
     if os.path.exists(f"{CACHE_DIR}/_neg_embed.pt"):
@@ -1847,19 +1377,12 @@ def train_krea2():
             return all_preview_names[0]
 
     # ── A2: sampler ──────────────────────────────────────────────────────────
-    if SAMPLER_MODE == "epoch":
-        sampler = EpochSampler(buckets, BATCH_SIZE, SEED)
-    else:
-        sampler = LegacySampler(buckets, BATCH_SIZE, SEED)
+    sampler = _sampling.build_sampler(SAMPLER_MODE, buckets, BATCH_SIZE, SEED)
+    if SAMPLER_MODE != "epoch":
         # El default histórico es un bug medible: avisar con el número real.
-        counts = sorted(len(v) for v in buckets.values())
-        if len(counts) > 1 and counts[-1] > counts[0]:
-            bias = counts[-1] / counts[0]
-            print(f"\n[!] sampler='legacy' samples buckets uniformly, so an image in the "
-                  f"smallest bucket ({counts[0]} img) gets {bias:.0f}x the gradient steps of one "
-                  f"in the largest ({counts[-1]} img).")
-            print(f"[!] Muestreo sesgado {bias:.0f}x. Use sampler='epoch' (or preset 'stable_v2') "
-                  f"for full coverage / para cobertura completa.")
+        warning = _sampling.bias_warning(buckets)
+        if warning:
+            print(f"\n{warning}")
 
     # ── A6: restaurar RNG y estado del sampler tras un resume ────────────────
     if pending_state is not None:

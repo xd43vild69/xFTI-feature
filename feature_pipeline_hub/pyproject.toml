@@ -31,7 +31,20 @@ testpaths = ["tests"]
 [tool.mypy]
 plugins = ["pydantic.mypy"]
 python_version = "3.13"
-files = ["src/feature_pipeline", "mcp_server"]
+# workers/ is otherwise out of scope (ported from upstream, and the training-runtime
+# modules import torch, which this environment does not have). The krea2 modules listed
+# here are the torch-free ones, so they type-check and get tested like the rest of the
+# codebase; anything under workers/krea2/ that imports torch stays off this list.
+files = [
+    "src/feature_pipeline",
+    "mcp_server",
+    "workers/krea2/__init__.py",
+    "workers/krea2/config.py",
+    "workers/krea2/curation.py",
+    "workers/krea2/sampling.py",
+    "workers/krea2/checkpoints.py",
+]
+mypy_path = "workers"
 warn_return_any = true
 warn_unused_ignores = true
 warn_redundant_casts = true

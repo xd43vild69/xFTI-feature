@@ -234,7 +234,9 @@ feature_pipeline_hub/
 │   ├── recaption_worker.py         # Qwen3-VL recaption worker
 │   ├── caption_qwen3vl.py          # Vendored Qwen3-VL loading/captioning (ported from LoRAlab)
 │   ├── precache_worker.py          # VAE & text embedding pre-cache worker (vendored, byte-for-byte)
-│   ├── train_worker.py             # LoRA training execution worker (vendored logic; docstrings rewritten locally)
+│   ├── train_worker.py             # LoRA training entrypoint (being split into krea2/)
+│   ├── krea2/                      # Trainer package: config/, sampling/, curation/, checkpoints/ are
+│   │                               #   torch-free and covered by mypy + tests/workers/
 │   └── _telemetry.py               # Wraps precache/train's __main__ with lifecycle JSON events
 ```
 
@@ -286,8 +288,9 @@ uv run pytest
 1. **`uv sync --locked`** — installs the exact dependency set from `uv.lock`.
 2. **`mypy`** — strict, Pydantic-aware type-checking (`pydantic.mypy` plugin) over
    `src/feature_pipeline/` and `mcp_server/`, where the domain models and the tools an
-   agent calls actually live. `ui/` (Streamlit) and `workers/` (ported
-   from upstream LoRAlab) are deliberately out of scope.
+   agent calls actually live. plus the torch-free
+   modules under `workers/krea2/`. `ui/` (Streamlit) and the rest of `workers/` — which
+   import torch, unavailable in this environment — are deliberately out of scope.
 3. **`pytest`** — the full test suite (caption normalization, validation rules,
    deduplication, export integrity, MCP tools, and more), the gate against a change
    silently breaking caption quality or a dataset export.

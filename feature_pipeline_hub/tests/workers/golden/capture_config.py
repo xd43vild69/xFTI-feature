@@ -25,9 +25,14 @@ WORKERS = HERE.parents[2] / "workers"
 
 # Values that are noise rather than resolved config: absolute paths that move with
 # the checkout or the temp dir, and the static tables the fixtures never change.
+#
+# CFG is the TrainConfig object itself. Skipping it loses no coverage — every one of
+# its fields is dumped through the module-level alias that reads it — and it keeps the
+# goldens readable. When Stage 4 retires those aliases they will show up here as
+# MISSING, which is the cue to dump CFG's fields directly instead.
 SKIP = {"PROJECT_ROOT", "CACHE_ROOT", "OUTPUT_ROOT", "CONFIG_PATH", "ADVANCED_PATH",
         "DEFAULTS", "PRESETS", "SKIP_QUANT", "RESUME_DIR", "OPT_FILE", "STEP_FILE",
-        "RUN_ID_FILE", "_BELL_MEAN", "_HALF_BELL_MEAN"}
+        "RUN_ID_FILE", "_BELL_MEAN", "_HALF_BELL_MEAN", "CFG"}
 
 # Runs inside the child interpreter, after train_worker has been imported.
 CHILD = r"""
