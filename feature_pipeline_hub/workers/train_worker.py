@@ -21,7 +21,6 @@ train_advanced.json, an optional preset, and DEFAULTS — in that precedence.
 """
 import os
 import gc
-import csv
 import time
 import random
 import sys
@@ -60,6 +59,7 @@ from krea2 import dataset as _dataset           # noqa: E402
 from krea2 import ema as _ema                   # noqa: E402
 from krea2 import lora_io as _lora_io           # noqa: E402
 from krea2 import math_ops as _math             # noqa: E402
+from krea2 import metrics as _metrics           # noqa: E402
 from krea2 import preview as _preview           # noqa: E402
 from krea2 import quantization as _quant        # noqa: E402
 from krea2 import sampling as _sampling         # noqa: E402
@@ -639,22 +639,7 @@ def train_krea2():
         return total / max(1, count)
 
     # ── C2: logging estructurado ─────────────────────────────────────────────
-    train_log = val_log = train_log_file = val_log_file = None
-    if CSV_LOG:
-        train_log_path = os.path.join(OUTPUT_DIR, "train_log.csv")
-        val_log_path   = os.path.join(OUTPUT_DIR, "val_log.csv")
-        # Append: reanudar no debe perder la historia previa.
-        new_train = not os.path.exists(train_log_path)
-        new_val   = not os.path.exists(val_log_path)
-        train_log_file = open(train_log_path, "a", newline="", encoding="utf-8")
-        val_log_file   = open(val_log_path,   "a", newline="", encoding="utf-8")
-        train_log = csv.writer(train_log_file)
-        val_log   = csv.writer(val_log_file)
-        if new_train:
-            train_log.writerow(["step", "update", "epoch", "loss", "loss_avg", "grad_norm",
-                                "lr", "sigma", "bucket_h", "bucket_w", "secs", "vram_peak_gb"])
-        if new_val:
-            val_log.writerow(["step", "update", "epoch", "val_loss"])
+    logs = _metrics.CsvLogs(OUTPUT_DIR, enabled=CSV_LOG)
 
     loss_hist = collections.deque(maxlen=max(1, LOSS_WINDOW))
     nan_count = oom_streak = skipped_outlier = 0
@@ -832,44 +817,24 @@ def train_krea2():
                 accum_count = 0
 
             t_step     = time.time() - t0
-            t_step_avg = t_step if t_step_avg == 0 else 0.1 * t_step + 0.9 * t_step_avg
-            # En multifase la barra, el % y la ETA son globales: el hand-off conserva
-            # los pesos, así que reiniciarlos por fase haría parecer que se empieza de cero.
-            done_steps  = GLOBAL_STEP_OFFSET + step
-            total_shown = GLOBAL_TOTAL_STEPS if MULTIPHASE else TOTAL_STEPS
-            eta_s      = (total_shown - done_steps) * t_step_avg
-            eta        = f"{int(eta_s//3600):02d}:{int((eta_s%3600)//60):02d}:{int(eta_s%60):02d}"
-            pct        = done_steps / max(1, total_shown)
-            barra      = "█" * int(pct * 20) + "░" * (20 - int(pct * 20))
+            t_step_avg = _metrics.smooth(t_step_avg, t_step)
+            avg_loss = _metrics.average_loss(LOSS_DISPLAY, loss_hist,
+                                             running_loss, step - start_step)
+            print("\r" + _metrics.format_progress(
+                step=step, total_steps=TOTAL_STEPS, avg_loss=avg_loss,
+                grad_norm=grad_norm, lr=lr_at(step), epoch=sampler.epoch,
+                seconds_per_step=t_step_avg, multiphase=MULTIPHASE,
+                phase_index=PHASE_INDEX, phase_count=PHASE_COUNT,
+                phase_label=PHASE_LABEL, global_step_offset=GLOBAL_STEP_OFFSET,
+                global_total_steps=GLOBAL_TOTAL_STEPS), end="", flush=True)
 
-            if LOSS_DISPLAY == "window":
-                # La media acumulada se aplana por construcción y esconde el
-                # movimiento tardío; la ventana sí lo muestra.
-                avg_loss = sum(loss_hist) / max(1, len(loss_hist))
-            else:
-                avg_loss = running_loss / max(1, step - start_step)
-
-            if MULTIPHASE:
-                head = (f"[F{PHASE_INDEX+1}/{PHASE_COUNT} {PHASE_LABEL}²] "
-                        f"Paso {step:4d}/{TOTAL_STEPS} · global {done_steps:5d}/{GLOBAL_TOTAL_STEPS}")
-            else:
-                head = f"Step/Paso {step:4d}/{TOTAL_STEPS}"
-            progress_line = (
-                f"{head} [{barra}] {pct*100:5.1f}% | "
-                f"Loss {avg_loss:.4f} | gnorm {grad_norm:.3f} | "
-                f"lr {lr_at(step):.2e} | ep {sampler.epoch} | {t_step_avg:.2f}s/it | ETA {eta}"
-            )
-            print(f"\r{progress_line}", end="", flush=True)
-
-            if train_log is not None and did_update:
-                train_log.writerow([
-                    step, int(step / max(1, GRAD_ACCUM_STEPS)), sampler.epoch,
-                    f"{step_loss:.6f}", f"{avg_loss:.6f}", f"{grad_norm:.4f}",
-                    f"{lr_at(step):.3e}", f"{sigma.mean().item():.4f}",
-                    size[0], size[1], f"{t_step:.3f}",
-                    f"{torch.cuda.max_memory_allocated() / 1e9:.2f}",
-                ])
-                train_log_file.flush()
+            if did_update:
+                logs.log_step(
+                    step=step, update=int(step / max(1, GRAD_ACCUM_STEPS)),
+                    epoch=sampler.epoch, loss=step_loss, avg_loss=avg_loss,
+                    grad_norm=grad_norm, lr=lr_at(step),
+                    sigma=sigma.mean().item(), bucket=size, seconds=t_step,
+                    vram_peak_gb=torch.cuda.max_memory_allocated() / 1e9)
 
             if step % SAVE_EVERY == 0:
                 print()
@@ -878,10 +843,9 @@ def train_krea2():
             if VALIDATE_EVERY > 0 and val_names and step % VALIDATE_EVERY == 0:
                 vloss = validation_loss()
                 print(f"\n  [Val] step {step} | val_loss {vloss:.4f} | {len(val_names)} images")
-                if val_log is not None:
-                    val_log.writerow([step, int(step / max(1, GRAD_ACCUM_STEPS)),
-                                      sampler.epoch, f"{vloss:.6f}"])
-                    val_log_file.flush()
+                logs.log_validation(step=step,
+                                    update=int(step / max(1, GRAD_ACCUM_STEPS)),
+                                    epoch=sampler.epoch, val_loss=vloss)
 
             if PREVIEW_EVERY > 0 and step % PREVIEW_EVERY == 0:
                 if PREVIEW_SOURCE == "prompts" and sample_prompts:

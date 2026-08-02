@@ -43,6 +43,7 @@ files = [
     "workers/krea2/config.py",
     "workers/krea2/curation.py",
     "workers/krea2/sampling.py",
+    "workers/krea2/metrics.py",
     "workers/krea2/schedule.py",
     "workers/krea2/checkpoints.py",
 ]
