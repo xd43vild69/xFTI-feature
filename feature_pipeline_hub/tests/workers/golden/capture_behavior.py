@@ -269,6 +269,76 @@ def capture_curation_group():
     return out
 
 
+def capture_lora_metadata():
+    """The safetensors metadata map, across the config fields that feed it.
+
+    Went from reading 13 module globals to taking a TrainConfig, so this pins the
+    wiring. `ss_network_alpha` is the field that matters most: get it wrong and every
+    loader silently runs the adapter at the wrong strength.
+    """
+    import tempfile
+
+    from krea2 import config as kconfig
+    from krea2 import lora_io
+
+    cases = {
+        "defaults": {},
+        "named_with_trigger": {"project_name": "mi_lora", "trigger_word": "sks_person"},
+        "rank32_alpha64": {"lora_rank": 32, "lora_alpha": 64},
+        "fp32_ema_attn": {"lora_dtype": "fp32", "use_ema": True, "lora_target": "attn"},
+        "metadata_off": {"export_metadata": False},
+        "alt_optimizer": {"optimizer": "adamw", "lr_scheduler": "linear",
+                          "lr": 5e-5, "seed": 7},
+    }
+    out = {}
+    with tempfile.TemporaryDirectory() as tmp:
+        root = pathlib.Path(tmp)
+        for name, settings in cases.items():
+            path = root / f"{name}.json"
+            path.write_text(json.dumps(settings))
+            cfg = kconfig.load_config(str(root), settings_path=str(path),
+                                      advanced_path=str(root / "absent.json"),
+                                      cache_root=str(root / "c"),
+                                      output_root=str(root / "o"),
+                                      env={}, log=lambda _m: None)
+            out[name] = {
+                "metadata": lora_io.build_metadata(cfg, step=250, epoch=3, num_images=42),
+                "fingerprint": lora_io.fingerprint(cfg).replace(str(root), "<ROOT>"),
+                "lora_scale": cfg.lora_scale,
+            }
+        # No step means no training_info key at all, not an empty one.
+        cfg = kconfig.load_config(str(root), settings_path=str(root / "defaults.json"),
+                                  advanced_path=str(root / "absent.json"),
+                                  cache_root=str(root / "c"), output_root=str(root / "o"),
+                                  env={}, log=lambda _m: None)
+        out["no_step_no_images"] = {"metadata": lora_io.build_metadata(cfg)}
+    return out
+
+
+def capture_ema_horizon():
+    """When the EMA decay implies a window longer than the run itself."""
+    from krea2 import ema as kema
+
+    out = {}
+    for decay in (0.9, 0.99, 0.999, 0.9999):
+        for total_updates in (100.0, 300.0, 5000.0):
+            warning = kema.horizon_warning(decay, total_updates)
+            out[f"d{decay}_u{total_updates:.0f}"] = warning
+    return out
+
+
+def capture_noise_offset():
+    """Per-channel noise offset over packed latents, at a fixed seed."""
+    out = {}
+    for channels, scale in [(16, 0.05), (16, 0.1), (4, 0.05)]:
+        torch.manual_seed(31337)
+        noise = torch.randn(2, 64, channels * 4)
+        torch.manual_seed(555)
+        out[f"c{channels}_s{scale}"] = fingerprint(
+            tw._math.add_noise_offset(noise, channels, scale))
+    return out
+
+
 CAPTURES = {
     "behavior_latent_packing": capture_latent_packing,
     "behavior_shift": capture_shift,
@@ -280,6 +350,9 @@ CAPTURES = {
     "behavior_curation": capture_curation,
     "behavior_curation_group": capture_curation_group,
     "behavior_rotation": capture_rotation,
+    "behavior_lora_metadata": capture_lora_metadata,
+    "behavior_ema_horizon": capture_ema_horizon,
+    "behavior_noise_offset": capture_noise_offset,
 }
 
 

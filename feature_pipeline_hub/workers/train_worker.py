@@ -42,12 +42,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from diffusers import DiffusionPipeline
-from peft import LoraConfig, get_peft_model, set_peft_model_state_dict
-import bitsandbytes as bnb
-from safetensors.torch import save_file, load
-from bitsandbytes.nn import Linear4bit, Params4bit
-from safetensors import safe_open
-from bitsandbytes.functional import QuantState
+from peft import LoraConfig, get_peft_model
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -61,12 +56,16 @@ except Exception:
 # anywhere.
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# Settings resolution, the DEFAULTS/PRESETS tables and the validated enums all live in
-# krea2.config now. It is importable because this file is launched as a script, which
-# puts workers/ on sys.path — the same reason `from _telemetry import ...` works below.
+# The trainer's pieces live in the krea2 package. It is importable because this file is
+# launched as a script, which puts workers/ on sys.path — the same reason
+# `from _telemetry import ...` works below.
 from krea2 import checkpoints as _checkpoints   # noqa: E402
 from krea2 import config as _config             # noqa: E402
 from krea2 import curation as _curation         # noqa: E402
+from krea2 import ema as _ema                   # noqa: E402
+from krea2 import lora_io as _lora_io           # noqa: E402
+from krea2 import math_ops as _math             # noqa: E402
+from krea2 import quantization as _quant        # noqa: E402
 from krea2 import sampling as _sampling         # noqa: E402
 
 
@@ -265,32 +264,7 @@ def free_vram():
     torch.cuda.empty_cache()
 
 
-def patch_attention_for_low_vram():
-    """Monkey-patch Krea2 attention to avoid SDPA's `math` backend when a mask is used.
-
-    PyTorch rejects `attn_mask` together with `enable_gqa=True` on both the flash
-    and mem-efficient kernels, falling back to `math`, which materializes the full
-    [B, heads, S, S] score matrix. Expanding K/V to Q's head count lets us pass
-    `enable_gqa=False` and get mem-efficient back — tens of MB of K/V instead of
-    hundreds of MB of scores.
-
-    A no-op when captions are compacted (see COMPACT_TEXT), since flash already
-    handles GQA once there is no mask.
-    """
-    from diffusers.models.transformers import transformer_krea2
-
-    original = transformer_krea2.dispatch_attention_fn
-
-    def dispatch(query, key, value, *args, attn_mask=None, enable_gqa=False, **kwargs):
-        if attn_mask is not None and enable_gqa and key.shape[2] != query.shape[2]:
-            repeats = query.shape[2] // key.shape[2]
-            key = key.repeat_interleave(repeats, dim=2)
-            value = value.repeat_interleave(repeats, dim=2)
-            enable_gqa = False
-        return original(query, key, value, *args, attn_mask=attn_mask, enable_gqa=enable_gqa, **kwargs)
-
-    transformer_krea2.dispatch_attention_fn = dispatch
-    print("[OK] Attention patched to avoid the SDPA math backend / Atención parcheada para evitar el backend math.")
+patch_attention_for_low_vram = _quant.patch_attention_for_low_vram
 
 
 def ensure_model_downloaded(local_path, repo_id):
@@ -335,322 +309,47 @@ def ensure_model_downloaded(local_path, repo_id):
     return downloaded_path
 
 
-def calculate_shift(image_seq_len, base_seq_len=256, max_seq_len=6400,
-                    base_shift=0.5, max_shift=1.15):
-    """Interpolate the flow-matching timestep shift for a given latent sequence length.
-
-    Higher resolutions need more of the schedule spent at high sigma, so the shift
-    ramps linearly from `base_shift` at `base_seq_len` to `max_shift` at
-    `max_seq_len`. Feeds `sample_sigma` and the preview scheduler.
-    """
-    m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
-    b = base_shift - m * base_seq_len
-    return image_seq_len * m + b
+calculate_shift = _math.calculate_shift
 
 
 def sample_sigma(batch_size, image_seq_len, device, shift_cfg):
-    """Sample a flow-matching sigma per batch item, shifted by resolution.
-
-    `content_or_style` skews the underlying uniform before the shift is applied
-    (arXiv 2302.08453 §3.4): `content` (u³) concentrates on low sigma — fine detail
-    and likeness — while `style` (1−u³) concentrates on high sigma — composition
-    and color.
-    """
-    if TIMESTEP_SAMPLING == "logit_normal":
-        u = torch.sigmoid(LOGIT_NORMAL_MU + LOGIT_NORMAL_SIGMA
-                          * torch.randn(batch_size, device=device))
-    else:
-        u = torch.rand(batch_size, device=device)
-        if CONTENT_OR_STYLE == "content":
-            u = u ** 3
-        elif CONTENT_OR_STYLE == "style":
-            u = 1.0 - u ** 3
-
-    mu = calculate_shift(image_seq_len, *shift_cfg)
-    e_mu = math.exp(mu)
-    sigma = e_mu / (e_mu + (1.0 / u.clamp(1e-6, 1 - 1e-6) - 1.0))
-    sigma = sigma.clamp(1e-4, 1.0 - 1e-4)
-    if SIGMA_MIN > 0.0 or SIGMA_MAX < 1.0:
-        sigma = sigma.clamp(max(1e-4, SIGMA_MIN), min(1.0 - 1e-4, SIGMA_MAX))
-    return sigma
-
-
-# ∫₀¹ exp(-2(s-0.5)²) ds y su variante media-campana. Normalizan la media del
-# peso a 1 para que cambiar de esquema no altere de facto el learning rate
-# (sin normalizar, `bell` lo inflaría un 17%).
-_BELL_MEAN = 0.8556243918920983
-_HALF_BELL_MEAN = 0.9278121959460491
+    """Sample one flow-matching sigma per batch item, shifted by resolution."""
+    return _math.sample_sigma(
+        batch_size, image_seq_len, device, shift_cfg,
+        sampling=TIMESTEP_SAMPLING, content_or_style=CONTENT_OR_STYLE,
+        logit_normal_mu=LOGIT_NORMAL_MU, logit_normal_sigma=LOGIT_NORMAL_SIGMA,
+        sigma_min=SIGMA_MIN, sigma_max=SIGMA_MAX)
 
 
 def timestep_weight(sigma):
-    """ai-toolkit's BSMNTW/HBSMNTW loss weighting, re-expressed over sigma ∈ (0,1).
-
-    Normalized the weight spans 0.709 to 1.169, so at batch 1 it is a ±20% per-step
-    modulation of the LR; its real effect comes from re-weighting micro-batches
-    against each other inside the gradient-accumulation window.
-    """
-    if TIMESTEP_WEIGHTING == "bell":
-        return torch.exp(-2.0 * (sigma - 0.5) ** 2) / _BELL_MEAN
-    if TIMESTEP_WEIGHTING == "half_bell":
-        bell = torch.exp(-2.0 * (sigma - 0.5) ** 2)
-        return torch.where(sigma < 0.5, torch.ones_like(bell), bell) / _HALF_BELL_MEAN
-    return torch.ones_like(sigma)
+    """ai-toolkit's BSMNTW/HBSMNTW loss weighting over sigma."""
+    return _math.timestep_weight(sigma, TIMESTEP_WEIGHTING)
 
 
-def pack_latents(x):
-    """Patchify [B, C, H, W] latents into the [B, (H/2)*(W/2), C*4] sequence the transformer takes.
-
-    Each 2x2 spatial block becomes one token carrying all four of its values per
-    channel. `unpack_latents` is the exact inverse.
-    """
-    B, C, H, W = x.shape
-    x = x.view(B, C, H // 2, 2, W // 2, 2).permute(0, 2, 4, 1, 3, 5)
-    return x.reshape(B, (H // 2) * (W // 2), C * 4)
+pack_latents = _math.pack_latents
 
 
-def unpack_latents(x, H, W):
-    """Inverse of `pack_latents`: rebuild [B, C, H, W] latents from the token sequence.
-
-    `H` and `W` are the latent-space dimensions, not pixels.
-    """
-    B, _, C = x.shape
-    x = x.view(B, H // 2, W // 2, C // 4, 2, 2).permute(0, 3, 1, 4, 2, 5)
-    return x.reshape(B, C // 4, H, W)
+unpack_latents = _math.unpack_latents
 
 
-def prepare_position_ids(text_seq_len, grid_h, grid_w, device):
-    """Build the concatenated [text; image] RoPE position ids for one forward pass.
-
-    Text tokens all get position (0, 0, 0) — they carry no positional signal, which
-    is what makes caption compaction in `compact` exact — while image tokens get
-    their (row, col) coordinate on the patch grid.
-    """
-    text_ids = torch.zeros(text_seq_len, 3, device=device)
-    image_ids = torch.zeros(grid_h, grid_w, 3, device=device)
-    image_ids[..., 1] = torch.arange(grid_h, device=device)[:, None]
-    image_ids[..., 2] = torch.arange(grid_w, device=device)[None, :]
-    return torch.cat([text_ids, image_ids.reshape(grid_h * grid_w, 3)], dim=0)
+prepare_position_ids = _math.prepare_position_ids
 
 
-SKIP_QUANT = ("img_in", "time_embed", "time_mod_proj", "txt_in", "final_layer")
+quantize_to_nf4_ = _quant.quantize_in_place
 
 
-def quantize_to_nf4_(module, prefix=""):
-    """Recursively swap `nn.Linear` layers for 4-bit NF4 ones, in place.
-
-    Layers whose qualified name contains any `SKIP_QUANT` fragment stay in bf16:
-    they are the small embedding and projection layers at the model's edges, where
-    quantization costs accuracy but saves almost no VRAM. Slow — prefer
-    `load_nf4_cache_` when a pre-quantized cache exists.
-    """
-    from bitsandbytes.nn import Linear4bit, Params4bit
-    for name, child in list(module.named_children()):
-        full = f"{prefix}.{name}" if prefix else name
-        if isinstance(child, torch.nn.Linear) and not any(s in full for s in SKIP_QUANT):
-            w = child.weight.data.float().contiguous()
-            new_layer = Linear4bit(
-                child.in_features, child.out_features,
-                bias=child.bias is not None, quant_type="nf4",
-                compute_dtype=torch.bfloat16,
-            )
-            new_layer.weight = Params4bit(w, requires_grad=False, quant_type="nf4")
-            if child.bias is not None:
-                new_layer.bias = torch.nn.Parameter(child.bias.data, requires_grad=False)
-            setattr(module, name, new_layer)
-            del child, w
-        else:
-            quantize_to_nf4_(child, full)
+load_nf4_cache_ = _quant.load_nf4_cache
 
 
-def load_nf4_cache_(transformer, cache_dir):
-    """Rebuild NF4 layers from a pre-quantized on-disk cache instead of quantizing.
-
-    `index.json` lists every quantized layer and the safetensors file holding its
-    packed weight plus the `QuantState` tensors (absmax, quant maps, and their
-    nested second-level counterparts). Each is reassembled into a `Linear4bit` and
-    swapped into the tree. Every rebuilt layer is then re-checked for a live
-    quant_state; a mismatch raises rather than training on silently broken weights.
-    """
-    index_path = os.path.join(cache_dir, "index.json")
-
-    if not os.path.exists(index_path):
-        raise FileNotFoundError(f"index.json not found in NF4 cache / No existe index.json en caché NF4: {cache_dir}")
-
-    with open(index_path, "r", encoding="utf-8") as f:
-        index = json.load(f)
-
-    quantized = index.get("quantized", {})
-    weights_dir = os.path.join(cache_dir, "weights")
-    replaced = 0
-
-    def get_parent_module(root, module_name):
-        """Walk a dotted module path, returning (owning module, final attribute name)."""
-        parts = module_name.split(".")
-        parent = root
-        for part in parts[:-1]:
-            parent = getattr(parent, part)
-        return parent, parts[-1]
-
-    for name, info in quantized.items():
-        filepath = os.path.join(weights_dir, info["file"])
-        if not os.path.exists(filepath):
-            raise FileNotFoundError(f"NF4 weight file not found / No existe archivo NF4: {filepath}")
-
-        parent, child_name = get_parent_module(transformer, name)
-
-        with safe_open(filepath, framework="pt", device="cpu") as f:
-            weight_data = f.get_tensor("weight")
-            bias_data = None
-            if info.get("bias", False):
-                bias_data = f.get_tensor("bias")
-
-            qs_dict = {}
-            for key in f.keys():
-                if not key.startswith("quant_state."):
-                    continue
-                qs_key = key[len("quant_state."):]
-                qs_dict[qs_key] = f.get_tensor(key)
-
-            packed_qs = {
-                "absmax": qs_dict["absmax"],
-                "nested_absmax": qs_dict["nested_absmax"],
-                "nested_quant_map": qs_dict["nested_quant_map"],
-                "quant_map": qs_dict["quant_map"],
-                "quant_state.bitsandbytes__nf4": qs_dict["quant_state.bitsandbytes__nf4"],
-            }
-
-            quant_state = QuantState.from_dict(packed_qs, device="cpu")
-
-        new_weight = Params4bit(
-            weight_data,
-            requires_grad=False,
-            quant_type="nf4",
-            quant_storage=torch.uint8,
-        )
-        new_weight.quant_state = quant_state
-        new_weight.bnb_quantized = True
-
-        new_layer = Linear4bit(
-            info["in_features"],
-            info["out_features"],
-            bias=info["bias"],
-            quant_type="nf4",
-            compute_dtype=torch.bfloat16,
-        )
-        new_layer.weight = new_weight
-        if bias_data is not None:
-            new_layer.bias = torch.nn.Parameter(bias_data, requires_grad=False)
-
-        setattr(parent, child_name, new_layer)
-        replaced += 1
-
-    print(f"Reconstructed NF4 layers / Capas NF4 reconstruidas: {replaced}")
-
-    verified = 0
-    for name, layer in transformer.named_modules():
-        if isinstance(layer, Linear4bit):
-            if getattr(layer.weight, "bnb_quantized", False):
-                if layer.weight.quant_state is not None:
-                    verified += 1
-
-    print(f"Verified NF4 layers / Capas NF4 verificadas: {verified}")
-
-    if verified != replaced:
-        raise RuntimeError("NF4 Verification mismatch / La verificación NF4 no coincide")
-
-    print("[OK] NF4 cache loaded successfully / Caché NF4 cargada correctamente.")
-    return transformer
+_lora_b_norm = _lora_io.lora_b_norm
 
 
-def _lora_b_norm(model):
-    """Global ‖lora_B‖ across the adapter.
-
-    PEFT initializes lora_B to exactly zero, so any value > 0 proves a weight load
-    actually landed on the adapter rather than silently matching nothing.
-    """
-    total = 0.0
-    for name, p in model.named_parameters():
-        if "lora_B" in name:
-            total += p.detach().float().pow(2).sum().item()
-    return total ** 0.5
-
-
-def load_lora_weights(model, blob, src):
-    """Load LoRA weights into the adapter and verify the load actually took effect.
-
-    `set_peft_model_state_dict` uses load_state_dict(strict=False): if the keys did
-    not match — a different rank, alpha or lora_target than the checkpoint — nothing
-    would raise and the phase would train from random init in silence. This exits
-    non-zero instead, which aborts the orchestrator's pipeline.
-    """
-    res = set_peft_model_state_dict(model, load(blob))
-    unexpected = list(getattr(res, "unexpected_keys", []) or [])
-    if unexpected:
-        print(f"[!] {len(unexpected)} unexpected keys loading / claves inesperadas al cargar {src}")
-        for k in unexpected[:5]:
-            print(f"    - {k}")
-        sys.exit(1)
-
-    b_norm = _lora_b_norm(model)
-    if b_norm == 0.0:
-        print(f"[!] LoRA load was a no-op (‖lora_B‖ = 0) / la carga no surtió efecto: {src}")
-        print("[!] ¿Coinciden lora_rank/lora_alpha/lora_target con los del checkpoint?")
-        sys.exit(1)
-    print(f"    ‖lora_B‖ = {b_norm:.4f}")
-    return b_norm
+load_lora_weights = _lora_io.load_lora_weights
 
 
 def _export_lora(model, path, step=None, epoch=None, num_images=None):
-    """Export the adapter as a flat bf16 safetensors file with training metadata.
-
-    safetensors metadata is a plain str→str map, so no loader that iterates tensors
-    can trip over it. Per-module `.alpha` tensors stay opt-in, since adding keys
-    that are not `lora_*` can confuse loaders expecting only A/B pairs.
-    """
-    clean = {}
-    for k, v in model.state_dict().items():
-        if "lora_" not in k:
-            continue
-        new_key = "transformer." + k.replace("base_model.model.", "")
-        clean[new_key] = v.to(torch.bfloat16).cpu().contiguous()
-
-    if EXPORT_ALPHA_TENSORS:
-        alpha = torch.tensor(float(LORA_ALPHA), dtype=torch.bfloat16)
-        for key in [k for k in clean if k.endswith("lora_A.default.weight")]:
-            clean[key.replace("lora_A.default.weight", "alpha")] = alpha.clone()
-
-    meta = {"format": "pt"}
-    if EXPORT_METADATA:
-        # `ss_network_alpha` importa: con rank 16 y alpha 32 la escala correcta es
-        # 2.0, pero un loader sin información de alpha asume alpha=rank y aplica
-        # 1.0, o sea que el LoRA correría a media fuerza.
-        meta.update({
-            "ss_network_dim":           str(LORA_RANK),
-            "ss_network_alpha":         str(LORA_ALPHA),
-            "ss_network_module":        "peft.LoraConfig",
-            "ss_base_model_version":    "krea2",
-            "ss_output_name":           PROJECT_NAME or "krea2_lora",
-            "ss_learning_rate":         str(LR),
-            "ss_optimizer":             OPTIMIZER_NAME,
-            "ss_lr_scheduler":          LR_SCHEDULER,
-            "ss_seed":                  str(SEED),
-            "ss_training_comment":      f"AcademiaSD LoRAlab-Krea2 target={LORA_TARGET} "
-                                        f"dtype={LORA_DTYPE_NAME} ema={USE_EMA}",
-            "modelspec.architecture":   "krea2/lora",
-            "modelspec.implementation": "AcademiaSD_LoRAlab-Krea2",
-            "modelspec.title":          PROJECT_NAME or "krea2_lora",
-        })
-        if num_images is not None:
-            meta["ss_num_train_images"] = str(num_images)
-        # Entrada falsa `1_<trigger>`: es el truco que hace visible la palabra
-        # de activación en los paneles de metadata de ComfyUI y A1111.
-        if TRIGGER_WORD:
-            meta["ss_tag_frequency"] = json.dumps({f"1_{TRIGGER_WORD}": {TRIGGER_WORD: 1}})
-        if step is not None:
-            meta["training_info"] = json.dumps({"step": int(step),
-                                                "epoch": int(epoch or 0)})
-
-    save_file(clean, path, metadata=meta)
+    """Export the adapter as a flat bf16 safetensors file with training metadata."""
+    _lora_io.export_lora(model, path, CFG, step=step, epoch=epoch, num_images=num_images)
 
 
 # ── UTILIDADES DE ESTADO / STATE UTILITIES ──────────────────────────────────
@@ -684,65 +383,7 @@ EpochSampler = _sampling.EpochSampler
 LegacySampler = _sampling.LegacySampler
 
 
-class EMA:
-    """Exponential moving average of the trainable weights, kept in an fp32 shadow copy.
-
-    Use it around an export with `apply()` / `restore()`; the shipped LoRA is the
-    smoothed copy while the resume checkpoint keeps the raw weights.
-    """
-
-    def __init__(self, params, decay=0.99, device="cpu"):
-        self.decay = float(decay)
-        self.params = list(params)
-        self.device = torch.device(device)
-        self.shadow = [p.detach().to(self.device, torch.float32).clone() for p in self.params]
-        self.backup = None
-        self.updates = 0
-
-    @torch.no_grad()
-    def update(self):
-        """Fold the current weights into the shadow copy. Call once per optimizer update.
-
-        Calling this per micro-batch instead would make the effective decay
-        `decay ** grad_accum_steps`. The decay is warmed up over the first updates,
-        otherwise the initialization dominates the shadow for hundreds of steps.
-        """
-        self.updates += 1
-        # Warmup del decay: sin esto los primeros updates dominan el shadow
-        # durante cientos de pasos y el EMA arranca sesgado a la inicialización.
-        decay = min(self.decay, (1 + self.updates) / (10 + self.updates))
-        for shadow, param in zip(self.shadow, self.params):
-            shadow.mul_(decay).add_(param.detach().to(self.device, torch.float32),
-                                    alpha=1.0 - decay)
-
-    @torch.no_grad()
-    def apply(self):
-        """Install the EMA weights into the model, stashing the live ones for `restore`."""
-        self.backup = [p.detach().clone() for p in self.params]
-        for shadow, param in zip(self.shadow, self.params):
-            param.copy_(shadow.to(param.device, param.dtype))
-
-    @torch.no_grad()
-    def restore(self):
-        if self.backup is None:
-            return
-        for backup, param in zip(self.backup, self.params):
-            param.copy_(backup)
-        self.backup = None
-
-    def state_dict(self):
-        return {"decay": self.decay, "updates": self.updates,
-                "shadow": [s.cpu() for s in self.shadow]}
-
-    def load_state_dict(self, sd):
-        self.updates = int(sd.get("updates", 0))
-        loaded = sd.get("shadow") or []
-        if len(loaded) != len(self.shadow):
-            print("[!] EMA state size mismatch; reinitializing from current weights / "
-                  "tamaño de estado EMA distinto; reinicializando.")
-            return
-        for dst, src in zip(self.shadow, loaded):
-            dst.copy_(src.to(dst.device, dst.dtype))
+EMA = _ema.EMA
 
 
 class VaeHolder:
@@ -881,7 +522,7 @@ def train_krea2():
 
     NF4_CACHE_DIR = MODEL_ID
 
-    if os.path.exists(os.path.join(NF4_CACHE_DIR, "index.json")):
+    if _quant.has_nf4_cache(NF4_CACHE_DIR):
         print("\n¡NF4 CACHE DETECTED! / ¡CACHÉ NF4 DETECTADA!")
         print("Skipping NF4 quantization... / No se ejecutará cuantización NF4.")
         t0 = time.time()
@@ -904,25 +545,7 @@ def train_krea2():
         # fases de baja resolución donde la VRAM sobra (lo decide el orquestador).
         print("Gradient checkpointing OFF (faster, more VRAM) / Checkpointing desactivado.")
 
-    all_linears = [name for name, m in transformer.named_modules()
-                   if isinstance(m, (torch.nn.Linear, bnb.nn.Linear4bit))]
-
-    def keep(name):
-        """True when this linear layer should receive a LoRA adapter, per `lora_target`."""
-        # 'all' incluye también los bloques de text_fusion; los presets reducidos
-        # se limitan a los transformer_blocks de imagen, que es donde el LoRA rinde.
-        if LORA_TARGET == "all":
-            return True
-        if not name.startswith("transformer_blocks."):
-            return False
-        if ".attn." in name:
-            return True
-        return LORA_TARGET == "attn+ff" and ".ff." in name
-
-    target_modules = [n for n in all_linears if keep(n)]
-    if not target_modules:
-        print(f"[!] lora_target '{LORA_TARGET}' matched no layers; falling back to 'all' / no coincidió con ninguna capa.")
-        target_modules = all_linears
+    target_modules, all_linears = _lora_io.target_modules(transformer, LORA_TARGET)
     print(f"Target LoRA Layers / Capas LoRA objetivo: {len(target_modules)}/{len(all_linears)} ({LORA_TARGET})")
 
     lora_config = LoraConfig(
@@ -932,25 +555,7 @@ def train_krea2():
 
     model = get_peft_model(transformer, lora_config)
 
-    # A1: dtype de los pesos maestros del LoRA. En bf16 (mantisa de 8 bits) el
-    # epsilon relativo es ~0.0039, así que cualquier update menor al 0.39% de la
-    # magnitud del peso se redondea a nada: al final del coseno, con el LR ya
-    # bajo, buena parte de los updates sencillamente no aterrizan. PEFT castea la
-    # entrada al dtype de lora_A y el resultado de vuelta, así que fp32 funciona
-    # sobre la base NF4 sin tocarla (coste: ~+235 MB de VRAM).
-    for module in model.modules():
-        if hasattr(module, "lora_A"):
-            for adapter in module.lora_A.values():
-                adapter.to(dtype=LORA_DTYPE)
-        if hasattr(module, "lora_B"):
-            for adapter in module.lora_B.values():
-                adapter.to(dtype=LORA_DTYPE)
-        if hasattr(module, "lora_embedding_A"):
-            for adapter in module.lora_embedding_A.values():
-                adapter.data = adapter.data.to(LORA_DTYPE)
-        if hasattr(module, "lora_embedding_B"):
-            for adapter in module.lora_embedding_B.values():
-                adapter.data = adapter.data.to(LORA_DTYPE)
+    _lora_io.set_lora_dtype(model, LORA_DTYPE)
 
     model.print_trainable_parameters()
     print(f"LoRA master dtype / dtype de los pesos LoRA: {LORA_DTYPE_NAME}")
@@ -967,26 +572,15 @@ def train_krea2():
     transformer.img_in.register_forward_hook(_make_inputs_require_grad)
 
     trainable = [p for p in model.parameters() if p.requires_grad]
-    if OPTIMIZER_NAME == "adamw":
-        optimizer = torch.optim.AdamW(trainable, lr=LR, betas=OPTIMIZER_BETAS,
-                                      eps=OPTIMIZER_EPS, weight_decay=WEIGHT_DECAY)
-    elif OPTIMIZER_NAME == "adamw8bit":
-        optimizer = bnb.optim.AdamW8bit(trainable, lr=LR, betas=OPTIMIZER_BETAS,
-                                        eps=OPTIMIZER_EPS, weight_decay=WEIGHT_DECAY)
-    else:
-        # Paged: vuelca el estado del optimizador a RAM bajo presión de VRAM en lugar
-        # de reventar con OOM en los picos de las resoluciones altas.
-        optimizer = bnb.optim.PagedAdamW8bit(trainable, lr=LR, betas=OPTIMIZER_BETAS,
-                                             eps=OPTIMIZER_EPS, weight_decay=WEIGHT_DECAY)
+    optimizer = _lora_io.build_optimizer(OPTIMIZER_NAME, trainable, LR, OPTIMIZER_BETAS,
+                                         OPTIMIZER_EPS, WEIGHT_DECAY)
 
     ema = None
     if USE_EMA:
         ema = EMA(trainable, decay=EMA_DECAY, device=EMA_DEVICE)
-        horizon = 1.0 / max(1e-9, 1.0 - EMA_DECAY)
-        if horizon > TOTAL_UPDATES / 3.0:
-            print(f"[!] ema_decay {EMA_DECAY} implies a ~{horizon:.0f}-update horizon but this "
-                  f"run is only {TOTAL_UPDATES:.0f} updates: the EMA will barely leave its "
-                  f"initialization / el EMA apenas saldrá de su inicialización.")
+        warning = _ema.horizon_warning(EMA_DECAY, TOTAL_UPDATES)
+        if warning:
+            print(warning)
         print(f"[OK] EMA enabled / activada: decay {EMA_DECAY} on {EMA_DEVICE}")
 
     def lr_at(step):
@@ -1015,14 +609,7 @@ def train_krea2():
             factor = 0.5 * (1 + math.cos(math.pi * prog))
         return LR * (MIN_LR_RATIO + (1 - MIN_LR_RATIO) * factor)
 
-    # Identidad de la configuración que el checkpoint debe respetar para que
-    # restaurar tenga sentido. Un cambio de rank/target hace que los pesos ya no
-    # encajen; un cambio de caché o dtype invalida el estado del optimizador.
-    FINGERPRINT = json.dumps({
-        "rank": LORA_RANK, "alpha": LORA_ALPHA, "target": LORA_TARGET,
-        "cache_dir": CACHE_DIR, "lora_dtype": LORA_DTYPE_NAME,
-        "batch_size": BATCH_SIZE, "optimizer": OPTIMIZER_NAME,
-    }, sort_keys=True)
+    FINGERPRINT = _lora_io.fingerprint(CFG)
 
     # ── RESTAURACIÓN EXACTA DE CHECKPOINT / CHECKPOINT RESUME ─────────────────
     start_step = 0
@@ -1527,12 +1114,7 @@ def train_krea2():
                 noise = torch.randn(latent_patched.shape, device=latent_patched.device,
                                     dtype=noise_dtype)
                 if NOISE_OFFSET > 0:
-                    # El ruido se genera ya empaquetado, así que el canal c del latente
-                    # ocupa los índices c*4 … c*4+3. Ver B3: desaconsejado en rectified
-                    # flow, donde sigma=1 ya es ruido puro en distribución.
-                    channels = latents.shape[1]
-                    offset = torch.randn((B, 1, channels), device=noise.device, dtype=noise.dtype)
-                    noise = noise + NOISE_OFFSET * offset.repeat_interleave(4, dim=2)
+                    noise = _math.add_noise_offset(noise, latents.shape[1], NOISE_OFFSET)
 
                 t_exp = sigma.view(-1, 1, 1).to(noise.dtype)
                 base  = latent_patched.to(noise.dtype)

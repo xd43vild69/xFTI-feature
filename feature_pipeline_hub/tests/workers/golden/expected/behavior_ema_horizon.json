@@ -1,0 +1,14 @@
+{
+  "d0.9999_u100": "[!] ema_decay 0.9999 implies a ~10000-update horizon but this run is only 100 updates: the EMA will barely leave its initialization / el EMA apenas saldr\u00e1 de su inicializaci\u00f3n.",
+  "d0.9999_u300": "[!] ema_decay 0.9999 implies a ~10000-update horizon but this run is only 300 updates: the EMA will barely leave its initialization / el EMA apenas saldr\u00e1 de su inicializaci\u00f3n.",
+  "d0.9999_u5000": "[!] ema_decay 0.9999 implies a ~10000-update horizon but this run is only 5000 updates: the EMA will barely leave its initialization / el EMA apenas saldr\u00e1 de su inicializaci\u00f3n.",
+  "d0.999_u100": "[!] ema_decay 0.999 implies a ~1000-update horizon but this run is only 100 updates: the EMA will barely leave its initialization / el EMA apenas saldr\u00e1 de su inicializaci\u00f3n.",
+  "d0.999_u300": "[!] ema_decay 0.999 implies a ~1000-update horizon but this run is only 300 updates: the EMA will barely leave its initialization / el EMA apenas saldr\u00e1 de su inicializaci\u00f3n.",
+  "d0.999_u5000": null,
+  "d0.99_u100": "[!] ema_decay 0.99 implies a ~100-update horizon but this run is only 100 updates: the EMA will barely leave its initialization / el EMA apenas saldr\u00e1 de su inicializaci\u00f3n.",
+  "d0.99_u300": null,
+  "d0.99_u5000": null,
+  "d0.9_u100": null,
+  "d0.9_u300": null,
+  "d0.9_u5000": null
+}
