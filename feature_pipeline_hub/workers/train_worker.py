@@ -22,7 +22,6 @@ train_advanced.json, an optional preset, and DEFAULTS — in that precedence.
 import os
 import gc
 import csv
-import math
 import time
 import random
 import json
@@ -31,7 +30,6 @@ import signal
 import sys
 import zlib
 import collections
-from collections import defaultdict
 
 # Debe fijarse antes de que se inicialice el asignador CUDA. Reduce la
 # fragmentación de VRAM, que es el modo de fallo típico en GPUs de 12 GB al
@@ -62,11 +60,14 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 from krea2 import checkpoints as _checkpoints   # noqa: E402
 from krea2 import config as _config             # noqa: E402
 from krea2 import curation as _curation         # noqa: E402
+from krea2 import dataset as _dataset           # noqa: E402
 from krea2 import ema as _ema                   # noqa: E402
 from krea2 import lora_io as _lora_io           # noqa: E402
 from krea2 import math_ops as _math             # noqa: E402
+from krea2 import preview as _preview           # noqa: E402
 from krea2 import quantization as _quant        # noqa: E402
 from krea2 import sampling as _sampling         # noqa: E402
+from krea2 import schedule as _schedule         # noqa: E402
 
 
 def from_root(path):
@@ -386,86 +387,18 @@ LegacySampler = _sampling.LegacySampler
 EMA = _ema.EMA
 
 
-class VaeHolder:
-    """Lazy singleton for the VAE, which only previews need.
-
-    Training runs entirely on cached latents, so the decoder is loaded on first
-    preview and moved back to CPU afterwards rather than occupying VRAM throughout.
-    """
-
-    vae = None
-    @classmethod
-    def get(cls):
-        if cls.vae is None:
-            from diffusers import AutoencoderKLQwenImage
-            cls.vae = AutoencoderKLQwenImage.from_pretrained(
-                MODEL_ID, subfolder="vae", torch_dtype=torch.bfloat16)
-        return cls.vae
+VaeHolder = _preview.VaeHolder
 
 
 def run_preview(model, scheduler, embed, mask, neg, size, step, shift_cfg,
                 steps=None, cfg_scale=None, seed=None):
-    """Generate one preview image from the current weights and save it to OUTPUT_DIR.
-
-    A full denoising loop — optionally CFG-guided when a negative embedding was
-    cached — followed by a VAE decode. Runs under `no_grad` in eval mode and
-    restores the previous training mode on the way out. Bucket dimensions are
-    snapped to multiples of 16.
-    """
-    H, W = size
-    # El bucket debe ser múltiplo de 16: gh/gw son H/16 y W/16, y pack_latents
-    # divide las dimensiones latentes entre 2.
-    H, W = max(16, (H // 16) * 16), max(16, (W // 16) * 16)
-    steps = int(steps or PREVIEW_STEPS)
-    cfg_scale = PREVIEW_CFG if cfg_scale is None else float(cfg_scale)
-    gh, gw = H // 16, W // 16
-    device = "cuda"
-    was_training = model.training
-    model.eval()
-
-    g = torch.Generator(device=device).manual_seed(int(SEED if seed is None else seed))
-    latents = torch.randn((1, 16, H // 8, W // 8), generator=g, device=device, dtype=torch.bfloat16)
-    latents = pack_latents(latents)
-    pos_ids = prepare_position_ids(embed.shape[1], gh, gw, device)
-    embed = embed.to(device)
-    mask = mask.to(device) if mask is not None else None
-    neg_pos_ids = None
-    if neg is not None:
-        neg = (neg[0].to(device), neg[1].to(device) if neg[1] is not None else None)
-        # Compactado, el prompt negativo tiene menos tokens que el positivo, así
-        # que necesita sus propios position_ids.
-        neg_pos_ids = (pos_ids if neg[0].shape[1] == embed.shape[1]
-                       else prepare_position_ids(neg[0].shape[1], gh, gw, device))
-
-    sigmas = np.linspace(1.0, 1.0 / steps, steps)
-    mu = calculate_shift(latents.shape[1], *shift_cfg)
-    scheduler.set_timesteps(steps, device=device, sigmas=sigmas, mu=mu)
-
-    with torch.no_grad():
-        for t in scheduler.timesteps:
-            tt = (t / scheduler.config.num_train_timesteps).expand(1).to(torch.bfloat16)
-            pred = model(hidden_states=latents, encoder_hidden_states=embed, timestep=tt,
-                         position_ids=pos_ids, encoder_attention_mask=mask, return_dict=False)[0]
-            if neg is not None:
-                pred_u = model(hidden_states=latents, encoder_hidden_states=neg[0], timestep=tt,
-                               position_ids=neg_pos_ids, encoder_attention_mask=neg[1], return_dict=False)[0]
-                pred = pred + cfg_scale * (pred - pred_u)
-            latents = scheduler.step(pred, t, latents, return_dict=False)[0]
-
-        vae = VaeHolder.get().to(device)
-        lat = unpack_latents(latents, H // 8, W // 8).to(vae.dtype).unsqueeze(2)
-        mean = torch.tensor(vae.config.latents_mean, device=device, dtype=lat.dtype).view(1, -1, 1, 1, 1)
-        std  = torch.tensor(vae.config.latents_std,  device=device, dtype=lat.dtype).view(1, -1, 1, 1, 1)
-        img = vae.decode(lat * std + mean, return_dict=False)[0][:, :, 0]
-        img = ((img.float() / 2 + 0.5).clamp(0, 1)[0].cpu().permute(1, 2, 0).numpy() * 255).astype("uint8")
-        vae.to("cpu")
-
-    from PIL import Image
-    out = os.path.join(OUTPUT_DIR, f"preview_step_{step}.png")
-    Image.fromarray(img).save(out)
-    print(f"\n  ↳ Preview saved to / Preview guardada: {out}")
-    if was_training:
-        model.train()
+    """Generate one preview image from the current weights and save it to OUTPUT_DIR."""
+    _preview.render(
+        model, scheduler, embed, mask, neg, size, step, shift_cfg,
+        output_dir=OUTPUT_DIR, model_id=MODEL_ID,
+        steps=int(steps or PREVIEW_STEPS),
+        cfg_scale=PREVIEW_CFG if cfg_scale is None else float(cfg_scale),
+        seed=int(SEED if seed is None else seed))
     free_vram()
 
 
@@ -584,30 +517,13 @@ def train_krea2():
         print(f"[OK] EMA enabled / activada: decay {EMA_DECAY} on {EMA_DEVICE}")
 
     def lr_at(step):
-        """Learning rate for a given micro-step, after warmup and the configured decay.
-
-        `step` is a micro-step but the schedule runs in optimizer updates, so it is
-        divided by `grad_accum_steps` first — mixing the two units is the most common
-        way to misconfigure this file. `WARMUP_UPDATES` is already normalized.
-        """
-        # El LR sólo se aplica en actualizaciones reales del optimizador (1 de cada
-        # GRAD_ACCUM_STEPS pasos de bucle), así que el schedule se mide en updates,
-        # no en pasos de bucle. WARMUP_UPDATES ya viene normalizado a updates.
-        update = step / max(1, GRAD_ACCUM_STEPS)
-        if update < WARMUP_UPDATES:
-            return LR * update / max(1e-9, WARMUP_UPDATES)
-        prog = min(1.0, (update - WARMUP_UPDATES) / max(1e-9, TOTAL_UPDATES - WARMUP_UPDATES))
-        if LR_SCHEDULER == "constant":
-            factor = 1.0
-        elif LR_SCHEDULER == "linear":
-            factor = 1.0 - prog
-        elif LR_SCHEDULER == "cosine_with_restarts":
-            factor = 0.5 * (1 + math.cos(math.pi * ((prog * max(1, LR_NUM_CYCLES)) % 1.0)))
-        elif LR_SCHEDULER == "step":
-            factor = LR_STEP_GAMMA ** int(prog * max(1, LR_STEP_COUNT))
-        else:
-            factor = 0.5 * (1 + math.cos(math.pi * prog))
-        return LR * (MIN_LR_RATIO + (1 - MIN_LR_RATIO) * factor)
+        """Learning rate for a given micro-step, after warmup and the configured decay."""
+        return _schedule.lr_at_step(
+            step, lr=LR, grad_accum_steps=GRAD_ACCUM_STEPS,
+            warmup_updates=WARMUP_UPDATES, total_updates=TOTAL_UPDATES,
+            min_lr_ratio=MIN_LR_RATIO, scheduler=LR_SCHEDULER,
+            num_cycles=LR_NUM_CYCLES, step_gamma=LR_STEP_GAMMA,
+            step_count=LR_STEP_COUNT)
 
     FINGERPRINT = _lora_io.fingerprint(CFG)
 
@@ -788,104 +704,18 @@ def train_krea2():
     model.train()
     optimizer.zero_grad(set_to_none=True)
 
-    pin = torch.cuda.is_available()
-    cache_data, buckets = {}, defaultdict(list)
-
-    def compact(emb, msk):
-        """Drop a caption's padding tokens and its mask, returning `(embeds, None)`.
-
-        Exact, not an approximation: text tokens carry no RoPE — `prepare_position_ids`
-        assigns them all position 0 — so attention is permutation-equivariant over
-        them, and their outputs are discarded at `hidden_states[:, text_seq_len:]`.
-        The mask was only key-padding, so removing the padded tokens is equivalent to
-        masking them, and with no mask SDPA can use flash attention.
-        """
-        idx = msk[0].nonzero(as_tuple=True)[0]
-        if idx.numel() == 0:      # caption sin tokens válidos: dejarlo como estaba
-            return emb, msk
-        return emb[:, idx].contiguous(), None
-
-    def load_cache_entry(directory, name):
-        """Load one sample's `(latent, embedding, mask)` triple from the pre-cache.
-
-        Casts to bf16, optionally compacts the caption, and pins the tensors so the
-        training loop's host-to-device copies can be async.
-        """
-        lat = torch.load(f"{directory}/{name}_latent.pt", weights_only=True)
-        emb = torch.load(f"{directory}/{name}_embed.pt",  weights_only=True)
-        msk = torch.load(f"{directory}/{name}_mask.pt",   weights_only=True).bool()
-        lat, emb = lat.to(torch.bfloat16), emb.to(torch.bfloat16)
-        if COMPACT_TEXT:
-            emb, msk = compact(emb, msk)
-        if pin:
-            lat, emb = lat.pin_memory(), emb.pin_memory()
-            if msk is not None:
-                msk = msk.pin_memory()
-        return lat, emb, msk
-
-    manifest_names = None
-    manifest_path = os.path.join(CACHE_DIR, "cache_manifest.json")
-    if os.path.exists(manifest_path):
-        try:
-            with open(manifest_path, "r", encoding="utf-8") as f:
-                manifest_names = set(json.load(f).get("entries", {}))
-        except Exception:
-            manifest_names = None
-
-    for f in sorted(os.listdir(CACHE_DIR)):
-        if f.startswith(".") or not f.endswith("_latent.pt"):
-            continue
-        nombre = f.replace("_latent.pt", "")
-        cache_data[nombre] = load_cache_entry(CACHE_DIR, nombre)
-        buckets[(cache_data[nombre][0].shape[2], cache_data[nombre][0].shape[3])].append(nombre)
-
-    # Huérfanos: latentes de imágenes borradas o renombradas. Sin manifiesto no se
-    # limpiaban nunca y se seguían entrenando en silencio.
-    if manifest_names is not None:
-        # El manifiesto registra el nombre base; las variantes espejadas se
-        # derivan de flip_x, así que se comparan por su nombre base.
-        orphans = sorted(name for name in cache_data
-                         if (name[:-6] if name.endswith("__flip") else name) not in manifest_names)
-        if orphans:
-            print(f"\n[!] {len(orphans)} cached entries are not in cache_manifest.json "
-                  f"(deleted or renamed source images?) / no están en el manifiesto:")
-            for name in orphans[:10]:
-                print(f"      {name}")
-            if len(orphans) > 10:
-                print(f"      ... and {len(orphans) - 10} more")
-            print("[!] They ARE being trained on. Re-run Pre-Cache with prune_orphans='delete' "
-                  "to remove them / SE están entrenando.")
-
-    # ── C1: split de validación ──────────────────────────────────────────────
-    # Determinista (sobre nombres ordenados) y aplicado ANTES de construir el
-    # sampler, para que el holdout no reciba ningún gradiente.
-    val_data, val_names = {}, []
-    if VAL_CACHE_DIR and os.path.isdir(VAL_CACHE_DIR):
-        for f in sorted(os.listdir(VAL_CACHE_DIR)):
-            if f.startswith(".") or not f.endswith("_latent.pt"):
-                continue
-            name = f.replace("_latent.pt", "")
-            val_data[name] = load_cache_entry(VAL_CACHE_DIR, name)
-            val_names.append(name)
-        print(f"[OK] Validation set from {VAL_CACHE_DIR}: {len(val_names)} images")
-    elif VAL_SPLIT > 0:
-        ordered = sorted(cache_data)
-        stride = max(2, math.ceil(1.0 / VAL_SPLIT))
-        # Los pares original/flip deben caer del mismo lado del split.
-        picked = {n[:-6] if n.endswith("__flip") else n for n in ordered[::stride]}
-        val_names = [n for n in ordered
-                     if (n[:-6] if n.endswith("__flip") else n) in picked]
-        if len(val_names) >= len(ordered):
-            print("[!] val_split would hold out the whole dataset; disabling / desactivado.")
-            val_names = []
-        for name in val_names:
-            val_data[name] = cache_data.pop(name)
-            size = (val_data[name][0].shape[2], val_data[name][0].shape[3])
-            buckets[size].remove(name)
-            if not buckets[size]:
-                del buckets[size]
-        if val_names:
-            print(f"[OK] Holdout split: {len(val_names)} validation / {len(cache_data)} training images")
+    data = _dataset.load(
+        CACHE_DIR,
+        compact=COMPACT_TEXT,
+        pin=torch.cuda.is_available(),
+        val_split=VAL_SPLIT,
+        val_cache_dir=VAL_CACHE_DIR,
+    )
+    cache_data = data.samples
+    buckets = data.buckets
+    val_data, val_names = data.val_samples, data.val_names
+    neg = data.negative
+    sample_prompts = data.sample_prompts
 
     if not cache_data:
         print("[!] ERROR: no training images left after the validation split.")
@@ -898,14 +728,6 @@ def train_krea2():
     if curation_summary:
         print(_curation.format_summary(curation_summary))
 
-    neg = None
-    if os.path.exists(f"{CACHE_DIR}/_neg_embed.pt"):
-        neg_emb = torch.load(f"{CACHE_DIR}/_neg_embed.pt", weights_only=True)
-        neg_msk = torch.load(f"{CACHE_DIR}/_neg_mask.pt",  weights_only=True).bool()
-        if COMPACT_TEXT:
-            neg_emb, neg_msk = compact(neg_emb, neg_msk)
-        neg = (neg_emb, neg_msk)
-
     if CAPTION_DROPOUT > 0 and neg is None:
         print("[!] caption_dropout_rate is set but no _neg_embed.pt in the cache; "
               "re-run Pre-Cache / vuelve a ejecutar el Pre-Caché. Disabling.")
@@ -913,31 +735,8 @@ def train_krea2():
     else:
         CAPTION_DROPOUT_ACTIVE = CAPTION_DROPOUT
 
-    pos_cache = {}
-    def get_pos_ids(text_len, lh, lw):
-        key = (text_len, lh, lw)
-        if key not in pos_cache:
-            pos_cache[key] = prepare_position_ids(text_len, lh // 2, lw // 2, "cuda")
-        return pos_cache[key]
-
-    # ── C5: prompts de preview pre-codificados por el pre-caché ──────────────
-    # El entrenador no tiene text encoder cargado, así que los prompts se
-    # codifican en la etapa 1 y se leen aquí, igual que el embed negativo.
-    sample_prompts = []
-    for i in range(64):
-        emb_path = os.path.join(CACHE_DIR, f"_sample{i}_embed.pt")
-        if not os.path.exists(emb_path):
-            break
-        s_emb = torch.load(emb_path, weights_only=True).to(torch.bfloat16)
-        s_msk = torch.load(os.path.join(CACHE_DIR, f"_sample{i}_mask.pt"), weights_only=True).bool()
-        if COMPACT_TEXT:
-            s_emb, s_msk = compact(s_emb, s_msk)
-        meta = {}
-        meta_path = os.path.join(CACHE_DIR, f"_sample{i}_meta.json")
-        if os.path.exists(meta_path):
-            with open(meta_path, "r", encoding="utf-8") as f:
-                meta = json.load(f)
-        sample_prompts.append((s_emb, s_msk, meta))
+    pos_ids_cache = _dataset.PositionIdCache("cuda")
+    get_pos_ids = pos_ids_cache.get
 
     if PREVIEW_SOURCE == "prompts" and not sample_prompts:
         print("[!] preview_source='prompts' but no _sample*_embed.pt in the cache; "
@@ -950,18 +749,9 @@ def train_krea2():
     all_preview_names = sorted(cache_data.keys())
 
     def get_preview_sample(step):
-        """Pick which cached caption to render a preview from, per `preview_caption_mode`.
-
-        "random" picks freely, "rotate4" cycles the first four, anything else pins
-        the first sample so previews stay comparable across steps.
-        """
-        if PREVIEW_CAPTION_MODE == "random":
-            return random.choice(all_preview_names)
-        elif PREVIEW_CAPTION_MODE == "rotate4":
-            idx = (step // max(1, PREVIEW_EVERY)) % min(4, len(all_preview_names))
-            return all_preview_names[idx]
-        else:
-            return all_preview_names[0]
+        """Pick which cached caption to render a preview from, per `preview_caption_mode`."""
+        return _preview.choose_caption(all_preview_names, step,
+                                       PREVIEW_CAPTION_MODE, PREVIEW_EVERY)
 
     # ── A2: sampler ──────────────────────────────────────────────────────────
     sampler = _sampling.build_sampler(SAMPLER_MODE, buckets, BATCH_SIZE, SEED)

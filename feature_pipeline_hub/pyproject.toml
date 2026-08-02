@@ -39,9 +39,11 @@ files = [
     "src/feature_pipeline",
     "mcp_server",
     "workers/krea2/__init__.py",
+    "workers/krea2/cache_index.py",
     "workers/krea2/config.py",
     "workers/krea2/curation.py",
     "workers/krea2/sampling.py",
+    "workers/krea2/schedule.py",
     "workers/krea2/checkpoints.py",
 ]
 mypy_path = "workers"
