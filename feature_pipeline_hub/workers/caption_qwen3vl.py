@@ -5,9 +5,15 @@ caption_qwen3vl.py — Auto-captioning con el mismo Qwen3-VL-4B que Krea 2 usa c
 Ported verbatim from AcademiaSD_LoRAlab-Krea2's scripts/python/caption_qwen3vl.py,
 run here against feature_pipeline_hub's own training_runtime/model/text_encoder/
 instead of that checkout's Krea-2-NF4/text_encoder/ — the same weights, since
-setup_training_runtime.sh copies that exact folder. No other change: the loading
-technique, prompts and decoding parameters are untouched, so recaptioning stays
-byte-for-byte identical to LoRAlab's regardless of which project runs it.
+setup_training_runtime.sh copies that exact folder.
+
+Divergencia deliberada respecto al original: `generate_caption` acepta dos kwargs
+opcionales, `instruction` (prompt puesto por quien llama) y `deterministic`
+(decoding greedy), que este proyecto necesita para el captioning estructurado —
+ver src/feature_pipeline/domain/caption_schema.py. Son aditivos: sin pasarlos, la
+técnica de carga, los prompts y los parámetros de decoding son los de LoRAlab y
+el resultado es byte a byte el mismo. Las constantes CAPTION_INSTRUCTION y
+DETAILED_CAPTION_INSTRUCTION se conservan por eso, aunque el hub ya no las use.
 
 Carga `text_encoder/` (config.json + model.safetensors) por la vía de
 generación de `transformers` en vez de la vía de embeddings de `diffusers`. El
@@ -130,20 +136,31 @@ def _cap_image(im, megapixels=1.0):
 
 
 def generate_caption(model, processor, image_path, *, max_new_tokens=120,
-                     megapixels=1.0, detailed=False, seed=None):
+                     megapixels=1.0, detailed=False, seed=None,
+                     instruction=None, deterministic=False):
     """Genera un caption factual para `image_path`. Decoding sampleado
     (temperature=0.5, top_p=0.9) con semilla aleatoria por llamada, así que
     reintentos sobre la misma imagen dan redacciones distintas. Guarda y
     restaura el RNG global de torch alrededor de la llamada (higiene, aunque
-    aquí no hay training corriendo en paralelo que proteger)."""
+    aquí no hay training corriendo en paralelo que proteger).
+
+    `instruction` y `deterministic` son los dos añadidos de este proyecto (ver
+    el docstring del módulo). Con `instruction` el prompt lo pone quien llama en
+    vez de salir de las constantes de arriba; con `deterministic` el decoding
+    pasa a greedy, que es lo que hace falta cuando lo que se pide es un objeto
+    JSON y no una redacción. Omitidos ambos, el comportamiento es el de LoRAlab."""
     import random as _random
 
     from PIL import Image
 
     im = _cap_image(Image.open(image_path), megapixels)
-    instruction = DETAILED_CAPTION_INSTRUCTION if detailed else CAPTION_INSTRUCTION
-    if detailed:
-        max_new_tokens = max(max_new_tokens, 240)
+    if instruction is None:
+        instruction = DETAILED_CAPTION_INSTRUCTION if detailed else CAPTION_INSTRUCTION
+        if detailed:
+            max_new_tokens = max(max_new_tokens, 240)
+    else:
+        # El JSON completo de un schema de 5-6 slots no cabe en los 120 por defecto.
+        max_new_tokens = max(max_new_tokens, 200)
 
     messages = [{"role": "user", "content": [{"type": "image"},
                                              {"type": "text", "text": instruction}]}]
@@ -155,8 +172,12 @@ def generate_caption(model, processor, image_path, *, max_new_tokens=120,
     try:
         torch.manual_seed(seed if seed is not None else _random.randint(1, 2**31 - 1))
         with torch.no_grad():
-            out = model.generate(**inputs, max_new_tokens=max_new_tokens,
-                                 do_sample=True, temperature=0.5, top_p=0.9)
+            if deterministic:
+                out = model.generate(**inputs, max_new_tokens=max_new_tokens,
+                                     do_sample=False)
+            else:
+                out = model.generate(**inputs, max_new_tokens=max_new_tokens,
+                                     do_sample=True, temperature=0.5, top_p=0.9)
     finally:
         torch.random.set_rng_state(cpu_state)
         if cuda_states is not None:

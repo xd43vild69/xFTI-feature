@@ -456,7 +456,10 @@ def require_active_run() -> IngestionRun | None:
     return None
 
 
+_RUN_ICONS = {"upload": "📤", "clone": "📋", "folder": "📁"}
+
+
 def format_run_label(summary: IngestionRunSummary) -> str:
-    icon = "📤" if summary.source_kind == "upload" else "📁"
+    icon = _RUN_ICONS.get(summary.source_kind, "📁")
     when = summary.created_at.astimezone().strftime("%d %b %H:%M")
     return f"{icon} {summary.concept_name} · {summary.sample_count} imgs · {when}"

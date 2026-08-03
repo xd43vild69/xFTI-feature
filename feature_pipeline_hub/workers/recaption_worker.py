@@ -8,14 +8,20 @@ exits — which is what releases the VRAM.
 
 The captioning itself is not reimplemented: `caption_qwen3vl` is vendored
 alongside this script (see that file's docstring) so both projects stay on
-exactly the same model, prompts and decoding parameters.
+exactly the same model and loading technique.
+
+This worker is a relay, deliberately: the hub sends the prompt down and gets the
+model's raw reply back untouched. The prompt is a request for a JSON object of
+fixed slots, and reading that object back into a caption happens in the hub
+(domain/caption_schema.py), not here — nothing under workers/ runs in CI, so the
+part that can silently misparse belongs on the other side of this boundary.
 
 Protocol: a JSON job on stdin, JSON Lines events on stdout. Every event carries
 `timestamp` (absolute, unix seconds) and `run_id` (echoed back from the job,
 empty if the caller did not set one) so events from concurrent or successive
 runs can be told apart downstream.
 
-    job    {"text_encoder_dir": str, "images": [str], "detailed": bool, "run_id": str}
+    job    {"text_encoder_dir": str, "images": [str], "instruction": str, "run_id": str}
     events {"event": "loaded",  "device": str, "seconds": float, "timestamp": float, "run_id": str}
            {"event": "caption", "path": str, "caption": str, "seconds": float, "timestamp": float, "run_id": str}
            {"event": "error",   "path": str, "message": str, "timestamp": float, "run_id": str}
@@ -43,7 +49,7 @@ def main() -> int:
     job = json.load(sys.stdin)
     text_encoder_dir = job["text_encoder_dir"]
     images = job["images"]
-    detailed = bool(job.get("detailed", False))
+    instruction = job.get("instruction") or None
     _run_id = str(job.get("run_id", ""))
 
     import torch
@@ -69,7 +75,11 @@ def main() -> int:
     for path in images:
         image_started = time.time()
         try:
-            caption = generate_caption(model, processor, path, detailed=detailed)
+            # deterministic=True: the reply has to parse as JSON, and sampling is
+            # what turns a well-formed object into a stray token now and then.
+            caption = generate_caption(
+                model, processor, path, instruction=instruction, deterministic=True
+            )
         except Exception as exc:  # one bad image must not abort the batch
             failed += 1
             _emit(event="error", path=path, message=f"{type(exc).__name__}: {exc}")

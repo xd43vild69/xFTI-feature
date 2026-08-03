@@ -15,6 +15,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
+from feature_pipeline.domain.caption_schema import CaptionMode, instruction_for
 from feature_pipeline.infrastructure import training_runner
 
 WORKER = Path(__file__).resolve().parents[3] / "workers" / "recaption_worker.py"
@@ -64,14 +65,19 @@ def is_available() -> bool:
 
 
 def run_recaption(
-    image_paths: list[str], detailed: bool, environment: RecaptionEnvironment | None = None
+    image_paths: list[str], mode: CaptionMode, environment: RecaptionEnvironment | None = None
 ) -> Iterator[dict]:
-    """Caption `image_paths`, yielding the worker's events as they arrive.
+    """Caption `image_paths` under `mode`, yielding the worker's events as they arrive.
 
     Streaming rather than collecting lets the caller show progress: a batch takes
     a few seconds of model load plus roughly two seconds per image on GPU. Each
     call mints its own run_id so its events can be told apart from a concurrent
     or later batch once they land in a shared log/metrics store.
+
+    The job carries the resolved instruction rather than the mode itself: the
+    worker runs under the training runtime's interpreter, where `feature_pipeline`
+    is not importable, so the prompt has to travel as text. That also keeps the
+    schema and its wording in one place, on the side of the boundary CI covers.
     """
     env = environment or resolve_environment()
     run_id = str(uuid.uuid4())
@@ -79,7 +85,7 @@ def run_recaption(
         {
             "text_encoder_dir": str(env.model_dir),
             "images": image_paths,
-            "detailed": detailed,
+            "instruction": instruction_for(mode),
             "run_id": run_id,
         }
     )

@@ -73,6 +73,14 @@ The smoke run compares by tolerance, not diff: the loop is **not bit-reproducibl
 
 Pre-cache runs blocking (`training_service._run_precache_blocking`, minutes, has a timeout) before training is launched detached (`_launch_train`) — see `training_service.start_training`, used by the UI. The MCP server can't block a tool call for that long, so it uses the non-blocking split instead: `launch_precache` (fire-and-forget) + `precache_status` (poll) + `launch_train` (the public wrapper around `_launch_train`) — same underlying subprocess launch, just not chained together in one call.
 
+### Structured captioning (AI recaption)
+
+Recaptioning does not ask the VLM for prose. It asks for a **JSON object of fixed slots** and assembles the caption from them in Python, because of how a LoRA divides labour: what the caption *describes* stays conditioned on that text and steerable at inference, and what it *omits* is absorbed into the trigger word. So `subject` mode describes shot/pose/clothing/background/lighting and says nothing about face, hair or build; `location` mode inverts it — transient things (hour, weather, light, passers-by) in, architecture and style out. Asked for free prose, a VLM always ends up narrating the face; the schema plus an explicit prohibition is what holds the line. Technique ported from xLoralizerPro's `backend/normalizer.py`.
+
+The schemas, prompts, parsing and assembly all live in `domain/caption_schema.py`, deliberately: nothing under `workers/` runs in CI, so `recaption_worker.py` is only a relay — the hub sends the resolved instruction down (the prompt travels as text because `feature_pipeline` is not importable from the training runtime's interpreter) and gets the model's raw reply back untouched. `recaption_service` parses it. **Parse before `inject_trigger_word`**: that calls `normalize_caption`, whose whitelist eats `{`, `}`, `:` and `"`.
+
+Qwen3-VL runs through `transformers.generate`, which has no grammar-constrained decoding (Ollama's `format: json`), so a malformed reply is expected occasionally — `parse_slots` raises `CaptionSchemaError` and the service reports that one image as an error, leaving its existing caption alone, rather than salvaging a half-read object. `caption_qwen3vl.py` stays a verbatim port of LoRAlab's apart from two **additive** kwargs on `generate_caption` (`instruction`, `deterministic`); omit both and its behavior is byte-for-byte upstream's.
+
 ### Resuming a training run
 
 The trainer already knows how to resume: `krea2.state.CheckpointManager` restores adapter, optimizer, EMA, RNG and sampler position from `output_dir`, and its signal handlers checkpoint on SIGINT/SIGTERM/SIGHUP — so the UI's "Stop training" (which `training_runner.stop_process` sends as SIGINT) leaves a resumable checkpoint behind.
@@ -86,6 +94,7 @@ The per-step `Krea2_LoRA_step_N.safetensors` files are **not** resume points —
 ### Runs, concepts, and versions (SQLite: `feature_pipeline.db`)
 
 - A `concept` is a named dataset (concept_name + trigger_word). An `ingestion_run` is one import of that concept — re-scanning the same concept creates a **new** run rather than overwriting the old one, so runs stay independently selectable in the UI. `run_id`, not `concept_id`, is what the UI selects on.
+- A run's `source_kind` is `folder` (points at a path the user owns — `delete_managed_folder` refuses to clean it up), `upload` or `clone` (both own a folder under `data/raw/<run_id>/`). `dataset_service.clone_ingestion_run` copies an existing run's bytes into a new folder and takes captions from the DB rather than the `.txt` sidecars, which only get rewritten on export — the clone is fully independent, so it drops the source's duplicate/excluded/flagged verdicts and re-runs validation, but copies `metrics` verbatim since the files are byte-identical.
 - `samples` belong to a run and carry validation state, perceptual hashes (phash/dhash/colorhash), sharpness, and duplicate/exclude/flag flags.
 - `dataset_versions` are export snapshots (materialized flat training folders) with a `manifest_json` used to diff "did this export actually change anything" (`dataset_service.compute_content_hash` hashes sorted (phash, caption) pairs of non-excluded samples).
 - `training_runs` track every launched subprocess (precache/train/progressive/curate-scoring): pid, log path, status, and telemetry (duration, GPU-seconds, cost estimate) backfilled by `training_service.finalize_dead_run` once the process exits.

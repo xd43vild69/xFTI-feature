@@ -17,7 +17,16 @@ from feature_pipeline.application import recaption_service
 from feature_pipeline.domain.models import DatasetSample, IngestionRun
 from feature_pipeline.infrastructure import recaption_runner
 
-DETAILED_KEY = "recaption_detailed"
+MODE_KEY = "recaption_mode"
+
+# What each mode leaves *out* is the point — that is what the trigger word ends up
+# carrying. See domain/caption_schema.py.
+MODE_HELP = {
+    "subject": "Shot, pose, clothing, background and light. Says nothing about the "
+    "face, hair or build, so the trigger word learns those.",
+    "location": "Time of day, weather, light and whatever is passing through. Says "
+    "nothing about the architecture or style, so the trigger word learns those.",
+}
 
 
 def render_toolbar(
@@ -57,11 +66,12 @@ def render_toolbar(
             st.caption(":material/info: GPU busy training — recaption is paused until it finishes.")
 
         with st.popover("", icon=":material/tune:", help="Recaption settings"):
-            st.checkbox(
-                "Detailed captions",
-                key=DETAILED_KEY,
-                help="2-4 sentences covering pose, clothing, lighting and setting, "
-                "instead of a single factual sentence. Slower (~5s per image).",
+            st.radio(
+                "Caption mode",
+                list(MODE_HELP),
+                key=MODE_KEY,
+                format_func=lambda mode: mode.capitalize(),
+                captions=list(MODE_HELP.values()),
             )
 
         if st.button(
@@ -76,14 +86,14 @@ def render_toolbar(
 def _run_batch(run: IngestionRun, samples: list[DatasetSample]) -> None:
     started = time.time()
     total = len(samples)
-    detailed = bool(st.session_state.get(DETAILED_KEY))
+    mode = st.session_state.get(MODE_KEY) or "subject"
 
     progress = st.progress(0.0, text="Loading Qwen3-VL…")
     done = failed = 0
 
     with st.status(f"Recaptioning {total} image(s)", expanded=True) as status:
         for event in recaption_service.recaption_samples(
-            samples, run.concept.trigger_word, detailed=detailed
+            samples, run.concept.trigger_word, mode=mode
         ):
             if event.kind == "loaded":
                 status.write(f"Model loaded on {event.device} in {event.seconds}s.")

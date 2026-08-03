@@ -1,8 +1,10 @@
 """AI recaptioning: turn worker output into captions ready to store.
 
-The model writes a plain factual description; everything this project expects on
-top of that — normalisation and the trigger word — is applied here so an AI
-caption ends up indistinguishable in shape from a hand-written one.
+The model returns a JSON object of fixed slots rather than prose (see
+domain/caption_schema.py for why). This module is where that reply becomes a
+caption: parsed into slots, assembled in a fixed order, then given the
+normalisation and trigger word this project expects, so an AI caption ends up
+indistinguishable in shape from a hand-written one.
 """
 
 from collections.abc import Iterator
@@ -11,6 +13,12 @@ from dataclasses import dataclass
 from pydantic import ValidationError
 
 from feature_pipeline.application.caption_service import inject_trigger_word
+from feature_pipeline.domain.caption_schema import (
+    CaptionMode,
+    CaptionSchemaError,
+    assemble_caption,
+    parse_slots,
+)
 from feature_pipeline.domain.models import DatasetSample
 from feature_pipeline.domain.worker_contracts import (
     CaptionEvent,
@@ -35,9 +43,9 @@ class RecaptionProgress:
 
 
 def recaption_samples(
-    samples: list[DatasetSample], trigger_word: str, detailed: bool = False
+    samples: list[DatasetSample], trigger_word: str, mode: CaptionMode = "subject"
 ) -> Iterator[RecaptionProgress]:
-    """Recaption `samples`, yielding progress as each image comes back.
+    """Recaption `samples` under `mode`, yielding progress as each image comes back.
 
     Yields rather than returns because a batch is slow enough (a few seconds of
     model load plus roughly two seconds per image) that the UI needs to show
@@ -48,7 +56,7 @@ def recaption_samples(
 
     by_path = {sample.image_path: sample for sample in samples}
 
-    for raw in recaption_runner.run_recaption(list(by_path), detailed):
+    for raw in recaption_runner.run_recaption(list(by_path), mode):
         # The runner is a dumb transport: it forwards every JSON object the worker
         # prints. Validating here is what turns that stream into the documented
         # protocol; anything that does not match it is worker noise and is dropped.
@@ -64,10 +72,26 @@ def recaption_samples(
             sample = by_path.get(event.path)
             if sample is None:
                 continue
+
+            # Parse before injecting: inject_trigger_word normalises, and
+            # normalize_caption's whitelist drops `{`, `}`, `:` and `"` — running it
+            # first would shred the JSON this is trying to read.
+            try:
+                caption = assemble_caption(parse_slots(event.caption, mode))
+            except CaptionSchemaError as exc:
+                # Reported rather than salvaged, so the sample keeps the caption it
+                # already had. Re-running the batch over just the failures is cheap;
+                # a caption assembled from a misread reply would be indistinguishable
+                # from a good one once it is in the dataset.
+                yield RecaptionProgress(
+                    kind="error", sample_id=sample.sample_id, message=str(exc)
+                )
+                continue
+
             yield RecaptionProgress(
                 kind="caption",
                 sample_id=sample.sample_id,
-                caption=inject_trigger_word(event.caption, trigger_word),
+                caption=inject_trigger_word(caption, trigger_word),
                 seconds=event.seconds,
             )
 

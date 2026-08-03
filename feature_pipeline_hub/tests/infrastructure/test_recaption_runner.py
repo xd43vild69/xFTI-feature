@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+from feature_pipeline.domain.caption_schema import LOCATION_INSTRUCTION
 from feature_pipeline.infrastructure import recaption_runner, training_runner
 from feature_pipeline.infrastructure.recaption_runner import (
     RecaptionEnvironment,
@@ -112,7 +113,7 @@ def stub_environment(tmp_path, monkeypatch):
 def test_events_stream_back_and_noise_is_dropped(stub_environment):
     env = stub_environment(STUB_WORKER)
 
-    events = list(run_recaption(["/data/a.png", "/data/b.png"], detailed=False, environment=env))
+    events = list(run_recaption(["/data/a.png", "/data/b.png"], mode="subject", environment=env))
 
     kinds = [e["event"] for e in events]
     assert kinds == ["loaded", "caption", "caption", "done"]
@@ -123,7 +124,7 @@ def test_events_stream_back_and_noise_is_dropped(stub_environment):
 ECHO_WORKER = """
 import json, sys
 job = json.load(sys.stdin)
-print(json.dumps({"event": "job", "images": job["images"], "detailed": job["detailed"],
+print(json.dumps({"event": "job", "images": job["images"], "instruction": job["instruction"],
                   "text_encoder_dir": job["text_encoder_dir"], "run_id": job["run_id"]}), flush=True)
 """
 
@@ -131,18 +132,20 @@ print(json.dumps({"event": "job", "images": job["images"], "detailed": job["deta
 def test_the_job_reaches_the_worker_on_stdin(stub_environment):
     env = stub_environment(ECHO_WORKER)
 
-    events = list(run_recaption(["/data/a.png"], detailed=True, environment=env))
+    events = list(run_recaption(["/data/a.png"], mode="location", environment=env))
 
     assert events[0]["images"] == ["/data/a.png"]
-    assert events[0]["detailed"] is True
+    # The mode travels as the resolved prompt: feature_pipeline is not importable
+    # from the training runtime's interpreter, so the worker cannot look it up.
+    assert events[0]["instruction"] == LOCATION_INSTRUCTION
     assert events[0]["text_encoder_dir"] == str(env.model_dir)
 
 
 def test_each_call_mints_its_own_run_id(stub_environment):
     env = stub_environment(ECHO_WORKER)
 
-    first = list(run_recaption(["/data/a.png"], detailed=False, environment=env))
-    second = list(run_recaption(["/data/a.png"], detailed=False, environment=env))
+    first = list(run_recaption(["/data/a.png"], mode="subject", environment=env))
+    second = list(run_recaption(["/data/a.png"], mode="subject", environment=env))
 
     assert first[0]["run_id"]
     assert second[0]["run_id"]
@@ -152,7 +155,7 @@ def test_each_call_mints_its_own_run_id(stub_environment):
 def test_a_failed_event_carries_the_run_id_that_was_sent(stub_environment):
     env = stub_environment(CRASHING_WORKER)
 
-    events = list(run_recaption(["/data/a.png"], detailed=False, environment=env))
+    events = list(run_recaption(["/data/a.png"], mode="subject", environment=env))
 
     assert events[-1]["run_id"]
 
@@ -160,7 +163,7 @@ def test_a_failed_event_carries_the_run_id_that_was_sent(stub_environment):
 def test_a_crashing_worker_yields_a_failed_event_with_stderr(stub_environment):
     env = stub_environment(CRASHING_WORKER)
 
-    events = list(run_recaption(["/data/a.png"], detailed=False, environment=env))
+    events = list(run_recaption(["/data/a.png"], mode="subject", environment=env))
 
     assert events[-1]["event"] == "failed"
     assert "OutOfMemoryError" in events[-1]["message"]

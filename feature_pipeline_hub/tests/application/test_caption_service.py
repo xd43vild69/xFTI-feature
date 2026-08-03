@@ -4,6 +4,7 @@ from feature_pipeline.application.caption_service import (
     normalize_caption,
     replace_exact_word,
     strip_trigger_word,
+    swap_trigger_word,
 )
 
 
@@ -88,3 +89,24 @@ def test_replace_exact_word_avoids_substring_matches():
     assert count == 1
 
 
+
+
+def test_swap_trigger_word_replaces_the_old_trigger_without_leaving_a_dangling_comma():
+    assert swap_trigger_word("sks_cat, a cat sitting", "sks_cat", "sks_cat2") == (
+        "sks_cat2, a cat sitting"
+    )
+
+
+def test_swap_trigger_word_cleans_up_a_trigger_removed_from_mid_caption():
+    assert swap_trigger_word("a photo of sks_cat, standing", "sks_cat", "new_cat") == (
+        "new_cat, a photo of, standing"
+    )
+
+
+def test_swap_trigger_word_handles_a_caption_that_was_only_the_trigger():
+    assert swap_trigger_word("sks_cat", "sks_cat", "new_cat") == "new_cat"
+
+
+def test_swap_trigger_word_is_plain_injection_when_the_trigger_does_not_change():
+    assert swap_trigger_word("sks_cat, a cat", "sks_cat", "sks_cat") == "sks_cat, a cat"
+    assert swap_trigger_word("a cat", "", "sks_cat") == "sks_cat, a cat"

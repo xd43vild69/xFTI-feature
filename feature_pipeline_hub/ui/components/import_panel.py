@@ -1,4 +1,4 @@
-"""Step 1: import a raw folder or a set of uploads into a new dataset.
+"""Step 1: import a raw folder, a set of uploads, or a copy of an existing dataset.
 
 Concept name and trigger word live here rather than in a persistent sidebar —
 they only matter while creating an ingestion.
@@ -12,12 +12,13 @@ import streamlit as st
 
 import state
 import step_telemetry
-from feature_pipeline.application.dataset_service import create_ingestion_run
+from feature_pipeline.application.dataset_service import clone_ingestion_run, create_ingestion_run
 from feature_pipeline.domain.naming import slugify
 from feature_pipeline.infrastructure.storage import run_upload_dir, save_uploaded_files
 
 SOURCE_FOLDER = "From folder"
 SOURCE_UPLOAD = "Upload files"
+SOURCE_CLONE = "Clone dataset"
 
 # Set once the user edits Trigger word by hand, so their edit sticks instead of
 # being overwritten the next time Concept name changes.
@@ -63,11 +64,16 @@ def _render_form() -> None:
 
     source = st.segmented_control(
         "Source",
-        [SOURCE_FOLDER, SOURCE_UPLOAD],
+        [SOURCE_FOLDER, SOURCE_UPLOAD, SOURCE_CLONE],
         default=SOURCE_FOLDER,
         required=True,
         label_visibility="collapsed",
     )
+
+    if source == SOURCE_CLONE:
+        _render_clone_form()
+        return
+
     from_folder = source != SOURCE_UPLOAD
 
     typed_path = None
@@ -95,6 +101,84 @@ def _render_form() -> None:
 
     if scan_clicked:
         _ingest(from_folder, typed_path, uploaded_files)
+
+
+def _render_clone_form() -> None:
+    """Pick an existing dataset to copy; Concept name / Trigger word above name the copy."""
+    summaries = state.list_runs()
+    if not summaries:
+        st.info("No datasets to clone yet — import one first.")
+        return
+
+    by_run_id = {summary.run_id: summary for summary in summaries}
+
+    with st.container(horizontal=True, vertical_alignment="bottom"):
+        source_run_id = st.selectbox(
+            "Dataset to clone",
+            list(by_run_id),
+            format_func=lambda run_id: state.format_run_label(by_run_id[run_id]),
+            key="clone_source_run_id",
+            label_visibility="collapsed",
+        )
+        clone_clicked = st.button("Clone dataset", icon=":material/content_copy:")
+
+    include_excluded = st.checkbox(
+        "Include excluded images",
+        key="clone_include_excluded",
+        help=(
+            "Off by default: images excluded during curation stay out of the copy. "
+            "The clone gets its own images and captions — editing or deleting it never "
+            "touches the original."
+        ),
+    )
+
+    if clone_clicked and source_run_id:
+        _clone(source_run_id, include_excluded)
+
+
+def _clone(source_run_id: str, include_excluded: bool) -> None:
+    concept_name = st.session_state.get("concept_name", "").strip()
+    trigger_word = st.session_state.get("trigger_word", "").strip()
+
+    # Same order as `_ingest`: nothing is written to disk before the name that every
+    # copied file is named after is known to exist.
+    if not concept_name or not trigger_word:
+        st.warning("Set concept name and trigger word above first.")
+        return
+
+    source_run = state.load_run(source_run_id)
+    if source_run is None:  # deleted from another session while this page sat open
+        st.error("That dataset no longer exists.")
+        return
+
+    run_id = str(uuid.uuid4())
+    started = time.time()
+    with st.spinner("Copying images..."):
+        run = clone_ingestion_run(
+            source=source_run,
+            destination=run_upload_dir(run_id),
+            concept_name=concept_name,
+            trigger_word=trigger_word,
+            run_id=run_id,
+            include_excluded=include_excluded,
+        )
+
+    if not run.concept.samples:
+        st.warning("Nothing was copied — the source dataset's images are no longer on disk.")
+        state.save_run(run)
+        step_telemetry.record_step(run_id, "import", time.time() - started, error_count=1)
+        return
+
+    state.save_run(run)
+    state.set_active_run(run.run_id)
+
+    error_count = sum(1 for s in run.concept.samples if not s.is_valid)
+    step_telemetry.record_step(run_id, "import", time.time() - started, error_count=error_count)
+    st.session_state["ingest_message"] = (
+        f"Cloned {len(run.concept.samples)} image(s) from "
+        f"'{source_run.concept.concept_name}' into '{concept_name}'."
+    )
+    st.rerun()
 
 
 def _ingest(from_folder: bool, typed_path: str | None, uploaded_files: list | None) -> None:

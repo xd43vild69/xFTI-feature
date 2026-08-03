@@ -6,7 +6,7 @@ import uuid
 from pathlib import Path
 
 from feature_pipeline.application import quality_service
-from feature_pipeline.application.caption_service import inject_trigger_word
+from feature_pipeline.application.caption_service import inject_trigger_word, swap_trigger_word
 from feature_pipeline.application.image_service import compute_image_metrics
 from feature_pipeline.domain.models import (
     ConceptGroup,
@@ -17,7 +17,12 @@ from feature_pipeline.domain.models import (
 )
 from feature_pipeline.domain.validators import validate_sample
 from feature_pipeline.infrastructure import ingestion_repository as repo
-from feature_pipeline.infrastructure.storage import read_caption_for_image, scan_raw_folder
+from feature_pipeline.infrastructure.storage import (
+    copy_images_into,
+    read_caption_for_image,
+    scan_raw_folder,
+    write_caption_sidecar,
+)
 
 
 def build_sample(image_path: str, trigger_word: str) -> DatasetSample:
@@ -77,6 +82,83 @@ def create_ingestion_run(
         source_path=folder_path,
         source_kind=source_kind,
         concept=concept,
+    )
+
+
+def clone_ingestion_run(
+    source: IngestionRun,
+    destination: str,
+    concept_name: str,
+    trigger_word: str,
+    run_id: str | None = None,
+    concept_id: str | None = None,
+    include_excluded: bool = False,
+) -> IngestionRun:
+    """Copy an existing run's images and captions into a new, fully independent run.
+
+    The counterpart to `create_ingestion_run` for "start from what I already curated".
+    Re-importing the source folder would lose every caption edit; pointing a second run
+    at the same files would make the two datasets share pixels, so deleting one would
+    gut the other. This copies the bytes into `destination` (a folder the new run owns)
+    and takes the captions from the database rather than from the .txt sidecars, since
+    those are only rewritten on export and can lag behind what the user last typed.
+
+    What survives the copy and what doesn't:
+
+    - Captions come from `caption` (the edited one), re-triggered when the clone takes a
+      different trigger word, and become the clone's `original_caption` too — the clone
+      is a fresh import, so "what it was imported with" is what it was cloned with.
+    - `metrics` are copied verbatim rather than recomputed: the files are byte-identical,
+      so pHash/dHash/colorhash/sharpness cannot have changed, and recomputing them would
+      re-decode every image for no gain. Validation *is* re-run, because the rules may
+      have moved since the source was imported.
+    - Curation verdicts (duplicate/excluded/flagged) do not carry over. The clone is its
+      own dataset and gets its own quality pass; inheriting a duplicate flag computed
+      against a different set of samples would be a verdict about another dataset.
+    - Excluded samples are left behind unless `include_excluded` is set, so a clone does
+      not silently resurrect images the user rejected.
+    """
+    run_id = run_id or str(uuid.uuid4())
+    old_trigger = source.concept.trigger_word
+
+    originals = [s for s in source.concept.samples if include_excluded or not s.is_excluded]
+    # Keyed by path, which is unique within a run — `append_images_to_run` is the only
+    # way to add to one and it refuses a path the run already holds.
+    new_path_by_source = dict(
+        copy_images_into([s.image_path for s in originals], destination, concept_name)
+    )
+
+    samples: list[DatasetSample] = []
+    for original in originals:
+        new_path = new_path_by_source.get(original.image_path)
+        if new_path is None:  # source file vanished; copy_images_into skipped it
+            continue
+
+        caption = swap_trigger_word(original.caption, old_trigger, trigger_word)
+        write_caption_sidecar(new_path, caption, keep_backup=False)
+
+        sample = DatasetSample(
+            sample_id=str(uuid.uuid4()),
+            image_path=new_path,
+            caption=caption,
+            original_caption=caption,
+            metrics=original.metrics.model_copy(),
+        )
+        errors = validate_sample(sample)
+        sample.is_valid = not errors
+        sample.validation_errors = errors
+        samples.append(sample)
+
+    return IngestionRun(
+        run_id=run_id,
+        source_path=destination,
+        source_kind="clone",
+        concept=ConceptGroup(
+            concept_id=concept_id or str(uuid.uuid4()),
+            concept_name=concept_name,
+            trigger_word=trigger_word,
+            samples=samples,
+        ),
     )
 
 

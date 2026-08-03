@@ -5,12 +5,18 @@ from PIL import Image
 from feature_pipeline.application.dataset_service import (
     append_images_to_run,
     build_manifest,
+    clone_ingestion_run,
     compute_content_hash,
     create_ingestion_run,
     ingest_concept_from_folder,
     revalidate_samples,
 )
-from feature_pipeline.domain.models import ConceptGroup, DatasetSample, ImageMetrics
+from feature_pipeline.domain.models import (
+    ConceptGroup,
+    DatasetSample,
+    ImageMetrics,
+    IngestionRun,
+)
 
 
 def _make_image(path: Path, size=(512, 512)) -> None:
@@ -336,3 +342,139 @@ def test_revalidate_samples_leaves_an_already_correct_verdict_untouched():
     )
 
     assert revalidate_samples([sample]) == 0
+
+
+# --- clone --------------------------------------------------------------------
+
+
+def _run_to_clone(tmp_path: Path) -> IngestionRun:
+    source_folder = tmp_path / "source"
+    source_folder.mkdir()
+    for name in ("a", "b"):
+        _make_image(source_folder / f"{name}.png")
+        (source_folder / f"{name}.txt").write_text("a cat sitting")
+
+    return create_ingestion_run(
+        folder_path=str(source_folder),
+        concept_name="cats",
+        trigger_word="sks_cat",
+        source_kind="folder",
+    )
+
+
+def test_clone_copies_images_and_captions_into_a_folder_of_its_own(tmp_path: Path):
+    source = _run_to_clone(tmp_path)
+    destination = tmp_path / "clone"
+
+    clone = clone_ingestion_run(
+        source=source,
+        destination=str(destination),
+        concept_name="cats_v2",
+        trigger_word="sks_cat2",
+    )
+
+    assert clone.run_id != source.run_id
+    assert clone.concept.concept_id != source.concept.concept_id
+    assert clone.source_kind == "clone"
+    assert len(clone.concept.samples) == 2
+
+    for sample in clone.concept.samples:
+        # Renamed under the new concept's slug, in the new run's own folder.
+        assert Path(sample.image_path).parent == destination
+        assert Path(sample.image_path).stem.startswith("cats_v2_")
+        assert Path(sample.image_path).exists()
+        # The sidecar is written too, so the folder stands on its own for export.
+        assert Path(sample.image_path).with_suffix(".txt").read_text() == sample.caption
+
+    # Source is untouched.
+    assert all(Path(s.image_path).exists() for s in source.concept.samples)
+
+
+def test_clone_retriggers_captions_without_leaving_the_old_trigger_behind(tmp_path: Path):
+    source = _run_to_clone(tmp_path)
+    assert source.concept.samples[0].caption == "sks_cat, a cat sitting"
+
+    clone = clone_ingestion_run(
+        source=source,
+        destination=str(tmp_path / "clone"),
+        concept_name="cats_v2",
+        trigger_word="sks_cat2",
+    )
+
+    sample = clone.concept.samples[0]
+    assert sample.caption == "sks_cat2, a cat sitting"
+    # A clone is a fresh import, so what it was cloned with is its baseline.
+    assert sample.original_caption == "sks_cat2, a cat sitting"
+
+
+def test_clone_starts_from_the_edited_caption_not_the_sidecar(tmp_path: Path):
+    source = _run_to_clone(tmp_path)
+    source.concept.samples[0].caption = "sks_cat, an edited description"
+
+    clone = clone_ingestion_run(
+        source=source,
+        destination=str(tmp_path / "clone"),
+        concept_name="cats_v2",
+        trigger_word="sks_cat",
+    )
+
+    captions = sorted(s.caption for s in clone.concept.samples)
+    assert captions == ["sks_cat, a cat sitting", "sks_cat, an edited description"]
+
+
+def test_clone_drops_curation_verdicts_so_the_copy_starts_clean(tmp_path: Path):
+    source = _run_to_clone(tmp_path)
+    source.concept.samples[0].is_duplicate = True
+    source.concept.samples[0].is_flagged = True
+
+    clone = clone_ingestion_run(
+        source=source,
+        destination=str(tmp_path / "clone"),
+        concept_name="cats_v2",
+        trigger_word="sks_cat2",
+    )
+
+    assert all(not s.is_duplicate and not s.is_flagged for s in clone.concept.samples)
+    assert {s.sample_id for s in clone.concept.samples}.isdisjoint(
+        {s.sample_id for s in source.concept.samples}
+    )
+    # Byte-identical files: metrics carry over rather than being recomputed.
+    assert clone.concept.samples[0].metrics.phash == source.concept.samples[0].metrics.phash
+
+
+def test_clone_leaves_excluded_samples_behind_unless_asked(tmp_path: Path):
+    source = _run_to_clone(tmp_path)
+    source.concept.samples[0].is_excluded = True
+
+    without = clone_ingestion_run(
+        source=source,
+        destination=str(tmp_path / "clone_a"),
+        concept_name="cats_v2",
+        trigger_word="sks_cat2",
+    )
+    with_excluded = clone_ingestion_run(
+        source=source,
+        destination=str(tmp_path / "clone_b"),
+        concept_name="cats_v3",
+        trigger_word="sks_cat3",
+        include_excluded=True,
+    )
+
+    assert len(without.concept.samples) == 1
+    assert len(with_excluded.concept.samples) == 2
+    # Brought along, but no longer excluded — the clone is its own dataset.
+    assert all(not s.is_excluded for s in with_excluded.concept.samples)
+
+
+def test_clone_skips_source_images_that_are_gone_from_disk(tmp_path: Path):
+    source = _run_to_clone(tmp_path)
+    Path(source.concept.samples[0].image_path).unlink()
+
+    clone = clone_ingestion_run(
+        source=source,
+        destination=str(tmp_path / "clone"),
+        concept_name="cats_v2",
+        trigger_word="sks_cat2",
+    )
+
+    assert len(clone.concept.samples) == 1

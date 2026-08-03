@@ -5,7 +5,9 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
-SourceKind = Literal["folder", "upload"]
+# "clone" is a copy of an earlier run's images into a folder of its own: it owns its
+# files like an upload does, but records that the pixels came from another dataset.
+SourceKind = Literal["folder", "upload", "clone"]
 
 # `concept_name` becomes a directory name under training_runtime/datasets (see
 # training_service.dataset_dir_for), so it has to stay a single, harmless path

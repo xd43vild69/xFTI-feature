@@ -196,6 +196,42 @@ def append_uploaded_files(
     return _write_standardized(uploaded_files, destination, concept_name, start_index)
 
 
+def copy_images_into(
+    image_paths: list[str], destination: str, concept_name: str, start_index: int = 1
+) -> list[tuple[str, str]]:
+    """Copy image files into `destination`, renamed `<concept_slug>_NNNN.ext`.
+
+    Returns (source_path, new_path) pairs in the order given. A source that is no
+    longer on disk is skipped rather than raising, so cloning a dataset whose folder
+    has partly disappeared still produces the images that survived.
+
+    Captions are deliberately not copied: the caller owns them. A clone writes the
+    caption the database holds — the edited one, possibly re-triggered — rather than
+    whatever .txt happens to sit next to the source image.
+    """
+    folder = Path(destination)
+    folder.mkdir(parents=True, exist_ok=True)
+    taken = {path.stem for path in folder.iterdir() if path.is_file()}
+
+    copied: list[tuple[str, str]] = []
+    index = start_index
+
+    for source_path in image_paths:
+        source = Path(source_path)
+        if not source.is_file():
+            continue
+
+        stem = _available_stem(taken, standardized_stem(concept_name, index))
+        taken.add(stem)
+        index += 1
+
+        target = folder / f"{stem}{source.suffix.lower()}"
+        shutil.copy2(source, target)
+        copied.append((source_path, str(target)))
+
+    return copied
+
+
 def run_upload_dir(run_id: str) -> str:
     """Per-run folder under `data/raw/` for files uploaded through the UI."""
     return str(raw_data_dir() / run_id)

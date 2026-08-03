@@ -5,6 +5,11 @@ import re
 _WHITESPACE_RE = re.compile(r"\s+")
 _SPECIAL_CHARS_RE = re.compile(r"[^\w\s,.\-']", flags=re.UNICODE)
 
+# Cleanup for the gap a removed trigger word leaves behind — see `swap_trigger_word`.
+_ORPHAN_COMMA_RE = re.compile(r"\s+,")
+_REPEATED_COMMA_RE = re.compile(r",(\s*,)+")
+_LEADING_SEPARATOR_RE = re.compile(r"^[\s,]+")
+
 
 def normalize_caption(caption: str) -> str:
     """Strip special characters, collapse repeated whitespace, and trim the result."""
@@ -53,6 +58,24 @@ def inject_trigger_word(caption: str, trigger_word: str) -> str:
         return trigger_word
 
     return f"{trigger_word}, {normalized}"
+
+
+def swap_trigger_word(caption: str, old_trigger: str, new_trigger: str) -> str:
+    """Re-trigger a caption: drop `old_trigger`, then prefix `new_trigger`.
+
+    Written for cloning a dataset under a different trigger word. Stripping on its
+    own leaves behind the separator the old trigger sat next to — "sks, a cat"
+    becomes ", a cat" — so the orphaned commas are collapsed before the new trigger
+    goes on, rather than being carried into every caption of the new dataset.
+    """
+    if not old_trigger or old_trigger == new_trigger:
+        return inject_trigger_word(caption, new_trigger)
+
+    remainder = strip_trigger_word(caption, old_trigger)
+    remainder = _ORPHAN_COMMA_RE.sub(",", remainder)
+    remainder = _REPEATED_COMMA_RE.sub(",", remainder)
+    remainder = _LEADING_SEPARATOR_RE.sub("", remainder)
+    return inject_trigger_word(remainder, new_trigger)
 
 
 def replace_exact_word(caption: str, old_word: str, new_word: str) -> tuple[str, int]:
