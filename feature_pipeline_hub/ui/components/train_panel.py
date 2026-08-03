@@ -191,21 +191,45 @@ def _render_launch_form(run: IngestionRun, latest: training_repo.TrainingRun | N
                 "Total steps", min_value=1, step=100,
                 value=config["total_steps"], key=_field_key(run.run_id, "total_steps"),
                 on_change=_sync_fields_to_json, args=(run.run_id,),
+                help=(
+                    "Número total de micro-pasos de entrenamiento. Las actualizaciones "
+                    "reales del modelo son total_steps / grad_accum_steps. Más pasos = "
+                    "más tiempo de aprendizaje pero más riesgo de sobreajuste en "
+                    "datasets pequeños."
+                ),
             )
             st.number_input(
                 "Learning rate", min_value=0.0, step=1e-5, format="%.6f",
                 value=config["lr"], key=_field_key(run.run_id, "lr"),
                 on_change=_sync_fields_to_json, args=(run.run_id,),
+                help=(
+                    "Tasa de aprendizaje máxima, alcanzada tras el warmup y luego "
+                    "decaída según el scheduler. Más alta aprende más rápido pero "
+                    "puede volverse inestable; más baja es más lenta pero más estable."
+                ),
             )
             st.number_input(
                 "LoRA rank", min_value=1, step=1,
                 value=config["lora_rank"], key=_field_key(run.run_id, "lora_rank"),
                 on_change=_sync_fields_to_json, args=(run.run_id,),
+                help=(
+                    "Capacidad del adaptador LoRA. Rank bajo (4-8) es rápido, liviano "
+                    "y menos propenso a sobreajuste en datasets chicos; rank alto "
+                    "(32-64+) captura transformaciones más complejas pero usa más "
+                    "VRAM y sobreajusta más fácil."
+                ),
             )
             st.number_input(
                 "LoRA alpha", min_value=1, step=1,
                 value=config["lora_alpha"], key=_field_key(run.run_id, "lora_alpha"),
                 on_change=_sync_fields_to_json, args=(run.run_id,),
+                help=(
+                    "Junto con el rank define la escala (alpha/rank) con la que el "
+                    "adaptador se aplica al modelo base. Subir alpha sin subir el "
+                    "rank intensifica cuánto 'jala' el adaptador — útil para que el "
+                    "estilo domine, pero si se exagera degrada la coherencia general. "
+                    "Convención habitual: alpha ≈ 2×rank."
+                ),
             )
 
         with st.container(horizontal=True):
@@ -213,21 +237,43 @@ def _render_launch_form(run: IngestionRun, latest: training_repo.TrainingRun | N
                 "Batch size", min_value=1, step=1,
                 value=config["batch_size"], key=_field_key(run.run_id, "batch_size"),
                 on_change=_sync_fields_to_json, args=(run.run_id,),
+                help=(
+                    "Imágenes procesadas juntas por micro-paso. Más alto da un "
+                    "gradiente más estable pero usa más VRAM; en GPUs limitadas se "
+                    "deja en 1 y se compensa con grad_accum_steps."
+                ),
             )
             st.number_input(
                 "Grad accumulation steps", min_value=1, step=1,
                 value=config["grad_accum_steps"], key=_field_key(run.run_id, "grad_accum_steps"),
                 on_change=_sync_fields_to_json, args=(run.run_id,),
+                help=(
+                    "Micro-pasos acumulados antes de cada actualización real del "
+                    "optimizador. Subirlo simula un batch más grande sin más VRAM, "
+                    "pero cada actualización tarda más en llegar."
+                ),
             )
             st.number_input(
                 "Save every", min_value=1, step=25,
                 value=config["save_every"], key=_field_key(run.run_id, "save_every"),
                 on_change=_sync_fields_to_json, args=(run.run_id,),
+                help=(
+                    "Cada cuántos micro-pasos se guarda un checkpoint completo "
+                    "(modelo, optimizador, EMA, RNG). Más bajo da más seguridad ante "
+                    "fallos pero más uso de disco/I-O; más alto reduce overhead pero "
+                    "arriesga más trabajo perdido si se interrumpe."
+                ),
             )
             st.number_input(
                 "Seed", min_value=0, step=1,
                 value=config["seed"], key=_field_key(run.run_id, "seed"),
                 on_change=_sync_fields_to_json, args=(run.run_id,),
+                help=(
+                    "Semilla aleatoria que fija torch/CUDA/numpy y el muestreo de "
+                    "ruido. Con el mismo seed y los mismos pasos, dos corridas dan "
+                    "resultados idénticos — útil para comparar cambios de forma "
+                    "controlada."
+                ),
             )
 
         with st.container(horizontal=True):
@@ -235,6 +281,12 @@ def _render_launch_form(run: IngestionRun, latest: training_repo.TrainingRun | N
                 "Warmup steps", min_value=0, step=10,
                 value=config["warmup_steps"], key=_field_key(run.run_id, "warmup_steps"),
                 on_change=_sync_fields_to_json, args=(run.run_id,),
+                help=(
+                    "Actualizaciones iniciales donde la tasa de aprendizaje sube "
+                    "gradualmente desde 0 hasta lr. Si el valor iguala o supera el "
+                    "total de actualizaciones, el sistema lo recorta automáticamente "
+                    "al 10% del total."
+                ),
             )
             st.selectbox(
                 "LR scheduler", ["cosine", "constant", "linear", "cosine_with_restarts", "step"],
@@ -243,11 +295,23 @@ def _render_launch_form(run: IngestionRun, latest: training_repo.TrainingRun | N
                     config["lr_scheduler"]
                 ),
                 on_change=_sync_fields_to_json, args=(run.run_id,),
+                help=(
+                    "Cómo decae la tasa de aprendizaje tras el warmup: cosine (curva "
+                    "suave, la más usada), constant (fija en lr), linear (línea "
+                    "recta), cosine_with_restarts (repite la curva varias veces, ver "
+                    "'LR restarts') o step (baja en saltos)."
+                ),
             )
             st.number_input(
                 "LR restarts (cosine_with_restarts only)", min_value=1, step=1,
                 value=config["lr_num_cycles"], key=_field_key(run.run_id, "lr_num_cycles"),
                 on_change=_sync_fields_to_json, args=(run.run_id,),
+                help=(
+                    "Solo aplica con cosine_with_restarts: cuántas veces se repite "
+                    "el ciclo de subida/bajada de la tasa de aprendizaje. Más ciclos "
+                    "dan más 'reinicios' (más exploración, afinado final menos "
+                    "suave); sin efecto con otros schedulers."
+                ),
             )
 
         with st.container(horizontal=True):
@@ -256,17 +320,36 @@ def _render_launch_form(run: IngestionRun, latest: training_repo.TrainingRun | N
                 key=_field_key(run.run_id, "timestep_weighting"),
                 index=["none", "bell", "half_bell"].index(config["timestep_weighting"]),
                 on_change=_sync_fields_to_json, args=(run.run_id,),
+                help=(
+                    "Cómo se pondera la pérdida según el nivel de ruido de cada "
+                    "muestra: none pondera igual todos los niveles, bell da más peso "
+                    "a niveles intermedios, half_bell hace lo mismo solo en la mitad "
+                    "inferior. Los pesos están normalizados para no alterar la tasa "
+                    "de aprendizaje efectiva."
+                ),
             )
             st.number_input(
                 "Noise offset", min_value=0.0, step=0.01, format="%.3f",
                 value=config["noise_offset"], key=_field_key(run.run_id, "noise_offset"),
                 on_change=_sync_fields_to_json, args=(run.run_id,),
+                help=(
+                    "Agrega un desplazamiento constante al ruido de entrenamiento. "
+                    "Desaconsejado para este modelo (usa rectified flow, donde el "
+                    "ruido puro ya es la distribución esperada) — se deja en 0 salvo "
+                    "que se replique una configuración externa que lo use."
+                ),
             )
             st.number_input(
                 "Caption dropout rate", min_value=0.0, max_value=1.0, step=0.01, format="%.2f",
                 value=config["caption_dropout_rate"],
                 key=_field_key(run.run_id, "caption_dropout_rate"),
                 on_change=_sync_fields_to_json, args=(run.run_id,),
+                help=(
+                    "Probabilidad de que, en un micro-paso, se use el prompt vacío "
+                    "en vez del caption real. Subirlo mejora la fidelidad al prompt "
+                    "en inferencia (como classifier-free guidance) pero reduce la "
+                    "señal de aprendizaje del caption en cada paso."
+                ),
             )
 
         if config["noise_offset"] > 0:
