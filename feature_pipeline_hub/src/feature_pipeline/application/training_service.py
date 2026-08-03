@@ -51,20 +51,20 @@ class TrainingConfig(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    total_steps: int = Field(default=1200, gt=0)
-    lr: float = Field(default=1e-4, gt=0)
-    lora_rank: int = Field(default=16, gt=0)
-    lora_alpha: int = Field(default=32, gt=0)
+    total_steps: int = Field(default=3000, gt=0)
+    lr: float = Field(default=1.5e-4, gt=0)
+    lora_rank: int = Field(default=32, gt=0)
+    lora_alpha: int = Field(default=16, gt=0)
     batch_size: int = Field(default=1, gt=0)
     grad_accum_steps: int = Field(default=4, gt=0)
-    save_every: int = Field(default=25, gt=0)
+    save_every: int = Field(default=300, gt=0)
     seed: int = Field(default=42, ge=0)
     warmup_steps: int = Field(default=100, ge=0)
     lr_scheduler: Literal["cosine", "constant", "linear", "cosine_with_restarts", "step"] = "cosine"
     lr_num_cycles: int = Field(default=3, gt=0)
     timestep_weighting: Literal["none", "bell", "half_bell"] = "none"
     noise_offset: float = Field(default=0.0, ge=0.0)
-    caption_dropout_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    caption_dropout_rate: float = Field(default=0.05, ge=0.0, le=1.0)
 
 
 def merge_training_config_overrides(
