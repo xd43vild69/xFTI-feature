@@ -15,7 +15,17 @@ import state
 import streamlit as st
 from components import context_bar
 
-st.set_page_config(page_title="FTI Feature Pipeline Hub", layout="wide")
+st.set_page_config(
+    page_title="FTI Feature Pipeline Hub",
+    icon="🤖",
+    layout="wide",
+    initial_sidebar_state="expanded",
+    menu_items={
+        "Get Help": "https://github.com/xd43vild69/xFTI-feature",
+        "Report a bug": "https://github.com/xd43vild69/xFTI-feature/issues",
+        "About": "Feature Pipeline Hub — end-to-end LoRA training dataset curation & training execution",
+    },
+)
 
 context_bar.render()
 
