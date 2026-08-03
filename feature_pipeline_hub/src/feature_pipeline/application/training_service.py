@@ -67,6 +67,21 @@ class TrainingConfig(BaseModel):
     caption_dropout_rate: float = Field(default=0.0, ge=0.0, le=1.0)
 
 
+def merge_training_config_overrides(
+    current: dict, overrides: dict
+) -> tuple[dict, list[str]]:
+    """Merge a pasted JSON blueprint onto `current`, validated via TrainingConfig's own bounds.
+
+    Returns (new_config_dict, ignored_extra_keys). Raises pydantic.ValidationError if a
+    known field's value has the wrong type or is out of bounds — callers should reject the
+    whole apply and surface that message rather than commit a partially-invalid config.
+    """
+    known = set(TrainingConfig.model_fields)
+    extra_keys = sorted(set(overrides) - known)
+    merged = {**current, **{k: v for k, v in overrides.items() if k in known}}
+    return TrainingConfig(**merged).model_dump(), extra_keys
+
+
 class PrecacheFailed(RuntimeError):
     """Pre-cache exited non-zero or timed out; the caller should not launch training."""
 

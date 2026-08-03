@@ -7,11 +7,13 @@ page works the same whether it's the tab that launched the run or a fresh
 browser session hours later.
 """
 
+import json
 from contextlib import contextmanager
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+from pydantic import ValidationError
 
 import state
 from feature_pipeline.application import training_service
@@ -30,6 +32,63 @@ def _db():
         yield conn
     finally:
         conn.close()
+
+
+def _launch_config_state(run_id: str) -> dict:
+    key = f"train_launch_config_{run_id}"
+    if key not in st.session_state:
+        st.session_state[key] = training_service.TrainingConfig().model_dump()
+    return st.session_state[key]
+
+
+def _field_key(run_id: str, name: str) -> str:
+    version = st.session_state.get(f"train_launch_field_version_{run_id}", 0)
+    return f"train_field_{name}_v{version}"
+
+
+def _json_key(run_id: str) -> str:
+    version = st.session_state.get(f"train_launch_json_version_{run_id}", 0)
+    return f"train_json_v{version}"
+
+
+def _bump(key: str) -> None:
+    st.session_state[key] = st.session_state.get(key, 0) + 1
+
+
+def _sync_fields_to_json(run_id: str) -> None:
+    """on_change callback for every field widget: fold its new value into the
+    canonical config and force the JSON tab's textarea to remount with it."""
+    config = _launch_config_state(run_id)
+    for name in training_service.TrainingConfig.model_fields:
+        widget_key = _field_key(run_id, name)
+        if widget_key in st.session_state:
+            config[name] = st.session_state[widget_key]
+    _bump(f"train_launch_json_version_{run_id}")
+    st.session_state[f"train_launch_json_error_{run_id}"] = None
+
+
+def _sync_json_to_fields(run_id: str) -> None:
+    """on_change callback for the JSON textarea: parse, validate, merge, and force
+    the field widgets to remount with the result — or leave everything untouched
+    and surface an error if the pasted text doesn't parse/validate."""
+    raw = st.session_state[_json_key(run_id)]
+    error_key = f"train_launch_json_error_{run_id}"
+    try:
+        overrides = json.loads(raw)
+        if not isinstance(overrides, dict):
+            raise ValueError("Blueprint must be a JSON object of field: value pairs.")
+        config = _launch_config_state(run_id)
+        new_config, extra_keys = training_service.merge_training_config_overrides(
+            config, overrides
+        )
+    except (json.JSONDecodeError, ValueError, ValidationError) as exc:
+        st.session_state[error_key] = f"Invalid JSON blueprint: {exc}"
+        return
+    config.update(new_config)
+    st.session_state[error_key] = (
+        f"Ignored unknown field(s): {', '.join(extra_keys)}" if extra_keys else None
+    )
+    _bump(f"train_launch_field_version_{run_id}")
 
 
 def render() -> None:
@@ -123,59 +182,120 @@ def _render_launch_form(run: IngestionRun, latest: training_repo.TrainingRun | N
         _render_resume_form(run, resume_points)
         st.markdown("**Start a new run**")
 
-    with st.container(horizontal=True):
-        total_steps = st.number_input("Total steps", min_value=1, value=1200, step=100)
-        lr = st.number_input("Learning rate", min_value=0.0, value=1e-4, step=1e-5, format="%.6f")
-        lora_rank = st.number_input("LoRA rank", min_value=1, value=16, step=1)
-        lora_alpha = st.number_input("LoRA alpha", min_value=1, value=32, step=1)
+    config = _launch_config_state(run.run_id)
+    form_tab, json_tab = st.tabs(["Form", "JSON"])
 
-    with st.container(horizontal=True):
-        batch_size = st.number_input("Batch size", min_value=1, value=1, step=1)
-        grad_accum_steps = st.number_input("Grad accumulation steps", min_value=1, value=4, step=1)
-        save_every = st.number_input("Save every", min_value=1, value=25, step=25)
-        seed = st.number_input("Seed", min_value=0, value=42, step=1)
+    with form_tab:
+        with st.container(horizontal=True):
+            st.number_input(
+                "Total steps", min_value=1, step=100,
+                value=config["total_steps"], key=_field_key(run.run_id, "total_steps"),
+                on_change=_sync_fields_to_json, args=(run.run_id,),
+            )
+            st.number_input(
+                "Learning rate", min_value=0.0, step=1e-5, format="%.6f",
+                value=config["lr"], key=_field_key(run.run_id, "lr"),
+                on_change=_sync_fields_to_json, args=(run.run_id,),
+            )
+            st.number_input(
+                "LoRA rank", min_value=1, step=1,
+                value=config["lora_rank"], key=_field_key(run.run_id, "lora_rank"),
+                on_change=_sync_fields_to_json, args=(run.run_id,),
+            )
+            st.number_input(
+                "LoRA alpha", min_value=1, step=1,
+                value=config["lora_alpha"], key=_field_key(run.run_id, "lora_alpha"),
+                on_change=_sync_fields_to_json, args=(run.run_id,),
+            )
 
-    with st.container(horizontal=True):
-        warmup_steps = st.number_input("Warmup steps", min_value=0, value=100, step=10)
-        lr_scheduler = st.selectbox(
-            "LR scheduler", ["cosine", "constant", "linear", "cosine_with_restarts", "step"]
-        )
-        lr_num_cycles = st.number_input(
-            "LR restarts (cosine_with_restarts only)", min_value=1, value=3, step=1
-        )
+        with st.container(horizontal=True):
+            st.number_input(
+                "Batch size", min_value=1, step=1,
+                value=config["batch_size"], key=_field_key(run.run_id, "batch_size"),
+                on_change=_sync_fields_to_json, args=(run.run_id,),
+            )
+            st.number_input(
+                "Grad accumulation steps", min_value=1, step=1,
+                value=config["grad_accum_steps"], key=_field_key(run.run_id, "grad_accum_steps"),
+                on_change=_sync_fields_to_json, args=(run.run_id,),
+            )
+            st.number_input(
+                "Save every", min_value=1, step=25,
+                value=config["save_every"], key=_field_key(run.run_id, "save_every"),
+                on_change=_sync_fields_to_json, args=(run.run_id,),
+            )
+            st.number_input(
+                "Seed", min_value=0, step=1,
+                value=config["seed"], key=_field_key(run.run_id, "seed"),
+                on_change=_sync_fields_to_json, args=(run.run_id,),
+            )
 
-    with st.container(horizontal=True):
-        timestep_weighting = st.selectbox("Timestep weighting", ["none", "bell", "half_bell"])
-        noise_offset = st.number_input(
-            "Noise offset", min_value=0.0, value=0.0, step=0.01, format="%.3f"
-        )
-        caption_dropout_rate = st.number_input(
-            "Caption dropout rate", min_value=0.0, max_value=1.0, value=0.0, step=0.01, format="%.2f"
-        )
+        with st.container(horizontal=True):
+            st.number_input(
+                "Warmup steps", min_value=0, step=10,
+                value=config["warmup_steps"], key=_field_key(run.run_id, "warmup_steps"),
+                on_change=_sync_fields_to_json, args=(run.run_id,),
+            )
+            st.selectbox(
+                "LR scheduler", ["cosine", "constant", "linear", "cosine_with_restarts", "step"],
+                key=_field_key(run.run_id, "lr_scheduler"),
+                index=["cosine", "constant", "linear", "cosine_with_restarts", "step"].index(
+                    config["lr_scheduler"]
+                ),
+                on_change=_sync_fields_to_json, args=(run.run_id,),
+            )
+            st.number_input(
+                "LR restarts (cosine_with_restarts only)", min_value=1, step=1,
+                value=config["lr_num_cycles"], key=_field_key(run.run_id, "lr_num_cycles"),
+                on_change=_sync_fields_to_json, args=(run.run_id,),
+            )
 
-    if noise_offset > 0:
-        st.caption(
-            ":material/warning: noise_offset is discouraged under rectified flow "
-            "(Krea2's own math_ops.py docstring) — usually leave at 0 for this model."
+        with st.container(horizontal=True):
+            st.selectbox(
+                "Timestep weighting", ["none", "bell", "half_bell"],
+                key=_field_key(run.run_id, "timestep_weighting"),
+                index=["none", "bell", "half_bell"].index(config["timestep_weighting"]),
+                on_change=_sync_fields_to_json, args=(run.run_id,),
+            )
+            st.number_input(
+                "Noise offset", min_value=0.0, step=0.01, format="%.3f",
+                value=config["noise_offset"], key=_field_key(run.run_id, "noise_offset"),
+                on_change=_sync_fields_to_json, args=(run.run_id,),
+            )
+            st.number_input(
+                "Caption dropout rate", min_value=0.0, max_value=1.0, step=0.01, format="%.2f",
+                value=config["caption_dropout_rate"],
+                key=_field_key(run.run_id, "caption_dropout_rate"),
+                on_change=_sync_fields_to_json, args=(run.run_id,),
+            )
+
+        if config["noise_offset"] > 0:
+            st.caption(
+                ":material/warning: noise_offset is discouraged under rectified flow "
+                "(Krea2's own math_ops.py docstring) — usually leave at 0 for this model."
+            )
+
+    with json_tab:
+        st.text_area(
+            "Hyperparameter blueprint (JSON)",
+            value=json.dumps(config, indent=2),
+            key=_json_key(run.run_id),
+            height=320,
+            on_change=_sync_json_to_fields, args=(run.run_id,),
         )
+        error = st.session_state.get(f"train_launch_json_error_{run.run_id}")
+        if error:
+            if error.startswith("Ignored unknown"):
+                st.warning(error)
+            else:
+                st.error(error)
 
     if st.button("Start training", icon=":material/play_arrow:"):
-        config = training_service.TrainingConfig(
-            total_steps=int(total_steps),
-            lr=float(lr),
-            lora_rank=int(lora_rank),
-            lora_alpha=int(lora_alpha),
-            batch_size=int(batch_size),
-            grad_accum_steps=int(grad_accum_steps),
-            save_every=int(save_every),
-            seed=int(seed),
-            warmup_steps=int(warmup_steps),
-            lr_scheduler=lr_scheduler,
-            lr_num_cycles=int(lr_num_cycles),
-            timestep_weighting=timestep_weighting,
-            noise_offset=float(noise_offset),
-            caption_dropout_rate=float(caption_dropout_rate),
-        )
+        try:
+            validated_config = training_service.TrainingConfig(**config)
+        except ValidationError as exc:
+            st.error(str(exc))
+            return
         with st.spinner("Pre-caching dataset…"):
             with _db() as conn:
                 try:
@@ -184,7 +304,7 @@ def _render_launch_form(run: IngestionRun, latest: training_repo.TrainingRun | N
                         dataset_run_id=run.run_id,
                         dataset_name=run.concept.concept_name,
                         trigger_word=run.concept.trigger_word,
-                        config=config,
+                        config=validated_config,
                     )
                 except training_service.PrecacheFailed as exc:
                     st.error(str(exc))
