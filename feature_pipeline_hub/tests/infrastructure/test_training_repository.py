@@ -6,6 +6,7 @@ from feature_pipeline.infrastructure.training_repository import (
     find_running_training_run,
     get_training_run,
     list_training_runs,
+    record_train_log_metrics,
     update_training_run_status,
 )
 
@@ -111,6 +112,8 @@ def test_a_fresh_run_has_no_telemetry_yet(conn):
     assert run.gpu_seconds is None
     assert run.cost_estimate is None
     assert run.error_message == ""
+    assert run.steps_executed is None
+    assert run.metrics == {}
 
 
 def test_status_update_can_attach_telemetry(conn):
@@ -138,3 +141,44 @@ def test_status_update_can_attach_an_error_message(conn):
     update_training_run_status(conn, training_run_id, "failed", error_message="CUDA OOM")
 
     assert get_training_run(conn, training_run_id).error_message == "CUDA OOM"
+
+
+def test_train_log_metrics_round_trip(conn):
+    training_run_id = _create(conn)
+
+    record_train_log_metrics(
+        conn, training_run_id, steps_executed=1180, metrics={"final_loss_avg": 0.08}
+    )
+
+    run = get_training_run(conn, training_run_id)
+    assert run.steps_executed == 1180
+    assert run.metrics == {"final_loss_avg": 0.08}
+
+
+def test_a_later_status_change_does_not_erase_the_metrics(conn):
+    # update_training_run_status writes every telemetry column from its keyword
+    # defaults, so folding these two in as more arguments would have meant any bare
+    # status change silently nulled them. They get their own statement instead.
+    training_run_id = _create(conn)
+    record_train_log_metrics(
+        conn, training_run_id, steps_executed=1180, metrics={"final_loss_avg": 0.08}
+    )
+
+    update_training_run_status(conn, training_run_id, "stopped")
+
+    run = get_training_run(conn, training_run_id)
+    assert run.steps_executed == 1180
+    assert run.metrics == {"final_loss_avg": 0.08}
+
+
+def test_an_unreadable_metrics_blob_degrades_to_empty_rather_than_raising(conn):
+    # One corrupt row must not break list_training_runs for every run on the page.
+    training_run_id = _create(conn)
+    with conn:
+        conn.execute(
+            "UPDATE training_runs SET metrics_json = ? WHERE training_run_id = ?",
+            ("not json at all", training_run_id),
+        )
+
+    assert get_training_run(conn, training_run_id).metrics == {}
+    assert len(list_training_runs(conn)) == 1

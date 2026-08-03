@@ -11,7 +11,18 @@ The application is organized into **five sequential pipeline steps** plus a stan
 ### 📊 Metrics: Cross-Dataset Health & Pipeline Observability
 * **Fleet Inventory**: A sortable table across *every* dataset — imported date, image/active/excluded/duplicate counts, missing-description count, invalid count, and median sharpness — plus headline totals (datasets, total images, active images, datasets with issues). Duplicate and sharpness figures are read from each dataset's last stored Quality-step verdict rather than recomputed live.
 * **Per-Run Pipeline Telemetry**: Duration, error count, and throughput for each step (Import, Recaption, Quality, Export) of the active run, joined with its matching Training run (status, duration, GPU-seconds).
-* **Cost Tiles**: Ingestion cost, training cost, and total cost estimates (`st.metric` tiles) plus a GPU-hours caption, computed from GPU-seconds emitted by the training/pre-cache workers and an hourly rate you configure (see `FTI_GPU_HOURLY_RATE` below).
+* **Training Metrics—Real Execution Data**: The Training row now reports **actual steps executed** (read from `train_log.csv`) rather than the configured target, correcting a longstanding issue where a run that crashed at step 400 of 3000 was reported as "3000 steps complete." Includes:
+  * **Steps executed vs. target** — e.g., "400 / 3000 steps" when progress stalled, or "—" when no log is available.
+  * **Completion percentage** — clamped to 100% if the run overshot its own target (possible after a resume).
+  * **Wall-clock throughput** — seconds per step, computed from the process's elapsed time including model load and checkpointing.
+  * **Four detailed tabs** (expanded view):
+    * **Progress**: Steps, epochs, updates, and loss metrics (final, best, first, trend). Loss is dominated by the noise level sampled each step, not by model quality, so it tracks convergence within a run but not quality across runs.
+    * **Time**: Wall clock, seconds/step, per-step timing from the CSV, and peak allocated VRAM (cumulative over the process; read lower than `nvidia-smi`).
+    * **Dataset & config**: Active images, images-per-epoch estimate (derived from sampler epochs and batch size), resolution buckets actually trained, and all hyperparameters from the most recent launch.
+    * **Health**: Skipped optimizer updates (non-finite gradients), loss spikes (heuristic), gradient norm distribution (p50, p95, max), and resume history (launches, steps rewound, seams where step rewound after a checkpoint restore).
+  * **Lineage aggregation**: A resume reuses the same `output_dir`, so the panel groups N training_runs rows that share one CSV; completion and metrics reflect the whole lineage, not one launch.
+  * **Honest missing data**: A run with no measurable log shows "—", never borrows the target from config. A stopped run that killed before exiting gracefully has full metrics from the CSV but no duration; a run the UI doesn't know about has nothing.
+* **Cost Tiles**: Ingestion cost, training cost, and total cost estimates (`st.metric` tiles) computed from GPU-seconds emitted by the training/pre-cache workers and an hourly rate you configure (see `FTI_GPU_HOURLY_RATE` below). Note: GPU-seconds is wall-clock time the process held the GPU, not measured utilization.
 * Not gated behind an active run — the fleet inventory half is visible with no dataset selected.
 
 ### 1. 📥 Step 1: Import & Ingestion
@@ -91,17 +102,20 @@ The application is organized into **five sequential pipeline steps** plus a stan
   2. **Training Stage (Detached Process)**: Runs `workers/train_worker.py` in a detached process group (`start_new_session=True`). Continues running in the background even if Streamlit is closed or restarted.
 * **Real-Time Monitoring Dashboard**:
   * Auto-refreshing UI fragment (`@st.fragment(run_every="5s")`) displaying live training loss curves (`train_log.csv`), stdout log tailing, elapsed duration, and a running cost estimate once GPU-seconds are available.
-  * **Stop Training**: Send SIGINT for graceful checkpoint saving before escalating to process termination.
-  * Full run execution history tracked in SQLite (`training_runs` table), including GPU-seconds and cost estimate backfilled once the process exits.
+  * **Stop Training**: Send SIGINT for graceful checkpoint saving before escalating to process termination. Metrics (steps executed, loss, gradient health) are persisted immediately, so a gracefully stopped run has full observability even though it did not reach the target.
+  * Full run execution history tracked in SQLite (`training_runs` table), including steps executed, a snapshot of training metrics from `train_log.csv`, GPU-seconds, and cost estimate — all backfilled once the process exits. This enables the Metrics page to report honest numbers even after the training runtime directory is reclaimed.
 
 ---
 
 ## 🔭 Observability & Telemetry
 
-Two independent mechanisms feed the Metrics page and keep it honest without the UI having to poll a live process:
+Three independent mechanisms feed the Metrics page and keep it honest without the UI having to poll a live process:
 
 * **Step telemetry** (`ui/step_telemetry.py`): each UI step (Import, Recaption, Quality, Export) times itself and records duration + error count into that run's `ingestion_runs` row.
+* **Training log parsing** (`domain/train_log.py`): pure parsing and aggregation of `train_log.csv` (written by the trainer with one row flushed per optimizer update). Tolerates missing columns (logs predating `secs` and `vram_peak_gb`), non-monotonic step numbers (resume seams where training rewound), and torn final lines (killed mid-write). Computes: steps executed (max step), loss trend, epoch distribution, gradient health (skipped updates, norm percentiles), resolution bucket mix, and learned hyperparameters (LR peak/final). Served by `training_service.read_train_log_summary()` and aggregated across resume lineages by `training_metrics_service`.
 * **Worker lifecycle events**: `workers/precache_worker.py` and `workers/train_worker.py` are ported from the upstream LoRAlab project and are never instrumented directly — `workers/_telemetry.py` wraps only their `__main__` entrypoints from the outside, emitting one structured JSON line per lifecycle transition (`worker_started` / `worker_finished` / `worker_failed`, with duration and GPU-seconds) to the same stdout the training log already streams to. `training_runner.py` reads the last ~4KB of a (possibly multi-hour) log file to find that final line cheaply, and `training_service.finalize_dead_run()` uses it to backfill `training_runs.gpu_seconds` / `cost_estimate`.
+  * **Stopped runs get metrics too**: `stop_training` reads the CSV and persists the summary immediately (not waiting for a lifecycle event), so a gracefully stopped run has steps_executed and full health metrics even though `finalize_dead_run` will never see it.
+  * **Persisted snapshots**: The training metrics summary is stored as JSON in `training_runs.metrics_json` when a run finalizes, so the panel can still report real numbers even after `training_runtime/` is deleted. Live CSV reads take precedence (covering the whole resume lineage), falling back to stored snapshots if the file is gone.
 
 Recaptioning uses a related but separate JSON-lines protocol (`LoadedEvent` / `CaptionEvent` / `ErrorEvent` / `DoneEvent`) defined in `domain/worker_contracts.py`, streamed live rather than tailed after the fact, since that worker runs blocking in the foreground.
 
@@ -211,6 +225,7 @@ feature_pipeline_hub/
 │       │   ├── validators.py      # Extension, resolution & caption validation rules
 │       │   ├── naming.py          # Concept-name slugging & standardized image filenames
 │       │   ├── worker_contracts.py# Pydantic schemas for worker settings-in / events-out
+│       │   ├── train_log.py       # Parsing & summarizing train_log.csv (tolerates resumes & torn rows)
 │       │   └── cost.py            # GPU-seconds → estimated cost
 │       ├── application/           # Business logic & services
 │       │   ├── dataset_service.py # Ingestion, append, revalidation & dataset assembly
@@ -218,6 +233,7 @@ feature_pipeline_hub/
 │       │   ├── image_service.py   # pHash, dHash, colorhash, thumbnail generator
 │       │   ├── quality_service.py # Perceptual deduplication, sharpness & quality metrics
 │       │   ├── inventory_service.py # Cross-dataset health inventory for the Metrics page
+│       │   ├── training_metrics_service.py # Training lineage aggregation (resumes grouped by output_dir)
 │       │   ├── recaption_service.py # AI recaptioning orchestrator
 │       │   ├── export_service.py  # Flat dataset exporter for training
 │       │   └── training_service.py# Pre-cache & training process orchestrator

@@ -274,6 +274,122 @@ def test_finalize_dead_run_falls_back_without_a_lifecycle_event(conn, tmp_path):
     assert updated.duration_seconds is None
 
 
+TRAIN_LOG_HEADER = (
+    "step,update,epoch,loss,loss_avg,grad_norm,lr,sigma,bucket_h,bucket_w,secs,vram_peak_gb"
+)
+
+
+def _write_train_log(output_dir: Path, steps) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    rows = [TRAIN_LOG_HEADER] + [
+        f"{step},{step // 4},1,0.100000,0.100000,1.0000,1.000e-04,0.5000,64,64,0.500,8.00"
+        for step in steps
+    ]
+    (output_dir / "train_log.csv").write_text("\n".join(rows) + "\n")
+
+
+def _train_run_with_log(conn, tmp_path, steps, *, log_name="log.txt"):
+    output_dir = tmp_path / "checkpoints"
+    if steps is not None:
+        _write_train_log(output_dir, steps)
+    log_path = tmp_path / log_name
+    log_path.touch()
+    training_run_id = repo.create_training_run(
+        conn, dataset_run_id="r1", kind="train", pid=99999,
+        log_path=str(log_path), config={"output_dir": str(output_dir), "total_steps": 1200},
+    )
+    return training_run_id, log_path, output_dir
+
+
+def test_read_train_log_summary_ignores_a_precache_run(conn, tmp_path):
+    # precache_status finalizes pre-cache rows through the same path, and those have
+    # no output_dir — the legacy fallback would point at an unrelated directory.
+    _write_train_log(tmp_path / "checkpoints", [4, 8])
+    training_run_id = repo.create_training_run(
+        conn, dataset_run_id="r1", kind="precache", pid=1,
+        log_path=str(tmp_path / "log.txt"), config={"output_dir": str(tmp_path / "checkpoints")},
+    )
+
+    run = repo.get_training_run(conn, training_run_id)
+    assert training_service.read_train_log_summary(run) is None
+
+
+@pytest.mark.parametrize("content", [None, "", TRAIN_LOG_HEADER + "\n"])
+def test_read_train_log_summary_returns_none_when_there_is_nothing_to_read(
+    conn, tmp_path, content
+):
+    training_run_id, _, output_dir = _train_run_with_log(conn, tmp_path, None)
+    if content is not None:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "train_log.csv").write_text(content)
+
+    run = repo.get_training_run(conn, training_run_id)
+    assert training_service.read_train_log_summary(run) is None
+
+
+def test_finalize_dead_run_records_real_steps_even_with_no_lifecycle_event(conn, tmp_path):
+    """The killed-run case, and the reason the CSV is read before the early return.
+
+    A process killed outright prints no worker_finished line, so there is no
+    telemetry to recover — but krea2.metrics flushes every row as it writes it, so
+    the CSV survives intact. That is exactly the run whose real step count matters.
+    """
+    training_run_id, log_path, _ = _train_run_with_log(conn, tmp_path, range(4, 401, 4))
+    log_path.write_text("free-text output, killed before it could finish\n")
+    run = repo.get_training_run(conn, training_run_id)
+
+    training_service.finalize_dead_run(conn, run, fallback_status="failed")
+
+    updated = repo.get_training_run(conn, training_run_id)
+    assert updated.status == "failed"
+    assert updated.duration_seconds is None      # genuinely unknown
+    assert updated.steps_executed == 400         # but this is not
+    assert updated.metrics["updates_logged"] == 100
+
+
+def test_finalize_dead_run_stores_metrics_alongside_the_lifecycle_telemetry(conn, tmp_path):
+    training_run_id, log_path, _ = _train_run_with_log(conn, tmp_path, range(4, 1201, 4))
+    log_path.write_text(
+        '{"event": "worker_finished", "worker": "train", "duration_seconds": 600.0, '
+        '"gpu_seconds": 600.0}\n'
+    )
+    run = repo.get_training_run(conn, training_run_id)
+
+    training_service.finalize_dead_run(conn, run, fallback_status="failed")
+
+    updated = repo.get_training_run(conn, training_run_id)
+    assert updated.status == "completed"
+    assert updated.duration_seconds == 600.0
+    assert updated.steps_executed == 1200
+
+
+def test_finalize_dead_run_on_a_precache_row_leaves_the_metrics_alone(conn, tmp_path):
+    log_path = tmp_path / "log.txt"
+    log_path.write_text("nothing structured here\n")
+    training_run_id = repo.create_training_run(
+        conn, dataset_run_id="r1", kind="precache", pid=1, log_path=str(log_path), config={}
+    )
+    run = repo.get_training_run(conn, training_run_id)
+
+    training_service.finalize_dead_run(conn, run, fallback_status="failed")
+
+    assert repo.get_training_run(conn, training_run_id).steps_executed is None
+
+
+def test_stopping_a_run_records_how_far_it_got(conn, tmp_path, monkeypatch):
+    # A stopped run leaves 'running' at once, so finalize_dead_run never revisits
+    # it — whatever is written here is all it will ever have.
+    monkeypatch.setattr(training_service.training_runner, "stop_process", lambda pid: True)
+    training_run_id, _, _ = _train_run_with_log(conn, tmp_path, range(4, 401, 4))
+
+    training_service.stop_training(conn, training_run_id)
+
+    updated = repo.get_training_run(conn, training_run_id)
+    assert updated.status == "stopped"
+    assert updated.steps_executed == 400
+    assert updated.duration_seconds is not None and updated.duration_seconds >= 0
+
+
 def test_dataset_and_cache_dirs_are_scoped_under_the_runtime(fake_model_dir):
     dataset_dir = training_service.dataset_dir_for("my_concept")
     cache_dir = training_service.cache_dir_for("my_concept")

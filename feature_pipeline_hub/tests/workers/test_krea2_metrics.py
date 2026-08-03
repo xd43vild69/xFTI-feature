@@ -115,6 +115,19 @@ def sample_step(logs: CsvLogs, step: int, loss: float = 0.5) -> None:
                   seconds=1.0, vram_peak_gb=8.0)
 
 
+def test_the_hubs_copy_of_the_header_still_matches_this_one() -> None:
+    """The hub reads this CSV but cannot import this module.
+
+    `workers/` is not on the hub's sys.path and the training runtime is a separate
+    interpreter, so feature_pipeline.domain.train_log keeps its own copy of the
+    column list. This is the only place both sides are importable at once, so it
+    is the only place the duplication can be pinned.
+    """
+    from feature_pipeline.domain.train_log import TRAIN_LOG_COLUMNS
+
+    assert list(TRAIN_LOG_COLUMNS) == TRAIN_COLUMNS
+
+
 def test_writes_a_header_then_rows(tmp_path: Path) -> None:
     with CsvLogs(str(tmp_path)) as logs:
         sample_step(logs, 4)

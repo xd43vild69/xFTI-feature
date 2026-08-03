@@ -128,6 +128,15 @@ TRAINING_RUN_COLUMN_MIGRATIONS = {
     "gpu_seconds": "REAL",
     "cost_estimate": "REAL",
     "error_message": "TEXT NOT NULL DEFAULT ''",
+    # A snapshot of domain.train_log.summarize() taken when the process was
+    # finalized. Persisted rather than re-read on demand because output_dir is
+    # shared across a resume lineage: once a later launch appends to the same
+    # train_log.csv, no amount of re-reading recovers where *this* launch ended.
+    # steps_executed gets its own column — it is the one figure the panel, the
+    # MCP server and any future query all want — and the rest ride along as one
+    # blob, the same shape config_json already has on this table.
+    "steps_executed": "INTEGER",
+    "metrics_json": "TEXT NOT NULL DEFAULT '{}'",
 }
 
 # Per-step telemetry for ingestion runs: durations, error counts, and a cost

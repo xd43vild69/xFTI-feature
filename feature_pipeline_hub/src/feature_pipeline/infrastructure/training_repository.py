@@ -7,7 +7,7 @@ can find a job's PID and log file after the browser closes and reopens.
 import json
 import sqlite3
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 
@@ -26,6 +26,14 @@ class TrainingRun:
     gpu_seconds: float | None = None
     cost_estimate: float | None = None
     error_message: str = ""
+    # What the run's train_log.csv said when it was finalized. `metrics` is a plain
+    # dict, not domain.train_log.TrainLogSummary, for three reasons: it keeps this
+    # layer from importing the domain's shape, a blob written by an older version
+    # can never fail validation and break the page it appears on, and
+    # mcp_server._training_run_dict runs dataclasses.asdict over these rows —
+    # which leaves a model untouched and then fails to serialize it.
+    steps_executed: int | None = None
+    metrics: dict = field(default_factory=dict)
 
 
 def create_training_run(
@@ -99,6 +107,31 @@ def update_training_run_status(
         )
 
 
+def record_train_log_metrics(
+    conn: sqlite3.Connection,
+    training_run_id: str,
+    *,
+    steps_executed: int | None,
+    metrics: dict,
+) -> None:
+    """Attach a train_log.csv snapshot to a run, touching nothing else.
+
+    Deliberately not folded into update_training_run_status as more keyword
+    arguments: that one writes every telemetry column from its defaults on every
+    call, so any later bare status change would erase whatever was stored here.
+    A separate statement makes these columns immune to that by construction.
+    """
+    with conn:
+        conn.execute(
+            """
+            UPDATE training_runs
+            SET steps_executed = ?, metrics_json = ?
+            WHERE training_run_id = ?
+            """,
+            (steps_executed, json.dumps(metrics), training_run_id),
+        )
+
+
 def get_training_run(conn: sqlite3.Connection, training_run_id: str) -> TrainingRun | None:
     row = conn.execute(
         "SELECT * FROM training_runs WHERE training_run_id = ?", (training_run_id,)
@@ -147,4 +180,21 @@ def _row_to_training_run(row: sqlite3.Row) -> TrainingRun:
         gpu_seconds=row["gpu_seconds"],
         cost_estimate=row["cost_estimate"],
         error_message=row["error_message"],
+        steps_executed=row["steps_executed"],
+        metrics=_load_metrics(row["metrics_json"]),
     )
+
+
+def _load_metrics(raw: str | None) -> dict:
+    """The stored metrics blob, or an empty one if it cannot be read.
+
+    Degrading to "no metrics" rather than raising keeps a single corrupt row from
+    breaking list_training_runs for every run on the page.
+    """
+    if not raw:
+        return {}
+    try:
+        loaded = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return loaded if isinstance(loaded, dict) else {}

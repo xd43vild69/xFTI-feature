@@ -15,6 +15,7 @@ from feature_pipeline.application import (
     dataset_service,
     image_service,
     inventory_service,
+    training_metrics_service,
     training_service,
 )
 from feature_pipeline.domain.models import (
@@ -27,6 +28,7 @@ from feature_pipeline.domain.models import (
 )
 from feature_pipeline.domain.naming import next_standard_index
 from feature_pipeline.infrastructure import ingestion_repository as repo
+from feature_pipeline.infrastructure import training_repository as training_repo
 from feature_pipeline.infrastructure import version_repository as version_repo
 from feature_pipeline.infrastructure.database import get_connection
 from feature_pipeline.infrastructure.storage import (
@@ -124,6 +126,50 @@ def dataset_inventory() -> list[DatasetHealth]:
     would repeat on every click of the Metrics page.
     """
     return _cached_inventory(_inventory_fingerprint())
+
+
+def step_telemetry(run_id: str) -> repo.StepTelemetry | None:
+    with _db() as conn:
+        return repo.get_step_telemetry(conn, run_id)
+
+
+def _training_fingerprint(run_id: str) -> tuple:
+    """Cheap key for the training metrics cache: changes exactly when they would.
+
+    The log's size and mtime cover a run still in flight (the file grows as it
+    trains), and the row count plus latest status cover a relaunch or a run being
+    finalized. Everything else about a lineage is immutable once written.
+    """
+    with _db() as conn:
+        runs = training_repo.list_training_runs(conn, dataset_run_id=run_id)
+    trains = [run for run in runs if run.kind == "train"]
+    if not trains:
+        return (run_id, 0, "", 0.0, 0)
+    csv_path = training_service.training_log_csv_path(trains[0])
+    try:
+        stat = csv_path.stat()
+        size, mtime = stat.st_size, stat.st_mtime
+    except OSError:
+        size, mtime = 0, 0.0
+    return (run_id, len(trains), trains[0].status, mtime, size)
+
+
+@st.cache_data(max_entries=4, show_spinner=False)
+def _cached_training_lineages(
+    fingerprint: tuple,
+) -> list[training_metrics_service.TrainingLineage]:
+    with _db() as conn:
+        return training_metrics_service.load_training_lineages(conn, fingerprint[0])
+
+
+def training_lineages(run_id: str) -> list[training_metrics_service.TrainingLineage]:
+    """Every training this dataset has been through, newest first.
+
+    Cached on the same principle as `dataset_inventory`: this parses train_log.csv,
+    which for a long run is six figures of rows, and Streamlit reruns the whole
+    script on every widget interaction.
+    """
+    return _cached_training_lineages(_training_fingerprint(run_id))
 
 
 def save_caption(sample_id: str, caption: str) -> None:

@@ -7,18 +7,19 @@ field falls back to the worker's own DEFAULTS, exactly as it does for a bare
 train_settings.json in LoRAlab (see `_cfg()` in train_worker.py).
 """
 
+import csv
 import re
 import sqlite3
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from feature_pipeline.domain import cost
+from feature_pipeline.domain import cost, train_log
 from feature_pipeline.domain.worker_contracts import PrecacheSettings, TrainSettings
 from feature_pipeline.infrastructure import training_repository as repo
 from feature_pipeline.infrastructure import training_runner
@@ -94,7 +95,15 @@ def finalize_dead_run(conn: sqlite3.Connection, run: repo.TrainingRun, *, fallba
     it as the source of truth for status, duration and cost — falling back to
     `fallback_status` with no telemetry if the process died too hard to print
     one (killed, machine restart, or a run launched before this existed).
+
+    The CSV is read first, and unconditionally. A killed run prints no lifecycle
+    line but — because krea2.metrics flushes every row as it writes it — still
+    leaves a complete train_log.csv, and that is exactly the run whose real step
+    count you most want to know. Doing this after the early return below would
+    skip it in precisely that case.
     """
+    _persist_train_log_metrics(conn, run)
+
     event = training_runner.read_lifecycle_event(run.log_path)
     if event is None:
         repo.update_training_run_status(conn, run.training_run_id, fallback_status)
@@ -335,12 +344,36 @@ def is_training_active(conn: sqlite3.Connection) -> bool:
 
 
 def stop_training(conn: sqlite3.Connection, training_run_id: str) -> None:
-    """Send SIGINT to a running job's process and mark its row 'stopped'."""
+    """Send SIGINT to a running job's process and mark its row 'stopped', with telemetry.
+
+    A stopped run leaves 'running' immediately, which means finalize_dead_run —
+    the only other place telemetry is written — never revisits it: is_training_active
+    and the progress panel both look for status 'running'. So whatever is recorded
+    here is all this run will ever have, and a deliberately stopped run is the very
+    case where "how far did it actually get" matters most.
+
+    The CSV is read straight after the signal without waiting for the process to
+    go: the per-row flush means everything but the single in-flight step is
+    already on disk. `duration_seconds` is measured hub-side, from launch to stop
+    request, rather than by the worker — a slightly different quantity from a
+    completed run's, and a much better one than NULL.
+    """
     run = repo.get_training_run(conn, training_run_id)
     if run is None:
         raise ValueError(f"No such training run: {training_run_id}")
     training_runner.stop_process(run.pid)
-    repo.update_training_run_status(conn, training_run_id, "stopped")
+
+    _persist_train_log_metrics(conn, run)
+
+    elapsed = (datetime.now(timezone.utc) - run.started_at).total_seconds()
+    repo.update_training_run_status(
+        conn,
+        training_run_id,
+        "stopped",
+        duration_seconds=elapsed,
+        gpu_seconds=elapsed,
+        cost_estimate=cost.estimate_cost(elapsed, cost.gpu_hourly_rate()),
+    )
 
 
 def _launch_precache(
@@ -632,3 +665,45 @@ def training_log_csv_path(training_run: repo.TrainingRun) -> Path:
     if output_dir:
         return Path(output_dir) / "train_log.csv"
     return Path(training_run.log_path).parent / "checkpoints" / "train_log.csv"
+
+
+def read_train_log_summary(
+    training_run: repo.TrainingRun,
+) -> train_log.TrainLogSummary | None:
+    """Summarise this run's train_log.csv, or None if there is nothing usable there.
+
+    The I/O half of domain.train_log: this finds and streams the file, the domain
+    decides what its numbers mean. Streamed rather than read whole because a run at
+    grad_accum_steps=1 leaves one row per step, which for a long run is six figures.
+
+    Every failure returns None and none of them raise, because every caller is
+    finishing a run and none of them can do anything useful with the exception: the
+    file is absent for a run that died before its first optimizer update, or whose
+    runtime directory has since been reclaimed, and the last line is routinely half
+    written when the process was killed mid-row.
+    """
+    if training_run.kind != "train":
+        # precache_status finalizes pre-cache runs through the same path, and those
+        # have no output_dir at all — the fallback would point somewhere arbitrary.
+        return None
+    try:
+        with training_log_csv_path(training_run).open(newline="", encoding="utf-8") as handle:
+            records = train_log.parse_rows(csv.reader(handle))
+    except (OSError, UnicodeDecodeError, csv.Error):
+        return None
+    return train_log.summarize(records) if records else None
+
+
+def _persist_train_log_metrics(
+    conn: sqlite3.Connection, training_run: repo.TrainingRun
+) -> None:
+    """Store what the run's CSV says, if it says anything."""
+    summary = read_train_log_summary(training_run)
+    if summary is None:
+        return
+    repo.record_train_log_metrics(
+        conn,
+        training_run.training_run_id,
+        steps_executed=summary.steps_executed,
+        metrics=summary.model_dump(mode="json"),
+    )
