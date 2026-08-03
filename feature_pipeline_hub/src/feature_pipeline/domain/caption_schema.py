@@ -18,6 +18,21 @@ plus an explicit prohibition, and then assembling the sentence here from the
 slots rather than letting the model write it. Ported from xLoralizerPro's
 backend/normalizer.py, where the schemas and their wording are already proven.
 
+One thing the subject schema does say out loud is which side a tattoo or scar is
+on, and from the subject's own point of view rather than the camera's. A mark the
+caption never locates is learned as "somewhere on an arm", which is how a hand
+tattoo comes out on the wrong hand at inference; naming the side conditions it on
+text, where it stays steerable, instead of leaving it to the trigger. Anatomical
+side rather than viewer side because that is the invariant: the same tattoo would
+swap labels between a front and a back view otherwise.
+
+That slot assumes the cached dataset is not mirrored. `flip_x` in
+precache_worker.py encodes the prompt once and reuses that one embedding for both
+an image and its `__flip` copy, so with mirroring on, every side the caption names
+would be asserted of both sides at once — worse than saying nothing. It defaults
+to off and the hub never sets it; if that ever changes, this slot has to go with
+it.
+
 Pure: no I/O, no model, no network. The worker only relays `instruction_for()`
 downstream and hands the raw reply back to `parse_slots`.
 """
@@ -38,7 +53,8 @@ Return ONLY a JSON object with these exact keys:
 - "pose": short phrase, e.g. "standing facing camera", "sitting, arms crossed"
 - "lighting": short phrase, e.g. "soft studio lighting", "harsh sunlight"
 - "tattoos_visible": true or false
-Do NOT describe facial features, hair, body type, or tattoo designs. No extra text."""
+- "asymmetric_marks": short phrase naming each tattoo, scar or birthmark that is on one side of the body and the side it is on from the subject's own point of view, not the viewer's, e.g. "tattoo on their left forearm", "scar above their right eyebrow", or "none"
+Do NOT describe facial features, hair, body type, or tattoo designs — say where a mark is and on which side, never what it depicts. No extra text."""
 
 LOCATION_INSTRUCTION = """Analyze this photo of a location for AI training captioning.
 Return ONLY a JSON object with these exact keys:
@@ -93,6 +109,7 @@ class SubjectSlots(_Slots):
     background: str = ""
     lighting: str = ""
     tattoos_visible: bool = False
+    asymmetric_marks: str = ""
 
     @field_validator("tattoos_visible", mode="before")
     @classmethod
@@ -166,7 +183,13 @@ def assemble_caption(slots: Slots) -> str:
     """
     if isinstance(slots, SubjectSlots):
         parts = [slots.shot, slots.pose, slots.clothing, slots.background, slots.lighting]
-        if slots.tattoos_visible:
+        # Last, and the located phrase wins: "tattoo on their left forearm" already
+        # says a tattoo is visible, so the flag only speaks when the model named no
+        # side — a mark it could see but not place is still worth conditioning on.
+        marks = _spoken(slots.asymmetric_marks)
+        if marks:
+            parts.append(marks)
+        elif slots.tattoos_visible:
             parts.append("visible tattoos")
     else:
         parts = [slots.time_of_day, slots.weather, slots.lighting, slots.perspective]

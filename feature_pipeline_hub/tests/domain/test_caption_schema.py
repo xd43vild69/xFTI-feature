@@ -43,6 +43,12 @@ def test_the_instructions_forbid_what_the_trigger_word_is_meant_to_learn():
     assert "Do NOT describe the permanent architectural features" in LOCATION_INSTRUCTION
 
 
+def test_the_subject_instruction_pins_laterality_to_the_subject_not_the_camera():
+    # Viewer-relative sides would swap on a photo taken from behind, labelling one
+    # tattoo both ways across a dataset — the exact confusion the slot exists to fix.
+    assert "from the subject's own point of view, not the viewer's" in SUBJECT_INSTRUCTION
+
+
 # --- assembly -----------------------------------------------------------------
 
 
@@ -74,6 +80,45 @@ def test_location_slots_assemble_in_a_fixed_order():
 def test_visible_tattoos_are_appended_only_when_the_flag_is_set():
     assert "visible tattoos" in assemble_caption(parse_slots(_subject(tattoos_visible=True), "subject"))
     assert "visible tattoos" not in assemble_caption(parse_slots(_subject(), "subject"))
+
+
+def test_the_side_a_mark_is_on_reaches_the_caption():
+    # The whole point of the slot: unlocated, a hand tattoo is learned as "on a
+    # hand" and comes out on either one at inference.
+    caption = assemble_caption(
+        parse_slots(
+            _subject(tattoos_visible=True, asymmetric_marks="tattoo on their left hand"),
+            "subject",
+        )
+    )
+
+    assert caption.endswith("tattoo on their left hand")
+
+
+def test_a_located_mark_replaces_the_generic_tattoo_phrase():
+    # "tattoo on their left hand, visible tattoos" says the same thing twice.
+    caption = assemble_caption(
+        parse_slots(
+            _subject(tattoos_visible=True, asymmetric_marks="tattoo on their left hand"),
+            "subject",
+        )
+    )
+
+    assert "visible tattoos" not in caption
+
+
+def test_a_mark_the_model_could_not_place_still_falls_back_to_the_flag():
+    caption = assemble_caption(
+        parse_slots(_subject(tattoos_visible=True, asymmetric_marks="none"), "subject")
+    )
+
+    assert caption.endswith("visible tattoos")
+
+
+def test_a_subject_with_no_marks_at_all_gets_neither_phrase():
+    caption = assemble_caption(parse_slots(_subject(asymmetric_marks="none"), "subject"))
+
+    assert caption.endswith("soft studio lighting")
 
 
 def test_empty_slots_are_skipped_without_leaving_dangling_commas():
