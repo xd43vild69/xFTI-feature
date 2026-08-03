@@ -68,6 +68,12 @@ class CheckpointManager:
     def adapter_path(self) -> str:
         return os.path.join(self.cfg.resume_dir, ADAPTER_FILENAME)
 
+    @property
+    def _checkpoint_prefix(self) -> str:
+        # Falls back to the historical name for the standalone workflow (outside
+        # the hub, cfg.checkpoint_prefix stays "" unless someone sets it by hand).
+        return self.cfg.checkpoint_prefix or "Krea2"
+
     def has_checkpoint(self) -> bool:
         return (os.path.exists(self.cfg.step_file)
                 and os.path.exists(self.cfg.optimizer_state_file)
@@ -212,7 +218,7 @@ class CheckpointManager:
             self._save_run_state(step, sampler, ema)
 
             path = os.path.join(self.cfg.output_dir,
-                                f"Krea2_LoRA_step_{step}.safetensors")
+                                f"{self._checkpoint_prefix}_step_{step}.safetensors")
             self._export(path, step, sampler, ema, num_images)
 
             # The commit: written last, so its presence implies everything above.
@@ -220,7 +226,7 @@ class CheckpointManager:
                 self.cfg.step_file,
                 lambda p: open(p, "w", encoding="utf-8").write(str(step)))
             checkpoints.rotate(self.cfg.output_dir, self.cfg.max_checkpoints_to_keep,
-                               log=self.log)
+                               self._checkpoint_prefix, log=self.log)
             self.log(f"✓ Checkpoint saved successfully at step / "
                      f"Checkpoint guardado en paso {step}: {path}")
         finally:
@@ -285,8 +291,8 @@ class CheckpointManager:
 
     def export_final(self, step: int, sampler: Any = None, ema: Any = None,
                      num_images: int | None = None) -> str:
-        """Write Krea2_FINAL_LoRA.safetensors — the run's deliverable."""
-        path = os.path.join(self.cfg.output_dir, "Krea2_FINAL_LoRA.safetensors")
+        """Write {prefix}_FINAL.safetensors — the run's deliverable."""
+        path = os.path.join(self.cfg.output_dir, f"{self._checkpoint_prefix}_FINAL.safetensors")
         self._export(path, step, sampler, ema, num_images)
         return path
 

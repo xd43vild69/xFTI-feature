@@ -20,6 +20,7 @@ VALID_TRAIN = {
     "cache_dir": "/cache/cats",
     "output_dir": "/runs/train-1/checkpoints",
     "trigger_word": "sks_cat",
+    "checkpoint_prefix": "cats",
     "total_steps": 1200,
     "lr": 1e-4,
     "lora_rank": 16,
@@ -28,6 +29,12 @@ VALID_TRAIN = {
     "grad_accum_steps": 4,
     "save_every": 25,
     "seed": 42,
+    "warmup_steps": 100,
+    "lr_scheduler": "cosine",
+    "lr_num_cycles": 3,
+    "timestep_weighting": "none",
+    "noise_offset": 0.0,
+    "caption_dropout_rate": 0.0,
 }
 
 

@@ -7,10 +7,14 @@ field falls back to the worker's own DEFAULTS, exactly as it does for a bare
 train_settings.json in LoRAlab (see `_cfg()` in train_worker.py).
 """
 
+import re
 import sqlite3
 import time
 import uuid
+from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -18,7 +22,7 @@ from feature_pipeline.domain import cost
 from feature_pipeline.domain.worker_contracts import PrecacheSettings, TrainSettings
 from feature_pipeline.infrastructure import training_repository as repo
 from feature_pipeline.infrastructure import training_runner
-from feature_pipeline.infrastructure.storage import training_runtime_dir
+from feature_pipeline.infrastructure.storage import training_runtime_dir, write_caption_sidecar
 
 WORKERS_DIR = Path(__file__).resolve().parents[3] / "workers"
 PRECACHE_SCRIPT = WORKERS_DIR / "precache_worker.py"
@@ -28,6 +32,13 @@ PRECACHE_SETTINGS_ENV = "PRECACHE_SETTINGS_PATH"  # name LoRAlab's own script re
 TRAIN_SETTINGS_ENV = "TRAIN_SETTINGS_PATH"
 
 PRECACHE_TIMEOUT_SECONDS = 20 * 60  # pre-cache is I/O + VAE-encode bound, minutes not hours
+
+# The three files krea2.state.CheckpointManager.has_checkpoint() requires before it will
+# restore anything. `current_step.txt` is written last (see that module's commit
+# protocol), so all three present means the checkpoint they describe is complete.
+STEP_FILE = "current_step.txt"
+OPTIMIZER_STATE_FILE = "optimizer.pt"
+RESUME_ADAPTER = Path("resume_checkpoint") / "adapter_model.safetensors"
 
 
 class TrainingConfig(BaseModel):
@@ -48,6 +59,12 @@ class TrainingConfig(BaseModel):
     grad_accum_steps: int = Field(default=4, gt=0)
     save_every: int = Field(default=25, gt=0)
     seed: int = Field(default=42, ge=0)
+    warmup_steps: int = Field(default=100, ge=0)
+    lr_scheduler: Literal["cosine", "constant", "linear", "cosine_with_restarts", "step"] = "cosine"
+    lr_num_cycles: int = Field(default=3, gt=0)
+    timestep_weighting: Literal["none", "bell", "half_bell"] = "none"
+    noise_offset: float = Field(default=0.0, ge=0.0)
+    caption_dropout_rate: float = Field(default=0.0, ge=0.0, le=1.0)
 
 
 class PrecacheFailed(RuntimeError):
@@ -89,6 +106,115 @@ def cache_dir_for(dataset_name: str) -> Path:
     return training_runtime_dir() / "cache" / dataset_name
 
 
+_VERSIONED_NAME = re.compile(r"^(.+)_v(\d+)$")
+
+
+@dataclass(frozen=True)
+class DatasetVersionConflict:
+    """A versioned dataset (`{prefix}_v{N}`) whose captions still say an earlier
+    sibling version's name — the usual cause is copying an older version's
+    images/captions forward to seed the new one instead of recapturing them.
+    """
+
+    current_name: str
+    stale_trigger_word: str
+    affected_files: int
+    suggested_next_version: str
+
+
+def _caption_files_containing_word(dataset_dir: Path, word: str) -> list[Path]:
+    pattern = re.compile(r"\b" + re.escape(word) + r"\b")
+    return [
+        p for p in sorted(dataset_dir.glob("*.txt"))
+        if pattern.search(p.read_text(encoding="utf-8"))
+    ]
+
+
+def _next_available_version(taken_versions: set[int], start_from: int) -> int:
+    """First version number >= start_from not already claimed by a sibling dataset.
+
+    Walks forward one at a time rather than returning max(taken) + 1, so a gap
+    (v1, v2, v4 on disk — v3 deleted or never used) is offered before jumping
+    past it to v5.
+    """
+    candidate = start_from
+    while candidate in taken_versions:
+        candidate += 1
+    return candidate
+
+
+def detect_dataset_version_conflict(dataset_name: str) -> DatasetVersionConflict | None:
+    """Look for a stale earlier-version name baked into `dataset_name`'s captions.
+
+    Only versioned names (`{prefix}_v{N}`) are considered. Sibling versions are
+    found on disk under training_runtime/datasets/ — same prefix, any version
+    number — which is what catches a dataset duplicated forward from an older
+    export: the folder is correctly named `{prefix}_v2`, but its .txt captions
+    still read `{prefix}_v1` because that text was copied along with the images.
+    Checks the most recent earlier sibling first, since that's the most likely
+    source of a forward-copy.
+    """
+    match = _VERSIONED_NAME.match(dataset_name)
+    if match is None:
+        return None
+    prefix, current_version_str = match.groups()
+    current_version = int(current_version_str)
+
+    dataset_dir = dataset_dir_for(dataset_name)
+    if not dataset_dir.is_dir():
+        return None
+
+    datasets_root = training_runtime_dir() / "datasets"
+    if not datasets_root.is_dir():
+        return None
+    sibling_pattern = re.compile(rf"^{re.escape(prefix)}_v(\d+)$")
+    sibling_versions = [
+        int(m.group(1))
+        for entry in datasets_root.iterdir()
+        if entry.is_dir() and (m := sibling_pattern.match(entry.name))
+    ]
+    if not sibling_versions:
+        return None
+
+    earlier_versions = sorted(
+        (v for v in sibling_versions if v != current_version), reverse=True
+    )
+    for version in earlier_versions:
+        candidate = f"{prefix}_v{version}"
+        affected = _caption_files_containing_word(dataset_dir, candidate)
+        if affected:
+            next_version = _next_available_version(
+                set(sibling_versions), current_version + 1
+            )
+            suggested_next_version = f"{prefix}_v{next_version}"
+            return DatasetVersionConflict(
+                current_name=dataset_name,
+                stale_trigger_word=candidate,
+                affected_files=len(affected),
+                suggested_next_version=suggested_next_version,
+            )
+    return None
+
+
+def update_captions_in_dataset_dir(dataset_dir: Path, old_word: str, new_word: str) -> int:
+    """Replace `old_word` with `new_word` (whole-word match) across every caption
+    under dataset_dir. Reuses storage.write_caption_sidecar so each rewrite gets
+    the same atomic-write-plus-one-time-backup guarantee as any other caption
+    edit — passing the .txt path itself as the "image path" is safe, since
+    `.with_suffix(".txt")` on an already-.txt path is a no-op. Returns how many
+    files actually changed.
+    """
+    pattern = re.compile(r"\b" + re.escape(old_word) + r"\b")
+    updated = 0
+    for txt_path in sorted(dataset_dir.glob("*.txt")):
+        text = txt_path.read_text(encoding="utf-8")
+        new_text = pattern.sub(new_word, text)
+        if new_text != text:
+            write_caption_sidecar(str(txt_path), new_text)
+            updated += 1
+    return updated
+
+
 def start_training(
     conn: sqlite3.Connection,
     *,
@@ -119,6 +245,7 @@ def start_training(
     return _launch_train(
         conn,
         dataset_run_id=dataset_run_id,
+        dataset_name=dataset_name,
         model_dir=model_dir,
         dataset_path=dataset_path,
         cache_dir=cache_dir,
@@ -291,6 +418,7 @@ def launch_train(
     return _launch_train(
         conn,
         dataset_run_id=dataset_run_id,
+        dataset_name=dataset_name,
         model_dir=model_dir,
         dataset_path=dataset_path,
         cache_dir=cache_dir,
@@ -299,10 +427,146 @@ def launch_train(
     )
 
 
+@dataclass(frozen=True)
+class ResumePoint:
+    """A previous train run whose on-disk state can be continued.
+
+    `step` is the last step the trainer committed, so a resumed run picks up at
+    `step + 1`. `total_steps` is what that run was originally aiming for — the UI
+    needs it because resuming at or past it is a no-op the trainer refuses.
+    """
+
+    training_run_id: str
+    output_dir: Path
+    step: int
+    total_steps: int
+    status: str
+    started_at: datetime
+    # Excluded from eq/hash: a frozen dataclass derives __hash__ from its compared
+    # fields, and a dict in there would make instances unhashable — which breaks the
+    # moment one is handed to a widget as an option. training_run_id identifies it.
+    config: dict = field(compare=False)
+
+
+class ResumeUnavailable(RuntimeError):
+    """The requested run has no restorable checkpoint, or nothing left to run."""
+
+
+def checkpoint_step(output_dir: Path) -> int | None:
+    """The step a run's checkpoint sits at, or None if there isn't a complete one.
+
+    Mirrors krea2.state.CheckpointManager.has_checkpoint() deliberately: this is
+    the hub's read-only preview of the decision the trainer will make for itself
+    once it starts, so the two must agree on what counts as restorable.
+    """
+    if not (output_dir / OPTIMIZER_STATE_FILE).is_file():
+        return None
+    if not (output_dir / RESUME_ADAPTER).is_file():
+        return None
+    try:
+        return int((output_dir / STEP_FILE).read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def find_resume_points(conn: sqlite3.Connection, dataset_run_id: str) -> list[ResumePoint]:
+    """Every train run of this dataset that still has a checkpoint on disk, newest first.
+
+    Driven by the `training_runs` rows rather than by scanning the runtime
+    directory, so each entry keeps the hyperparameters it was launched with —
+    resuming has to reuse them, since a changed rank or alpha makes the saved
+    adapter fail to load.
+    """
+    points: list[ResumePoint] = []
+    for run in repo.list_training_runs(conn, dataset_run_id=dataset_run_id):
+        if run.kind != "train" or run.status == "running":
+            continue
+        raw_output_dir = run.config.get("output_dir")
+        if not raw_output_dir:
+            continue
+        output_dir = Path(raw_output_dir)
+        step = checkpoint_step(output_dir)
+        if step is None:
+            continue
+        points.append(
+            ResumePoint(
+                training_run_id=run.training_run_id,
+                output_dir=output_dir,
+                step=step,
+                total_steps=int(run.config.get("total_steps") or 0),
+                status=run.status,
+                started_at=run.started_at,
+                config=run.config,
+            )
+        )
+    return points
+
+
+def resume_training(
+    conn: sqlite3.Connection,
+    *,
+    dataset_run_id: str,
+    resume_point: ResumePoint,
+    total_steps: int,
+) -> str:
+    """Continue a previous run from its checkpoint, into a fresh training_runs row.
+
+    The relaunch keeps the original `output_dir`, which is what makes this a
+    resume at all: that is where the trainer looks for the checkpoint, appends
+    train_log.csv (krea2.metrics opens it in append mode for exactly this case)
+    and rotates per-step exports. Only the settings/log pair is new, so the
+    original run's log survives instead of being truncated by the relaunch.
+
+    Every hyperparameter is carried over untouched apart from `total_steps` —
+    the one thing you must be able to raise, since a checkpoint at the original
+    target has nothing left to run.
+    """
+    step = checkpoint_step(resume_point.output_dir)
+    if step is None:
+        raise ResumeUnavailable(
+            f"No complete checkpoint under {resume_point.output_dir} anymore."
+        )
+    if total_steps <= step:
+        raise ResumeUnavailable(
+            f"Checkpoint is at step {step}; total_steps must be greater than that "
+            f"to have anything left to train (got {total_steps})."
+        )
+
+    config = dict(resume_point.config)
+    _run_precache_blocking(
+        conn,
+        dataset_run_id=dataset_run_id,
+        model_dir=Path(config["model_id"]),
+        dataset_path=Path(config["dataset_path"]),
+        cache_dir=Path(config["cache_dir"]),
+        trigger_word=config.get("trigger_word", ""),
+    )
+
+    settings = TrainSettings(**{**config, "total_steps": total_steps}).model_dump()
+    run_dir = training_runtime_dir() / "runs" / f"train-{uuid.uuid4()}"
+
+    pid, log_path = training_runner.launch(
+        TRAIN_SCRIPT,
+        settings,
+        run_dir,
+        TRAIN_SETTINGS_ENV,
+        extra_env={"FTI_RUN_ID": str(uuid.uuid4())},
+    )
+    return repo.create_training_run(
+        conn,
+        dataset_run_id=dataset_run_id,
+        kind="train",
+        pid=pid,
+        log_path=log_path,
+        config=settings,
+    )
+
+
 def _launch_train(
     conn: sqlite3.Connection,
     *,
     dataset_run_id: str,
+    dataset_name: str,
     model_dir: Path,
     dataset_path: Path,
     cache_dir: Path,
@@ -319,6 +583,7 @@ def _launch_train(
         cache_dir=str(cache_dir),
         output_dir=str(output_dir),
         trigger_word=trigger_word,
+        checkpoint_prefix=dataset_name,
         **config.model_dump(),
     ).model_dump()
 
@@ -341,5 +606,14 @@ def _launch_train(
 
 
 def training_log_csv_path(training_run: repo.TrainingRun) -> Path:
-    """train_worker.py writes train_log.csv next to the settings/log in its run_dir."""
+    """Where train_worker.py writes train_log.csv: inside the run's output_dir.
+
+    Read from the stored settings rather than derived from the log's location,
+    because a resumed run keeps the *original* run's output_dir while getting a
+    log of its own — the two stop being siblings. Falls back to the old layout
+    for rows written before output_dir was recorded.
+    """
+    output_dir = training_run.config.get("output_dir")
+    if output_dir:
+        return Path(output_dir) / "train_log.csv"
     return Path(training_run.log_path).parent / "checkpoints" / "train_log.csv"

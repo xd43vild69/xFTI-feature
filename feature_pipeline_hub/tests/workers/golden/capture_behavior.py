@@ -252,10 +252,10 @@ def capture_rotation():
         with tempfile.TemporaryDirectory() as tmp:
             d = pathlib.Path(tmp)
             for step in [25, 50, 100, 200, 1000, 75]:
-                (d / f"Krea2_LoRA_step_{step}.safetensors").write_text("x")
-            (d / "Krea2_FINAL_LoRA.safetensors").write_text("x")
+                (d / f"Krea2_step_{step}.safetensors").write_text("x")
+            (d / "Krea2_FINAL.safetensors").write_text("x")
             (d / "unrelated.txt").write_text("x")
-            rotate(str(d), keep, log=lambda _m: None)
+            rotate(str(d), keep, "Krea2", log=lambda _m: None)
             out[f"keep_{keep}"] = sorted(p.name for p in d.iterdir())
     return out
 

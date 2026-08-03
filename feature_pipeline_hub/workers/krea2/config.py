@@ -47,6 +47,7 @@ DEFAULTS: dict[str, Any] = {
     "preview_cfg": 3.5,
     "preview_caption_mode": "first",
     "project_name": "",
+    "checkpoint_prefix": "",
     "trigger_word": "",
     "lora_target": "all",
     "compact_text": True,
@@ -203,6 +204,7 @@ class TrainConfig:
     preview_cfg: float
     preview_caption_mode: str
     project_name: str
+    checkpoint_prefix: str
     trigger_word: str
     lora_target: str
     compact_text: bool
@@ -500,6 +502,7 @@ def load_config(
         preview_cfg=float(r.get("preview_cfg")),
         preview_caption_mode=str(r.get("preview_caption_mode")),
         project_name=project_name,
+        checkpoint_prefix=str(r.get("checkpoint_prefix")).strip(),
         trigger_word=str(r.get("trigger_word")),
         lora_target=r.choice("lora_target"),
         compact_text=compact_text,

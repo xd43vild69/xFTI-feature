@@ -73,6 +73,16 @@ The smoke run compares by tolerance, not diff: the loop is **not bit-reproducibl
 
 Pre-cache runs blocking (`training_service._run_precache_blocking`, minutes, has a timeout) before training is launched detached (`_launch_train`) — see `training_service.start_training`, used by the UI. The MCP server can't block a tool call for that long, so it uses the non-blocking split instead: `launch_precache` (fire-and-forget) + `precache_status` (poll) + `launch_train` (the public wrapper around `_launch_train`) — same underlying subprocess launch, just not chained together in one call.
 
+### Resuming a training run
+
+The trainer already knows how to resume: `krea2.state.CheckpointManager` restores adapter, optimizer, EMA, RNG and sampler position from `output_dir`, and its signal handlers checkpoint on SIGINT/SIGTERM/SIGHUP — so the UI's "Stop training" (which `training_runner.stop_process` sends as SIGINT) leaves a resumable checkpoint behind.
+
+What makes a launch a resume is therefore **only** which `output_dir` it gets. `_launch_train` mints a fresh one per run, so a normal launch always starts at step 0; `resume_training` reuses the original run's `output_dir` while allocating a new run_dir for its own `settings.json`/`log.txt`, so the earlier log isn't truncated and each launch still gets one `training_runs` row. `krea2.metrics` opens the CSVs in append mode for exactly this case, so `train_log.csv` stays continuous across restarts — which is why `training_log_csv_path` reads `output_dir` out of the stored settings instead of deriving it from the log's location.
+
+A resume carries every hyperparameter over untouched except `total_steps`: the saved adapter was shaped by the original rank/alpha and `lora_io.load_lora_weights` exits rather than load a mismatch. `total_steps` must be raised above the checkpoint's step or the trainer reports "nothing to do" — `resume_training` rejects that up front. `find_resume_points` decides what is offerable using `checkpoint_step`, which mirrors `CheckpointManager.has_checkpoint()`; keep the two in agreement.
+
+The per-step `Krea2_LoRA_step_N.safetensors` files are **not** resume points — `lora_io.export_lora` rewrites keys to the `transformer.*` layout inference loaders want, which `set_peft_model_state_dict` won't take back. Only `resume_checkpoint/` (written by `save_pretrained`, PEFT layout) plus `optimizer.pt` and `current_step.txt` can be resumed from.
+
 ### Runs, concepts, and versions (SQLite: `feature_pipeline.db`)
 
 - A `concept` is a named dataset (concept_name + trigger_word). An `ingestion_run` is one import of that concept — re-scanning the same concept creates a **new** run rather than overwriting the old one, so runs stay independently selectable in the UI. `run_id`, not `concept_id`, is what the UI selects on.

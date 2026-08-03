@@ -42,6 +42,7 @@ class TrainSettings(_StrictSettings):
     cache_dir: str
     output_dir: str
     trigger_word: str = ""
+    checkpoint_prefix: str = ""
     total_steps: int = Field(gt=0)
     lr: float = Field(gt=0)
     lora_rank: int = Field(gt=0)
@@ -50,6 +51,12 @@ class TrainSettings(_StrictSettings):
     grad_accum_steps: int = Field(gt=0)
     save_every: int = Field(gt=0)
     seed: int = Field(ge=0)
+    warmup_steps: int = Field(default=100, ge=0)
+    lr_scheduler: Literal["cosine", "constant", "linear", "cosine_with_restarts", "step"] = "cosine"
+    lr_num_cycles: int = Field(default=3, gt=0)
+    timestep_weighting: Literal["none", "bell", "half_bell"] = "none"
+    noise_offset: float = Field(default=0.0, ge=0.0)
+    caption_dropout_rate: float = Field(default=0.0, ge=0.0, le=1.0)
 
 
 # --- worker events (worker -> hub, one JSON object per stdout line) -----------

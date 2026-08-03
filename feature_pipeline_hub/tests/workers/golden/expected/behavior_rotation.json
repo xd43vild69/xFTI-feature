@@ -1,34 +1,34 @@
 {
   "keep_0": [
-    "Krea2_FINAL_LoRA.safetensors",
-    "Krea2_LoRA_step_100.safetensors",
-    "Krea2_LoRA_step_1000.safetensors",
-    "Krea2_LoRA_step_200.safetensors",
-    "Krea2_LoRA_step_25.safetensors",
-    "Krea2_LoRA_step_50.safetensors",
-    "Krea2_LoRA_step_75.safetensors",
+    "Krea2_FINAL.safetensors",
+    "Krea2_step_100.safetensors",
+    "Krea2_step_1000.safetensors",
+    "Krea2_step_200.safetensors",
+    "Krea2_step_25.safetensors",
+    "Krea2_step_50.safetensors",
+    "Krea2_step_75.safetensors",
     "unrelated.txt"
   ],
   "keep_1": [
-    "Krea2_FINAL_LoRA.safetensors",
-    "Krea2_LoRA_step_1000.safetensors",
+    "Krea2_FINAL.safetensors",
+    "Krea2_step_1000.safetensors",
     "unrelated.txt"
   ],
   "keep_10": [
-    "Krea2_FINAL_LoRA.safetensors",
-    "Krea2_LoRA_step_100.safetensors",
-    "Krea2_LoRA_step_1000.safetensors",
-    "Krea2_LoRA_step_200.safetensors",
-    "Krea2_LoRA_step_25.safetensors",
-    "Krea2_LoRA_step_50.safetensors",
-    "Krea2_LoRA_step_75.safetensors",
+    "Krea2_FINAL.safetensors",
+    "Krea2_step_100.safetensors",
+    "Krea2_step_1000.safetensors",
+    "Krea2_step_200.safetensors",
+    "Krea2_step_25.safetensors",
+    "Krea2_step_50.safetensors",
+    "Krea2_step_75.safetensors",
     "unrelated.txt"
   ],
   "keep_3": [
-    "Krea2_FINAL_LoRA.safetensors",
-    "Krea2_LoRA_step_100.safetensors",
-    "Krea2_LoRA_step_1000.safetensors",
-    "Krea2_LoRA_step_200.safetensors",
+    "Krea2_FINAL.safetensors",
+    "Krea2_step_100.safetensors",
+    "Krea2_step_1000.safetensors",
+    "Krea2_step_200.safetensors",
     "unrelated.txt"
   ]
 }

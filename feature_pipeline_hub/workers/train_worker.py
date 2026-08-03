@@ -4,7 +4,7 @@ train_worker.py — LoRA training for Krea 2 (RAW) on an NF4-quantized base.
 
 Runs as a detached process in the training runtime's own virtualenv, reading
 VAE latents and text embeddings that the pre-cache stage already wrote to disk,
-and emitting LoRA checkpoints plus a final `Krea2_FINAL_LoRA.safetensors`.
+and emitting LoRA checkpoints plus a final `{checkpoint_prefix}_FINAL.safetensors`.
 
 Originally ported from AcademiaSD_LoRAlab-Krea2's `2_train_lora_krea2.py` and
 still tracks it for *logic* — the training loop, guards, checkpointing, curation

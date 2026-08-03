@@ -13,8 +13,6 @@ from typing import Callable
 
 Logger = Callable[[str], None]
 
-CHECKPOINT_PATTERN = re.compile(r"Krea2_LoRA_step_(\d+)\.safetensors")
-
 
 def atomic_write(path: str, writer: Callable[[str], None]) -> None:
     """Write through a temp file then `os.replace` — atomic on POSIX and Windows.
@@ -35,19 +33,23 @@ def atomic_write(path: str, writer: Callable[[str], None]) -> None:
         raise
 
 
-def rotate(output_dir: str, keep: int, log: Logger = print) -> list[str]:
+def rotate(output_dir: str, keep: int, prefix: str, log: Logger = print) -> list[str]:
     """Keep only the `keep` most recent per-step checkpoints; `keep <= 0` keeps all.
 
     Ordering comes from the step number parsed out of the filename, not ctime — ctime
     lies after a copy or an rsync, the step number does not. Never touches the FINAL
     export or any unrelated file. Returns the paths actually removed.
+
+    `prefix` must match what the caller writes checkpoints as (state.py's
+    `_checkpoint_prefix`) — this only *finds* checkpoints, it never writes them.
     """
     if keep <= 0:
         return []
 
+    pattern = re.compile(re.escape(prefix) + r"_step_(\d+)\.safetensors")
     found: list[tuple[int, str]] = []
     for name in os.listdir(output_dir):
-        match = CHECKPOINT_PATTERN.fullmatch(name)
+        match = pattern.fullmatch(name)
         if match:
             found.append((int(match.group(1)), os.path.join(output_dir, name)))
     found.sort(key=lambda pair: pair[0])

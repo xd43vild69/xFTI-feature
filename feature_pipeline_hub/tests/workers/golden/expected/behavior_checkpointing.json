@@ -6,7 +6,7 @@
   ],
   "after_save": {
     "files": [
-      "Krea2_LoRA_step_50.safetensors",
+      "Krea2_step_50.safetensors",
       "current_step.txt",
       "optimizer.pt",
       "resume_checkpoint"
@@ -48,9 +48,9 @@
     "start_step": 50
   },
   "rotation_on_save": [
-    "Krea2_FINAL_LoRA.safetensors",
-    "Krea2_LoRA_step_30.safetensors",
-    "Krea2_LoRA_step_40.safetensors"
+    "Krea2_FINAL.safetensors",
+    "Krea2_step_30.safetensors",
+    "Krea2_step_40.safetensors"
   ],
   "run_id_gating": {
     "other_run_discards": 0,
