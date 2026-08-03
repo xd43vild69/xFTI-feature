@@ -1,4 +1,5 @@
 from feature_pipeline.application.caption_service import (
+    append_word,
     has_trigger,
     inject_trigger_word,
     normalize_caption,
@@ -110,3 +111,30 @@ def test_swap_trigger_word_handles_a_caption_that_was_only_the_trigger():
 def test_swap_trigger_word_is_plain_injection_when_the_trigger_does_not_change():
     assert swap_trigger_word("sks_cat, a cat", "sks_cat", "sks_cat") == "sks_cat, a cat"
     assert swap_trigger_word("a cat", "", "sks_cat") == "sks_cat, a cat"
+
+
+def test_append_word_adds_the_term_at_the_end():
+    assert append_word("sks_cat, a cat sitting", "outdoors") == "sks_cat, a cat sitting, outdoors"
+
+
+def test_append_word_skips_a_caption_that_already_has_it_anywhere():
+    # Case-insensitive and position-independent, so re-running over the same
+    # dataset is a no-op instead of duplicating the term.
+    assert append_word("sks_cat, outdoors, sitting", "outdoors") == "sks_cat, outdoors, sitting"
+    assert append_word("sks_cat, Outdoors", "outdoors") == "sks_cat, Outdoors"
+
+
+def test_append_word_matches_whole_terms_only():
+    assert append_word("a cat in the outdoorsy park", "outdoors") == (
+        "a cat in the outdoorsy park, outdoors"
+    )
+
+
+def test_append_word_tidies_the_separator_it_joins_onto():
+    assert append_word("a cat sitting.", "outdoors") == "a cat sitting, outdoors"
+    assert append_word("a cat sitting, ", "outdoors") == "a cat sitting, outdoors"
+
+
+def test_append_word_handles_an_empty_caption_or_an_empty_word():
+    assert append_word("", "outdoors") == "outdoors"
+    assert append_word("a cat sitting", "") == "a cat sitting"

@@ -15,9 +15,10 @@ The application is organized into **five sequential pipeline steps** plus a stan
 * Not gated behind an active run — the fleet inventory half is visible with no dataset selected.
 
 ### 1. 📥 Step 1: Import & Ingestion
-* **Dual Ingestion Sources**:
+* **Three Ingestion Sources**:
   * **Local Directory Scan**: Ingest images directly from any local folder path. Files stay in place — nothing is copied or renamed.
   * **Browser File Uploads**: Drag-and-drop images (`.png`, `.jpg`, `.jpeg`, `.webp`) and optional `.txt` caption sidecar files via the UI. Uploaded datasets are persistently cached in `data/raw/<run_id>/`.
+  * **Clone Existing Dataset**: Copy an existing run's images into a new, fully independent dataset with a new name. Captions are cloned from the database (the current edited version, not the original `.txt` sidecars), and are re-triggered if the new dataset uses a different trigger word. Perfect for creating variants (e.g., same images under different LoRA concepts) without re-uploading or re-curating.
 * **Concept & Trigger Word Assignment**: Define a dataset **Concept Name** (e.g., `Cyberpunk Style`) and **Trigger Word**. Trigger Word auto-fills as a slugified version of Concept Name (`cyberpunk_style`) as you type, and stops following it the moment you edit it by hand. Trigger words are automatically prefixed to captions during ingestion if not already present.
 * **Standardized Image Naming**: Uploaded images (Step 1's "Upload files" and Curate's "Add images", below) are renamed to `<concept_slug>_0001.ext`, `<concept_slug>_0002.ext`, … regardless of their original filename, so a dataset's images are traceable to a single, predictable naming scheme. Folder-scanned imports keep their original filenames, since that source is never copied into the app's own storage.
 * **Automated Validation**: Enforces a minimum image resolution (both sides ≥ 512×512px, **or** either side alone ≥ 1024px — a tall or wide crop can carry enough detail on one axis even if the other falls short), validates file extensions, and checks caption character lengths (3 to 500 characters). A validation rule change doesn't retroactively touch datasets imported under the old rule until "Revalidate" (below) is run.
@@ -29,17 +30,26 @@ The application is organized into **five sequential pipeline steps** plus a stan
   * Click any thumbnail to open it full-size in a modal, with a "true size" toggle for viewing unscaled pixels with scroll — useful for judging focus and compression artifacts without the resampling a scaled preview would introduce.
   * Filter grid views: `Active`, `All`, `Duplicates`, `Invalid`, `No caption`, and `Excluded`.
 * **In-Place Caption Editing**: Edit text captions directly underneath each thumbnail with instant SQLite database persistence.
-* **Batch Caption Word Replacement**:
-  * Replace specific terms across all captions in the active dataset.
-  * Accessible via the top toolbar or the **`F2` keyboard shortcut**.
-  * Displays exact match counts and matching sample previews before executing the replacement.
+* **Batch Caption Editing** (Accessible via the **`F2` keyboard shortcut** or "Captions" toolbar button):
+  * **Replace Word Mode**: Replace specific exact terms across captions in a configurable scope (Seleccionadas / Filtro actual / Todas).
+    * Displays exact match counts and matching sample previews before executing the replacement.
+    * Case-sensitive matching for precision.
+  * **Append Word Mode**: Add a word or phrase to the end of captions, with automatic deduplication.
+    * Skips images that already contain the word (case-insensitive, anywhere in the caption).
+    * Shows how many images will be updated and how many already have the word.
+    * Safely idempotent: re-running over overlapping scopes does not duplicate terms.
 * **Add Images to an Existing Dataset**: Upload images you forgot the first time without starting over — existing exclusions, edited captions, and duplicate flags on the rest of the dataset are left untouched. New images are compared against the dataset already in place and flagged as duplicates if a near-match already exists, and continue the same `<concept_slug>_NNNN` naming sequence Import uses.
 * **Sample Inclusion & Exclusion**: Exclude specific images from the final dataset without deleting files from disk.
-* **AI Recaptioning Engine (Qwen3-VL-4B)**:
+* **AI Recaptioning Engine (Qwen3-VL-4B) with Structured Captioning**:
   * Regenerates captions using the **Qwen3-VL-4B** vision-language model (the text encoder model used by Krea 2).
-  * Options for **Standard factual captions** or **Detailed multi-sentence descriptions** (covering pose, clothing, lighting, and scene).
+  * **Two structured captioning modes** (not free-form prose — fixed JSON slots assembled deterministically):
+    * **Subject Mode** (default): Describes shot type, pose, clothing, background, and lighting — *deliberately omits* face, hair, and body type so the LoRA's trigger word can learn those traits instead.
+    * **Location Mode**: Describes time of day, weather, lighting, and transient objects — *deliberately omits* architecture and place style so the trigger word absorbs those properties.
+  * Both modes use explicit prohibitions (e.g., "Do NOT describe facial features") and enforce slot-based responses, guaranteeing that what the caption omits gets absorbed into training by the trigger word.
   * Runs as an isolated subprocess (`workers/recaption_worker.py`), streaming live progress (model loading, per-image timing, success/error counters) and releasing GPU VRAM on completion.
+  * **GPU Fallback Notice**: If the GPU is too full, the worker gracefully falls back to CPU (visible warning in the UI) — still produces correct captions, but at minutes per image instead of ~2s.
   * Preserves original captions as `.txt.bak` backups while updating both the database and `.txt` sidecars on disk.
+  * Validates model weights on load; reports any corrupted tensors with actionable diagnostics (memory/hardware issues, not data).
 
 ### 3. 🔍 Step 3: Quality Analysis & Deduplication
 * **Multi-Hash Perceptual Deduplication**:
@@ -398,7 +408,7 @@ uv run python main.py
 
 ## ⌨️ Shortcuts & UI Helpers
 
-* **`F2`**: Opens the **Rename Word in Captions** dialog in Curate to replace terms across all dataset captions.
+* **`F2`**: Opens the **Captions** dialog in Curate for batch editing: replace a word across captions, or append a word to the end of selected/filtered/all images.
 * **Click any thumbnail**: Opens it full-size in a modal (Curate and Quality), with a toggle for viewing true, unscaled pixels.
 * **Global Context Bar**: Persistent top header bar to switch active datasets, monitor real-time health badges (active count, duplicate count, missing descriptions, excluded count), view concept details, re-run validation against the current rules ("Revalidate"), or delete dataset runs.
 

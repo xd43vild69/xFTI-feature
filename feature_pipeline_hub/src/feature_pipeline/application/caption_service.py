@@ -60,6 +60,28 @@ def inject_trigger_word(caption: str, trigger_word: str) -> str:
     return f"{trigger_word}, {normalized}"
 
 
+def append_word(caption: str, word: str) -> str:
+    """Add `word` at the end of the caption, unless it is already in there.
+
+    "Already in there" is `has_trigger`'s reading — the exact term, anywhere in the
+    caption, any casing — so running this twice over a dataset is a no-op the second
+    time, and a caption that mentions the word mid-sentence does not get a second
+    copy tacked on. Position within the caption is not enforced: a caption the user
+    ordered by hand is left as it is rather than rewritten to move the word.
+
+    Trailing commas and periods at the join are dropped, since neither carries
+    meaning where the new term is about to go.
+    """
+    if not word:
+        return caption
+
+    if has_trigger(caption, word):
+        return caption
+
+    base = caption.strip().rstrip(" ,.")
+    return f"{base}, {word}" if base else word
+
+
 def swap_trigger_word(caption: str, old_trigger: str, new_trigger: str) -> str:
     """Re-trigger a caption: drop `old_trigger`, then prefix `new_trigger`.
 

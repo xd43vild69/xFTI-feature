@@ -97,6 +97,17 @@ def _run_batch(run: IngestionRun, samples: list[DatasetSample]) -> None:
         ):
             if event.kind == "loaded":
                 status.write(f"Model loaded on {event.device} in {event.seconds}s.")
+                if event.device == "cpu":
+                    # The worker falls back to CPU when the GPU is too full to load
+                    # the model. It finishes rather than failing the batch, but at
+                    # minutes per image instead of ~2s — worth saying out loud, since
+                    # otherwise the only symptom is that nothing seems to happen.
+                    st.warning(
+                        "Running on CPU because the GPU was busy — expect minutes per "
+                        "image instead of ~2s. Free the VRAM (close ComfyUI or another "
+                        "model) and re-run for the fast path.",
+                        icon=":material/warning:",
+                    )
 
             elif event.kind == "caption":
                 sample = _find(samples, event.sample_id)

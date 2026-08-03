@@ -69,6 +69,21 @@ def main() -> int:
         device = "cpu"
         model, processor = load_captioner(text_encoder_dir, device=device, dtype=torch.bfloat16)
 
+    # A weight that arrives non-finite makes every logit NaN, and greedy decoding
+    # turns NaN logits into token 0 over and over — the model "replies" with a wall
+    # of "!!!!" and the only visible symptom is a caption that will not parse. The
+    # bytes on disk are usually fine (checksum them before believing otherwise); a
+    # bad read is what puts NaN in RAM. Cheap enough to check on every load, and it
+    # turns a baffling symptom into a stated cause.
+    corrupt = [name for name, p in model.named_parameters() if not torch.isfinite(p).all()]
+    if corrupt:
+        raise RuntimeError(
+            f"Model weights loaded with non-finite values in {len(corrupt)} tensor(s), "
+            f"first: {corrupt[0]}. Generation would return garbage. Retry — this is "
+            "usually a bad read rather than a bad file. If it keeps happening, verify "
+            "the checkpoint against its source and test system RAM (memtest86+)."
+        )
+
     _emit(event="loaded", device=device, seconds=round(time.time() - started, 1))
 
     captioned = failed = 0

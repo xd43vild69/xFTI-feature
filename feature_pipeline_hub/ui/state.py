@@ -176,10 +176,37 @@ def preview_replace_counts(samples: list[DatasetSample], old_word: str) -> tuple
     return matching_samples, total_matches
 
 
-def batch_replace_caption_word(run: IngestionRun, old_word: str, new_word: str) -> tuple[int, int]:
-    """Batch replace exact occurrences of old_word with new_word in run's samples.
+def preview_append_counts(samples: list[DatasetSample], word: str) -> tuple[int, int]:
+    """(how many would gain `word`, how many already carry it), for the dialog's preview."""
+    if not word:
+        return 0, 0
 
-    Persists to SQLite and bumps caption widget versions so text areas refresh cleanly.
+    already = sum(1 for s in samples if caption_service.has_trigger(s.caption, word))
+    return len(samples) - already, already
+
+
+def _store_caption(conn, sample: DatasetSample, caption: str) -> None:
+    """Persist one edited caption and make the grid pick it up.
+
+    Bumping the widget version is what stops the editor showing the old text: a
+    keyed Streamlit widget ignores `value=` once it exists, so an edit made from
+    outside it needs a new key. Writes the DB only — the .txt sidecars are
+    rewritten wholesale on export.
+    """
+    repo.update_sample_caption(conn, sample.sample_id, caption)
+    sample.caption = caption
+    versions = st.session_state.setdefault(CAPTION_VERSIONS_KEY, {})
+    versions[sample.sample_id] = versions.get(sample.sample_id, 0) + 1
+
+
+def batch_replace_caption_word(
+    samples: list[DatasetSample], old_word: str, new_word: str
+) -> tuple[int, int]:
+    """Batch replace exact occurrences of old_word with new_word across `samples`.
+
+    Takes the samples rather than the run so the caller decides the scope — the
+    whole dataset, the current filter, or just what is selected.
+
     Returns (samples_updated_count, total_replacements_count).
     """
     if not old_word:
@@ -187,21 +214,39 @@ def batch_replace_caption_word(run: IngestionRun, old_word: str, new_word: str) 
 
     samples_updated = 0
     total_replacements = 0
-    versions = st.session_state.setdefault(CAPTION_VERSIONS_KEY, {})
 
     with _db() as conn:
-        for sample in run.concept.samples:
+        for sample in samples:
             new_caption, count = caption_service.replace_exact_word(
                 sample.caption, old_word, new_word
             )
             if count > 0:
-                repo.update_sample_caption(conn, sample.sample_id, new_caption)
-                sample.caption = new_caption
-                versions[sample.sample_id] = versions.get(sample.sample_id, 0) + 1
+                _store_caption(conn, sample, new_caption)
                 samples_updated += 1
                 total_replacements += count
 
     return samples_updated, total_replacements
+
+
+def batch_append_caption_word(samples: list[DatasetSample], word: str) -> int:
+    """Add `word` to the end of each caption in `samples`, and return how many changed.
+
+    Samples that already carry the word are left untouched (see
+    `caption_service.append_word`), so re-running over an overlapping scope does
+    not duplicate terms.
+    """
+    if not word:
+        return 0
+
+    updated = 0
+    with _db() as conn:
+        for sample in samples:
+            new_caption = caption_service.append_word(sample.caption, word)
+            if new_caption != sample.caption:
+                _store_caption(conn, sample, new_caption)
+                updated += 1
+
+    return updated
 
 
 def selection_key(run_id: str, sample_id: str) -> str:

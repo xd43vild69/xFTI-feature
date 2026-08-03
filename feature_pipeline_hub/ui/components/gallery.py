@@ -25,10 +25,56 @@ FILTERS = {
 }
 
 
-@st.dialog("Renombrar palabra en captions")
-def _render_rename_dialog(run: IngestionRun) -> None:
-    st.write("Busca una palabra exacta en los captions de las imágenes y reemplázala.")
+@st.dialog("Editar captions")
+def _render_caption_dialog(run: IngestionRun, visible: list[DatasetSample]) -> None:
+    """Batch caption edits: replace a word, or append one to the end.
 
+    Both halves share the scope selector, which is the part that used to be
+    missing — replacing always hit every image in the dataset, filter and
+    selection alike, without saying so.
+    """
+    selected = state.selected_samples(run)
+    scopes = {
+        "Seleccionadas": selected,
+        "Filtro actual": visible,
+        "Todas": run.concept.samples,
+    }
+
+    mode = st.radio(
+        "Acción",
+        ["Reemplazar", "Añadir"],
+        horizontal=True,
+        key=f"caption_mode_{run.run_id}",
+        captions=[
+            "Cambia una palabra exacta por otra.",
+            "Añade una palabra al final, si no está ya.",
+        ],
+    )
+
+    scope = st.radio(
+        "Aplicar a",
+        list(scopes),
+        horizontal=True,
+        # Defaults to the selection when there is one, since that is the more
+        # deliberate choice; falls back to the whole dataset when there is not.
+        index=0 if selected else 2,
+        key=f"caption_scope_{run.run_id}",
+    )
+    targets = scopes[scope]
+
+    if not targets:
+        st.warning("No hay imágenes en este alcance. Selecciona algunas en la galería.")
+        return
+
+    st.caption(f"{len(targets)} imagen(es) en el alcance.")
+
+    if mode == "Reemplazar":
+        _render_replace_form(run, targets)
+    else:
+        _render_append_form(run, targets)
+
+
+def _render_replace_form(run: IngestionRun, targets: list[DatasetSample]) -> None:
     old_word = st.text_input(
         "Palabra exacta a buscar (case-sensitive)",
         placeholder="ej. cat",
@@ -40,9 +86,7 @@ def _render_rename_dialog(run: IngestionRun) -> None:
         key=f"rename_new_{run.run_id}",
     )
 
-    matching_samples, total_matches = state.preview_replace_counts(
-        run.concept.samples, old_word
-    )
+    matching_samples, total_matches = state.preview_replace_counts(targets, old_word)
 
     if old_word:
         if total_matches > 0:
@@ -58,10 +102,39 @@ def _render_rename_dialog(run: IngestionRun) -> None:
         disabled=(total_matches == 0),
         use_container_width=True,
     ):
-        samples_cnt, total_cnt = state.batch_replace_caption_word(
-            run, old_word, new_word
-        )
+        samples_cnt, total_cnt = state.batch_replace_caption_word(targets, old_word, new_word)
         st.success(f"¡Se reemplazaron {total_cnt} coincidencia(s) en {samples_cnt} imagen(es)!")
+        st.rerun()
+
+
+def _render_append_form(run: IngestionRun, targets: list[DatasetSample]) -> None:
+    word = st.text_input(
+        "Palabra o frase a añadir al final",
+        placeholder="ej. outdoors",
+        key=f"append_word_{run.run_id}",
+        help="Se salta las imágenes cuyo caption ya la contenga, sin importar mayúsculas "
+        "ni en qué posición esté.",
+    )
+
+    pending, already = state.preview_append_counts(targets, word.strip())
+
+    if word.strip():
+        if pending:
+            note = f"Se añadirá a **{pending}** imagen(es)."
+            if already:
+                note += f" **{already}** ya la tiene(n) y no se tocarán."
+            st.info(note)
+        else:
+            st.warning("Todas las imágenes del alcance ya contienen esa palabra.")
+
+    if st.button(
+        f"Añadir a {pending} imagen(es)",
+        type="primary",
+        disabled=(pending == 0),
+        use_container_width=True,
+    ):
+        updated = state.batch_append_caption_word(targets, word.strip())
+        st.success(f"¡Se añadió '{word.strip()}' a {updated} imagen(es)!")
         st.rerun()
 
 
@@ -124,7 +197,7 @@ def render() -> None:
                 if (e.key === 'F2') {
                     e.preventDefault();
                     const buttons = Array.from(doc.querySelectorAll('button'));
-                    const btn = buttons.find(b => b.innerText && b.innerText.includes('Renombrar (F2)'));
+                    const btn = buttons.find(b => b.innerText && b.innerText.includes('Captions (F2)'));
                     if (btn) btn.click();
                 }
             });
@@ -160,12 +233,12 @@ def render() -> None:
 
     with toolbar:
         if st.button(
-            "Renombrar (F2)",
+            "Captions (F2)",
             icon=":material/find_replace:",
-            help="Reemplazar palabra en los captions (F2)",
+            help="Reemplazar o añadir una palabra en los captions (F2)",
             key=f"btn_rename_{run.run_id}",
         ):
-            _render_rename_dialog(run)
+            _render_caption_dialog(run, samples)
 
         if st.button(
             "Añadir",
