@@ -17,7 +17,7 @@ from components import context_bar
 
 st.set_page_config(
     page_title="FTI Feature Pipeline Hub",
-    icon="🤖",
+    page_icon="🤖",
     layout="wide",
     initial_sidebar_state="expanded",
     menu_items={
