@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from pydantic import ValidationError
 
 from feature_pipeline.application import training_service
+from feature_pipeline.domain.checkpoint_log import CheckpointLogSummary
 from feature_pipeline.domain.train_log import TrainLogSummary
 from feature_pipeline.infrastructure import training_repository as repo
 
@@ -34,12 +35,19 @@ class TrainingLineage:
     says whether it was just read off disk or restored from the snapshot stored
     when a launch finished — the stored one covers only that launch, so the
     distinction is worth showing rather than hiding.
+
+    `checkpoint_log` is the same arrangement for the per-checkpoint spans, resolved
+    independently: a run can perfectly well have one file and not the other, since
+    checkpoint logging arrived later and a run killed before its first save never
+    writes one at all.
     """
 
     output_dir: str
     launches: tuple[repo.TrainingRun, ...]  # oldest first
     train_log: TrainLogSummary | None
     train_log_is_live: bool
+    checkpoint_log: CheckpointLogSummary | None
+    checkpoint_log_is_live: bool
     total_steps_target: int
     wall_clock_seconds: float | None
     cost_estimate: float | None
@@ -113,6 +121,7 @@ def load_training_lineages(
 def _build_lineage(launches: list[repo.TrainingRun]) -> TrainingLineage:
     latest = launches[-1]
     summary, is_live = _resolve_summary(launches)
+    checkpoints, checkpoints_live = _resolve_checkpoint_summary(launches)
 
     # From the latest launch: a resume must raise total_steps above the checkpoint
     # to have anything left to run, so the first launch's target is stale.
@@ -134,6 +143,8 @@ def _build_lineage(launches: list[repo.TrainingRun]) -> TrainingLineage:
         launches=tuple(launches),
         train_log=summary,
         train_log_is_live=is_live,
+        checkpoint_log=checkpoints,
+        checkpoint_log_is_live=checkpoints_live,
         total_steps_target=total_steps,
         wall_clock_seconds=_total(run.duration_seconds for run in launches),
         cost_estimate=_total(run.cost_estimate for run in launches),
@@ -167,6 +178,33 @@ def _resolve_summary(
             # failing the page over; try the launch before it.
             continue
     return None, False
+
+
+def _resolve_checkpoint_summary(
+    launches: Sequence[repo.TrainingRun],
+) -> tuple[CheckpointLogSummary | None, bool]:
+    """The lineage's checkpoint spans, live if the file survives, stored if not.
+
+    Same policy as _resolve_summary, kept as a second function rather than a generic
+    one: the two differ in which reader and which stored column they use, and the
+    shared part is four lines of control flow.
+    """
+    live = training_service.read_checkpoint_log_summary(launches[-1])
+    if live is not None:
+        return live, True
+
+    for run in reversed(launches):
+        if not run.checkpoint_metrics:
+            continue
+        try:
+            return CheckpointLogSummary.model_validate(run.checkpoint_metrics), False
+        except ValidationError:
+            continue
+
+    # Last resort: every run launched before the trainer logged its saves has none of
+    # the above, but the checkpoints themselves are still on disk and their mtimes say
+    # when each one was written. Inferred rather than measured, and marked as such.
+    return training_service.reconstruct_checkpoint_log_summary(launches), False
 
 
 def _total(values: Iterable[float | None]) -> float | None:

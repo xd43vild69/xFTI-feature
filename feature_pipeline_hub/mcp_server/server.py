@@ -187,12 +187,17 @@ def continue_lora_training(
     grad_accum_steps: int = 4,
     save_every: int = 25,
     seed: int = 42,
+    checkpoint_name: str = "",
 ) -> dict:
     """Launch the training phase after `start_lora_training`'s pre-cache has completed.
 
     Call `get_training_status(precache_training_run_id)` first and only call this once
     it reports phase="precache", status="completed". Hyperparameters should match the
     call to `start_lora_training` (they were not persisted between the two calls).
+
+    `checkpoint_name` sets the base filename of the exported .safetensors files
+    (`{checkpoint_name}_step_N.safetensors`, `{checkpoint_name}_FINAL.safetensors`);
+    left empty, it falls back to the dataset's concept name.
     """
     with _db() as conn:
         status = training_service.precache_status(conn, precache_training_run_id)
@@ -209,6 +214,7 @@ def continue_lora_training(
             grad_accum_steps=grad_accum_steps,
             save_every=save_every,
             seed=seed,
+            checkpoint_name=checkpoint_name,
         )
         training_run_id = training_service.launch_train(
             conn,

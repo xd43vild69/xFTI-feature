@@ -14,6 +14,7 @@ rather than borrowing a number from the configuration.
 import streamlit as st
 
 import state
+from feature_pipeline.domain import cost
 
 # Diffusion loss is dominated by the noise level sampled at each step, not by how
 # good the adapter is, so it says whether a run converged on its own objective and
@@ -32,16 +33,20 @@ def render() -> None:
         return
 
     telemetry = state.step_telemetry(run.run_id)
-    lineages = state.training_lineages(run.run_id)
     # Newest training first. group_training_lineages drops pre-cache rows, which
     # otherwise shadowed the training whenever one had run more recently.
-    lineage = lineages[0] if lineages else None
+    lineages = state.training_lineages(run.run_id)
 
     if telemetry is None:
         st.warning("No pipeline data for this run yet.")
         return
 
     st.subheader("📊 Pipeline Metrics")
+
+    # Chosen before the table is built, so the Training row, the cost metric and the
+    # detail below all describe the same training rather than the table showing the
+    # newest while the detail shows whatever was picked.
+    lineage = _select_lineage(lineages, run.run_id)
 
     ingest_cost = telemetry.cost_estimate
     total_items = len(run.concept.samples)
@@ -127,6 +132,46 @@ def render() -> None:
         _render_training_detail(lineage, total_items)
 
 
+def _select_lineage(lineages, run_id: str):
+    """Which of this dataset's trainings the page describes. Newest by default.
+
+    Every launch of `start_training` mints its own output_dir, so a dataset trained
+    five times has five independent records — and the page used to show only the last
+    one, with no way to reach the rest. A resume is deliberately *not* a separate
+    entry: it continues the same training, and appears here as one.
+    """
+    if not lineages:
+        return None
+    if len(lineages) == 1:
+        return lineages[0]
+
+    # Keyed per dataset so switching datasets does not carry a selection across to a
+    # run whose list of trainings is entirely different.
+    return st.selectbox(
+        "Training run",
+        lineages,
+        index=0,
+        format_func=_lineage_label,
+        key=f"metrics_lineage_{run_id}",
+        help="Each launch of a training on this dataset is its own record. Resumes "
+             "are folded into the training they continue.",
+    )
+
+
+def _lineage_label(lineage) -> str:
+    """One training as a single line: when it started, what it made, how it went."""
+    started = lineage.launches[0].started_at
+    parts = [
+        started.strftime("%Y-%m-%d %H:%M") if started is not None else "unknown date",
+        str(lineage.latest.config.get("checkpoint_prefix") or "—"),
+        _steps_label(lineage),
+        lineage.status,
+    ]
+    if lineage.launch_count > 1:
+        parts.append(f"{lineage.launch_count} launches")
+    return " · ".join(parts)
+
+
 def _steps_label(lineage) -> str:
     """Steps executed against the target — or an honest dash.
 
@@ -155,8 +200,8 @@ def _render_training_detail(lineage, active_images: int) -> None:
         )
         return
 
-    progress, timing, dataset, health = st.tabs(
-        ["Progress", "Time", "Dataset & config", "Health"]
+    progress, timing, checkpoints, dataset, health = st.tabs(
+        ["Progress", "Time", "Checkpoints", "Dataset & config", "Health"]
     )
 
     with progress:
@@ -219,6 +264,9 @@ def _render_training_detail(lineage, active_images: int) -> None:
             help="Allocator-tracked peak, cumulative over the process. Reads lower "
                  "than nvidia-smi, which counts reserved memory.",
         )
+
+    with checkpoints:
+        _render_checkpoints(lineage)
 
     with dataset:
         cols = st.columns(4)
@@ -291,6 +339,118 @@ def _render_training_detail(lineage, active_images: int) -> None:
             help="Heuristic: losses far above the run's median. A legitimately "
                  "high-noise step can trip it.",
         )
+
+
+def _render_checkpoints(lineage) -> None:
+    """What each `.safetensors` cost: wall clock per save_every span, and per image.
+
+    The point of the normalised columns: with the rest of the configuration held
+    steady, seconds-per-image is the figure that carries across datasets of different
+    sizes, so a checkpoint here can be compared to a checkpoint of another run.
+    """
+    log = lineage.checkpoint_log
+    if log is None or not log.intervals:
+        st.info(
+            "No checkpoint timings for this training, and no checkpoints left on disk "
+            "to infer them from — so it either stopped before its first save, or its "
+            "runtime directory has since been reclaimed."
+        )
+        return
+
+    save_every = lineage.latest.config.get("save_every")
+
+    if log.is_reconstructed:
+        st.warning(
+            "**Estimated.** This training ran before the trainer logged its saves, so "
+            "these spans were inferred from when each `.safetensors` was written. Two "
+            "things follow: the first span of each launch also contains the model and "
+            "cache load, and a file that was ever copied or moved carries the wrong "
+            "timestamp. Runs launched from now on are measured, not inferred.",
+            icon="🧮",
+        )
+
+    cols = st.columns(5)
+    cols[0].metric(
+        "Checkpoints written",
+        f"{log.checkpoint_count:,}",
+        help=(f"One per {save_every} micro-steps, plus any written on the way out."
+              if save_every else "Includes any written on the way out."),
+    )
+    cols[4].metric(
+        "Launches",
+        f"{log.launch_count:,}",
+        help="Processes that contributed to this training. More than one means it "
+             "was resumed — the same training continued, each launch timing its own "
+             "spans from the moment it came back up.",
+    )
+    cols[1].metric(
+        "Median per checkpoint",
+        _duration(log.median_seconds_per_checkpoint),
+        help="Wall clock of a complete save_every span, measured between consecutive "
+             "saves. Spans cut short by a stop, the final leftover span and the "
+             "resume seam are excluded — they are partial by construction.",
+    )
+    cols[2].metric(
+        "Seconds / image",
+        _fmt(log.median_seconds_per_image, 2),
+        help=f"Median span divided by the {log.images_trained:,} unique training "
+             "images. Comparable across runs on datasets of different sizes."
+             if log.images_trained else
+             "Median span divided by the run's unique training images.",
+    )
+    cols[3].metric(
+        "Interrupted spans",
+        f"{log.interrupted_count:,}",
+        help="Checkpoints written by a stop, an OOM or a non-finite gradient rather "
+             "than by the save_every cadence. Their time is partial by definition.",
+    )
+
+    rate = cost.gpu_hourly_rate()
+    st.dataframe(
+        [
+            {
+                "Launch": interval.launch_ordinal,
+                "Step": f"{interval.step:,}",
+                "Reason": interval.reason,
+                "Span": _duration(interval.elapsed_seconds),
+                "Cumulative": _duration(interval.cumulative_seconds),
+                "Δ steps": f"{interval.steps_delta:,}",
+                "Images": f"{interval.num_images:,}" if interval.num_images else "—",
+                "s / image": _fmt(interval.seconds_per_image, 2),
+                "s / step": _fmt(interval.seconds_per_step, 2),
+                "Cost": _money(cost.estimate_cost(interval.elapsed_seconds, rate)),
+            }
+            for interval in log.intervals
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.caption(
+        "Each span is timed from the previous checkpoint of the same launch — a "
+        "resume starts its clock when the process came back, so the hours a stopped "
+        "run spent waiting are never counted as training time. The Launch column is "
+        "what separates one process's spans from the next one's."
+        + ("" if lineage.checkpoint_log_is_live else
+           " · checkpoint_log.csv is gone — showing the snapshot stored when it finished")
+    )
+
+
+def _money(value: float | None) -> str:
+    """A dash when FTI_GPU_HOURLY_RATE is unset — an unpriced run is not a free one."""
+    return f"${value:.4f}" if value is not None else "—"
+
+
+def _duration(seconds: float | None) -> str:
+    """Seconds as h:mm:ss or m:ss — the scale a checkpoint span actually lands on."""
+    if seconds is None:
+        return "—"
+    total = int(round(seconds))
+    hours, rest = divmod(total, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
 
 
 def _provenance(lineage) -> str:

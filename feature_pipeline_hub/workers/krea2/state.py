@@ -54,7 +54,7 @@ class CheckpointManager:
     """Owns everything that reads or writes the run's on-disk state."""
 
     def __init__(self, cfg: TrainConfig, model: torch.nn.Module, optimizer: Any,
-                 log: Logger = print) -> None:
+                 log: Logger = print, ckpt_log: Any = None) -> None:
         self.cfg = cfg
         self.model = model
         self.optimizer = optimizer
@@ -62,6 +62,9 @@ class CheckpointManager:
         self.log = log
         self._busy = False
         self.saved_on_exit = False
+        # metrics.CheckpointLog, or None outside the hub. Optional so the standalone
+        # workflow keeps working unchanged.
+        self._ckpt_log = ckpt_log
 
     # ── paths ───────────────────────────────────────────────────────────────
     @property
@@ -202,11 +205,16 @@ class CheckpointManager:
 
     # ── save ────────────────────────────────────────────────────────────────
     def save(self, step: int, sampler: Any = None, ema: Any = None,
-             num_images: int | None = None) -> None:
+             num_images: int | None = None, reason: str = "periodic") -> None:
         """Write the full resumable state atomically, and non-reentrantly.
 
         Re-entrancy matters: a signal arriving mid-save would otherwise start a second
         save over the first one's staging directory.
+
+        `reason` only reaches the checkpoint log — it says whether this was a full
+        save_every span or a stretch cut short. The timing is recorded here rather
+        than at the call site precisely because of the two guards below: a save that
+        returned early wrote nothing, and timing it would invent an interval.
         """
         if step <= 0 or self._busy:
             return
@@ -229,6 +237,13 @@ class CheckpointManager:
                                self._checkpoint_prefix, log=self.log)
             self.log(f"✓ Checkpoint saved successfully at step / "
                      f"Checkpoint guardado en paso {step}: {path}")
+            if self._ckpt_log is not None:
+                self._ckpt_log.record(
+                    step=step,
+                    epoch=sampler.epoch if sampler is not None else 0,
+                    reason=reason,
+                    num_images=num_images,
+                )
         finally:
             self._busy = False
 

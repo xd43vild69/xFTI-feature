@@ -17,6 +17,7 @@ from pydantic import ValidationError
 
 import state
 from feature_pipeline.application import training_service
+from feature_pipeline.domain import naming
 from feature_pipeline.domain.models import IngestionRun
 from feature_pipeline.infrastructure import training_repository as training_repo
 from feature_pipeline.infrastructure import training_runner
@@ -183,6 +184,19 @@ def _render_launch_form(run: IngestionRun, latest: training_repo.TrainingRun | N
         st.markdown("**Start a new run**")
 
     config = _launch_config_state(run.run_id)
+
+    st.text_input(
+        "Checkpoint name",
+        value=config["checkpoint_name"] or run.concept.concept_name,
+        key=_field_key(run.run_id, "checkpoint_name"),
+        on_change=_sync_fields_to_json, args=(run.run_id,),
+        help=(
+            "Nombre base de los archivos .safetensors generados: "
+            "{nombre}_step_N.safetensors y {nombre}_FINAL.safetensors. "
+            "Obligatorio — se sanea automáticamente a minúsculas y guiones bajos."
+        ),
+    )
+
     form_tab, json_tab = st.tabs(["Form", "JSON"])
 
     with form_tab:
@@ -374,6 +388,11 @@ def _render_launch_form(run: IngestionRun, latest: training_repo.TrainingRun | N
                 st.error(error)
 
     if st.button("Start training", icon=":material/play_arrow:"):
+        checkpoint_name = naming.slugify(config["checkpoint_name"] or "")
+        if not checkpoint_name:
+            st.error("El nombre del checkpoint es obligatorio.")
+            return
+        config["checkpoint_name"] = checkpoint_name
         try:
             validated_config = training_service.TrainingConfig(**config)
         except ValidationError as exc:

@@ -12,6 +12,7 @@ import re
 import sqlite3
 import time
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,8 +20,9 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from feature_pipeline.domain import cost, train_log
+from feature_pipeline.domain import checkpoint_log, cost, train_log
 from feature_pipeline.domain.worker_contracts import PrecacheSettings, TrainSettings
+from feature_pipeline.infrastructure import checkpoint_files
 from feature_pipeline.infrastructure import training_repository as repo
 from feature_pipeline.infrastructure import training_runner
 from feature_pipeline.infrastructure.storage import training_runtime_dir, write_caption_sidecar
@@ -52,6 +54,7 @@ class TrainingConfig(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
+    checkpoint_name: str = ""
     total_steps: int = Field(default=3000, gt=0)
     lr: float = Field(default=1.5e-4, gt=0)
     lora_rank: int = Field(default=32, gt=0)
@@ -631,8 +634,8 @@ def _launch_train(
         cache_dir=str(cache_dir),
         output_dir=str(output_dir),
         trigger_word=trigger_word,
-        checkpoint_prefix=dataset_name,
-        **config.model_dump(),
+        checkpoint_prefix=config.checkpoint_name or dataset_name,
+        **config.model_dump(exclude={"checkpoint_name"}),
     ).model_dump()
 
     pid, log_path = training_runner.launch(
@@ -694,16 +697,111 @@ def read_train_log_summary(
     return train_log.summarize(records) if records else None
 
 
+def checkpoint_log_csv_path(training_run: repo.TrainingRun) -> Path:
+    """Where krea2.metrics.CheckpointLog writes checkpoint_log.csv.
+
+    Sibling of train_log.csv inside output_dir, so it is resolved the same way and
+    inherits the same reason for it: a resumed run appends to the original run's file
+    while writing its own log elsewhere.
+    """
+    output_dir = training_run.config.get("output_dir")
+    if output_dir:
+        return Path(output_dir) / "checkpoint_log.csv"
+    return Path(training_run.log_path).parent / "checkpoints" / "checkpoint_log.csv"
+
+
+def read_checkpoint_log_summary(
+    training_run: repo.TrainingRun,
+) -> checkpoint_log.CheckpointLogSummary | None:
+    """Summarise this run's checkpoint_log.csv, or None if there is nothing usable.
+
+    The I/O half of domain.checkpoint_log, and the same contract as
+    read_train_log_summary: streamed, never raises, absent for any run that predates
+    checkpoint logging or died before writing its first checkpoint.
+    """
+    if training_run.kind != "train":
+        return None
+    try:
+        path = checkpoint_log_csv_path(training_run)
+        with path.open(newline="", encoding="utf-8") as handle:
+            records = checkpoint_log.parse_rows(csv.reader(handle))
+    except (OSError, UnicodeDecodeError, csv.Error):
+        return None
+    return checkpoint_log.summarize(records) if records else None
+
+
+def reconstruct_checkpoint_log_summary(
+    launches: Sequence[repo.TrainingRun],
+) -> checkpoint_log.CheckpointLogSummary | None:
+    """Infer a training's spans from the checkpoints it left, for runs with no log.
+
+    The last resort behind read_checkpoint_log_summary and the stored snapshot: every
+    run launched before the trainer logged its saves has nothing but the
+    `.safetensors` files themselves. Their mtimes bracket the work between them, and
+    their headers carry the step and the image count.
+
+    The launches are passed whole because their `started_at` is what makes a resumed
+    run come out right — anchoring each launch's first span to when that process
+    started, instead of charging it the hours the previous one lay dead.
+    """
+    if not launches:
+        return None
+    latest = launches[-1]
+    if latest.kind != "train":
+        return None
+
+    output_dir = latest.config.get("output_dir")
+    if not output_dir:
+        return None
+
+    files = checkpoint_files.list_checkpoint_files(Path(output_dir))
+    if not files:
+        return None
+
+    starts = [
+        (run.training_run_id, run.started_at.timestamp())
+        for run in launches
+        if run.started_at is not None
+    ]
+    save_every = latest.config.get("save_every")
+    records = checkpoint_log.reconstruct(
+        [
+            checkpoint_log.CheckpointFile(
+                step=info.step,
+                written_at=info.written_at,
+                num_images=info.num_images,
+                epoch=info.epoch,
+                is_final=info.is_final,
+            )
+            for info in files
+        ],
+        launches=starts,
+        save_every=int(save_every) if save_every else None,
+    )
+    if not records:
+        return None
+    return checkpoint_log.summarize(records, reconstructed=True)
+
+
 def _persist_train_log_metrics(
     conn: sqlite3.Connection, training_run: repo.TrainingRun
 ) -> None:
-    """Store what the run's CSV says, if it says anything."""
+    """Store what the run's CSVs say, if either says anything.
+
+    Both snapshots go in one statement, but neither is required: a run killed before
+    its first checkpoint has a train_log and no checkpoint_log, and a run launched
+    before checkpoint logging existed has the first and never the second.
+    """
     summary = read_train_log_summary(training_run)
-    if summary is None:
+    checkpoints = read_checkpoint_log_summary(training_run)
+    if summary is None and checkpoints is None:
         return
     repo.record_train_log_metrics(
         conn,
         training_run.training_run_id,
-        steps_executed=summary.steps_executed,
-        metrics=summary.model_dump(mode="json"),
+        steps_executed=summary.steps_executed if summary is not None else None,
+        metrics=summary.model_dump(mode="json") if summary is not None else {},
+        checkpoint_metrics=(
+            checkpoints.model_dump(mode="json") if checkpoints is not None else {}
+        ),
     )

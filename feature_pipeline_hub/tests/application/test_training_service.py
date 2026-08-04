@@ -89,6 +89,31 @@ def test_start_training_runs_precache_then_launches_train(
     training_runner.stop_process(train_run.pid, grace_period_seconds=1)
 
 
+def test_checkpoint_name_overrides_dataset_name_in_checkpoint_prefix(
+    conn, fake_model_dir, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        training_service, "PRECACHE_SCRIPT", _write_stub(tmp_path, SUCCESSFUL_PRECACHE)
+    )
+    monkeypatch.setattr(training_service, "TRAIN_SCRIPT", _write_stub(tmp_path, STUB_TRAIN))
+
+    training_run_id = training_service.start_training(
+        conn,
+        dataset_run_id="run-1",
+        dataset_name="my_concept",
+        trigger_word="sks_test",
+        config=training_service.TrainingConfig(total_steps=20, checkpoint_name="custom_name"),
+    )
+
+    train_run = repo.get_training_run(conn, training_run_id)
+    assert train_run.config["checkpoint_prefix"] == "custom_name"
+    assert "checkpoint_name" not in train_run.config
+
+    from feature_pipeline.infrastructure import training_runner
+
+    training_runner.stop_process(train_run.pid, grace_period_seconds=1)
+
+
 def test_advanced_hyperparameters_flow_through_to_the_persisted_config(
     conn, fake_model_dir, tmp_path, monkeypatch
 ):
@@ -361,6 +386,166 @@ def test_finalize_dead_run_stores_metrics_alongside_the_lifecycle_telemetry(conn
     assert updated.status == "completed"
     assert updated.duration_seconds == 600.0
     assert updated.steps_executed == 1200
+
+
+CHECKPOINT_LOG_HEADER = (
+    "step,epoch,reason,timestamp,elapsed_seconds,steps_delta,num_images,launch_id"
+)
+
+
+def _write_checkpoint_log(output_dir: Path, spans, launch="L1") -> None:
+    """spans: (step, reason, elapsed, steps_delta) tuples."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    rows = [CHECKPOINT_LOG_HEADER] + [
+        f"{step},1,{reason},1000.000,{elapsed:.3f},{delta},40,{launch}"
+        for step, reason, elapsed, delta in spans
+    ]
+    (output_dir / "checkpoint_log.csv").write_text("\n".join(rows) + "\n")
+
+
+def test_read_checkpoint_log_summary_reads_the_spans(conn, tmp_path):
+    training_run_id, _, output_dir = _train_run_with_log(conn, tmp_path, [4, 8])
+    _write_checkpoint_log(output_dir, [(100, "periodic", 120.0, 100),
+                                       (137, "interrupt", 30.0, 37)])
+
+    summary = training_service.read_checkpoint_log_summary(
+        repo.get_training_run(conn, training_run_id)
+    )
+
+    assert summary.checkpoint_count == 2
+    assert summary.interrupted_count == 1
+    assert summary.total_elapsed_seconds == 150.0
+    assert summary.median_seconds_per_image == 3.0   # 120s over 40 unique images
+
+
+def test_read_checkpoint_log_summary_is_none_when_the_run_never_saved(conn, tmp_path):
+    """The common case for every run launched before checkpoint logging existed."""
+    training_run_id, _, _ = _train_run_with_log(conn, tmp_path, [4, 8])
+
+    assert training_service.read_checkpoint_log_summary(
+        repo.get_training_run(conn, training_run_id)
+    ) is None
+
+
+def test_finalize_dead_run_stores_the_checkpoint_spans_too(conn, tmp_path):
+    training_run_id, log_path, output_dir = _train_run_with_log(
+        conn, tmp_path, range(4, 401, 4)
+    )
+    _write_checkpoint_log(output_dir, [(100, "periodic", 120.0, 100),
+                                       (200, "periodic", 110.0, 100)])
+    log_path.write_text("killed before it could finish\n")
+    run = repo.get_training_run(conn, training_run_id)
+
+    training_service.finalize_dead_run(conn, run, fallback_status="failed")
+
+    updated = repo.get_training_run(conn, training_run_id)
+    assert updated.steps_executed == 400                        # train_log, unchanged
+    assert updated.checkpoint_metrics["checkpoint_count"] == 2   # and the new blob
+    assert updated.checkpoint_metrics["total_elapsed_seconds"] == 230.0
+
+
+def test_a_resumed_trainings_launches_survive_into_the_stored_snapshot(conn, tmp_path):
+    """Two processes, one output_dir, one record — with the launches still separable."""
+    training_run_id, log_path, output_dir = _train_run_with_log(
+        conn, tmp_path, range(4, 401, 4)
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "checkpoint_log.csv").write_text(
+        "\n".join([
+            CHECKPOINT_LOG_HEADER,
+            "100,1,periodic,1000.000,120.000,100,40,first",
+            "200,2,interrupt,1120.000,110.000,100,40,first",
+            "300,3,periodic,9000.000,130.000,100,40,second",   # after the resume
+        ]) + "\n"
+    )
+    log_path.write_text("killed before it could finish\n")
+
+    training_service.finalize_dead_run(
+        conn, repo.get_training_run(conn, training_run_id), fallback_status="failed"
+    )
+
+    stored = repo.get_training_run(conn, training_run_id).checkpoint_metrics
+    assert stored["launch_count"] == 2
+    assert [i["launch_ordinal"] for i in stored["intervals"]] == [1, 1, 2]
+    # The 10_000s the process spent dead is not in there: each launch times its own.
+    assert stored["total_elapsed_seconds"] == 360.0
+
+
+def _write_fake_checkpoint(path: Path, step: int, mtime: float, images: str = "21"):
+    import json as _json
+    import os
+    import struct
+    header = _json.dumps({"__metadata__": {
+        "ss_num_train_images": images,
+        "training_info": _json.dumps({"step": step, "epoch": 0}),
+    }}).encode("utf-8")
+    path.write_bytes(struct.pack("<Q", len(header)) + header)
+    os.utime(path, (mtime, mtime))
+
+
+def test_a_run_with_no_log_is_reconstructed_from_its_checkpoint_files(conn, tmp_path):
+    """Every training launched before the trainer logged its saves.
+
+    Modelled on train-e2aae046: two launches, a stop at 1852, and 744s where the
+    process was dead that must not be charged as training time.
+    """
+    output_dir = tmp_path / "checkpoints"
+    output_dir.mkdir(parents=True)
+    _write_fake_checkpoint(output_dir / "dh_step_1800.safetensors", 1800, 4_000.0)
+    _write_fake_checkpoint(output_dir / "dh_step_1852.safetensors", 1852, 4_126.0)
+    _write_fake_checkpoint(output_dir / "dh_step_2100.safetensors", 2100, 5_513.0)
+
+    import dataclasses
+    from datetime import datetime, timezone
+
+    started = datetime(2026, 8, 3, 15, 46, tzinfo=timezone.utc)
+    first = repo.TrainingRun(
+        training_run_id="t1", dataset_run_id="r1", kind="train", status="stopped",
+        pid=1, log_path=str(tmp_path / "a.txt"),
+        config={"output_dir": str(output_dir), "save_every": 300},
+        started_at=started, finished_at=None,
+    )
+    # The relaunch: 4_870.0 epoch seconds, i.e. after the stop and before step 2100.
+    second = dataclasses.replace(
+        first,
+        training_run_id="t2",
+        started_at=datetime.fromtimestamp(4_870.0, tz=timezone.utc),
+    )
+
+    summary = training_service.reconstruct_checkpoint_log_summary([first, second])
+
+    assert summary.is_reconstructed is True
+    assert summary.launch_count == 2
+    assert [i.step for i in summary.intervals] == [1800, 1852, 2100]
+    assert [i.reason for i in summary.intervals] == ["periodic", "interrupt", "periodic"]
+    # 5513 - 4870, not 5513 - 4126: the 744s the process spent dead is not training.
+    assert summary.intervals[2].elapsed_seconds == 643.0
+    assert summary.intervals[2].steps_delta == 248
+    assert summary.images_trained == 21
+
+
+def test_reconstruction_needs_checkpoints_on_disk(conn, tmp_path):
+    run = repo.TrainingRun(
+        training_run_id="t1", dataset_run_id="r1", kind="train", status="completed",
+        pid=1, log_path=str(tmp_path / "a.txt"),
+        config={"output_dir": str(tmp_path / "reclaimed")},
+        started_at=None, finished_at=None,
+    )
+
+    assert training_service.reconstruct_checkpoint_log_summary([run]) is None
+    assert training_service.reconstruct_checkpoint_log_summary([]) is None
+
+
+def test_finalize_dead_run_stores_nothing_when_neither_csv_exists(conn, tmp_path):
+    training_run_id, log_path, _ = _train_run_with_log(conn, tmp_path, None)
+    log_path.write_text("nothing structured here\n")
+    run = repo.get_training_run(conn, training_run_id)
+
+    training_service.finalize_dead_run(conn, run, fallback_status="failed")
+
+    updated = repo.get_training_run(conn, training_run_id)
+    assert updated.steps_executed is None
+    assert updated.checkpoint_metrics == {}
 
 
 def test_finalize_dead_run_on_a_precache_row_leaves_the_metrics_alone(conn, tmp_path):
@@ -681,4 +866,41 @@ def test_training_log_csv_path_is_next_to_the_checkpoints():
 
     assert training_service.training_log_csv_path(run) == Path(
         "/x/runs/train-abc/checkpoints/train_log.csv"
+    )
+
+
+def test_checkpoint_log_csv_path_follows_the_same_output_dir():
+    """It is a sibling of train_log.csv, so a resume must resolve it the same way."""
+    run = repo.TrainingRun(
+        training_run_id="t2",
+        dataset_run_id="r1",
+        kind="train",
+        status="running",
+        pid=1,
+        log_path="/x/runs/train-resumed/log.txt",
+        config={"output_dir": "/x/runs/train-original/checkpoints"},
+        started_at=None,
+        finished_at=None,
+    )
+
+    assert training_service.checkpoint_log_csv_path(run) == Path(
+        "/x/runs/train-original/checkpoints/checkpoint_log.csv"
+    )
+
+
+def test_checkpoint_log_csv_path_is_next_to_the_checkpoints():
+    run = repo.TrainingRun(
+        training_run_id="t1",
+        dataset_run_id="r1",
+        kind="train",
+        status="running",
+        pid=1,
+        log_path="/x/runs/train-abc/log.txt",
+        config={},
+        started_at=None,
+        finished_at=None,
+    )
+
+    assert training_service.checkpoint_log_csv_path(run) == Path(
+        "/x/runs/train-abc/checkpoints/checkpoint_log.csv"
     )

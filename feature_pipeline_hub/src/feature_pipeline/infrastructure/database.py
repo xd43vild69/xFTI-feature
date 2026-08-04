@@ -137,6 +137,11 @@ TRAINING_RUN_COLUMN_MIGRATIONS = {
     # blob, the same shape config_json already has on this table.
     "steps_executed": "INTEGER",
     "metrics_json": "TEXT NOT NULL DEFAULT '{}'",
+    # The same treatment for domain.checkpoint_log.summarize(): one row per
+    # checkpoint the run wrote, with the wall-clock span that led to it. Its own
+    # column rather than a key inside metrics_json, because the two files are read
+    # independently and either can be present without the other.
+    "checkpoint_metrics_json": "TEXT NOT NULL DEFAULT '{}'",
 }
 
 # Per-step telemetry for ingestion runs: durations, error counts, and a cost

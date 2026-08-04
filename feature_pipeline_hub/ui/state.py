@@ -144,14 +144,22 @@ def _training_fingerprint(run_id: str) -> tuple:
         runs = training_repo.list_training_runs(conn, dataset_run_id=run_id)
     trains = [run for run in runs if run.kind == "train"]
     if not trains:
-        return (run_id, 0, "", 0.0, 0)
-    csv_path = training_service.training_log_csv_path(trains[0])
+        return (run_id, 0, "", 0.0, 0, 0.0, 0)
+    train_stat = _stat_or_zero(training_service.training_log_csv_path(trains[0]))
+    # checkpoint_log.csv grows once per save_every, far more slowly than train_log.csv
+    # — but on its own schedule, so a Checkpoints tab watching only the other file's
+    # mtime would sit on a stale table for as long as the cache survived.
+    ckpt_stat = _stat_or_zero(training_service.checkpoint_log_csv_path(trains[0]))
+    return (run_id, len(trains), trains[0].status, *train_stat, *ckpt_stat)
+
+
+def _stat_or_zero(path: Path) -> tuple[float, int]:
+    """(mtime, size) for a file, or zeros if it is not there yet."""
     try:
-        stat = csv_path.stat()
-        size, mtime = stat.st_size, stat.st_mtime
+        stat = path.stat()
     except OSError:
-        size, mtime = 0, 0.0
-    return (run_id, len(trains), trains[0].status, mtime, size)
+        return (0.0, 0)
+    return (stat.st_mtime, stat.st_size)
 
 
 @st.cache_data(max_entries=4, show_spinner=False)

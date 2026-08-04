@@ -513,13 +513,20 @@ def train_krea2():
     FINGERPRINT = _lora_io.fingerprint(CFG)
 
     # ── RESTAURACIÓN DE CHECKPOINT Y HAND-OFF ENTRE FASES ────────────────────
-    ckpt = _state.CheckpointManager(CFG, model, optimizer)
+    # Constructed here rather than beside CsvLogs further down, because its clock
+    # starts at construction and the signal handlers installed below can fire long
+    # before the cache finishes loading.
+    ckpt_log = _metrics.CheckpointLog(OUTPUT_DIR, enabled=CSV_LOG)
+    ckpt = _state.CheckpointManager(CFG, model, optimizer, ckpt_log=ckpt_log)
     FINGERPRINT = ckpt.fingerprint
     restored = ckpt.restore(ema)
     if restored.already_complete:
         return
     start_step = restored.start_step
     pending_state = restored.pending
+    # So a resumed launch's first span counts the steps it actually ran, not every
+    # step since zero. The clock stays where it was set: restoring is startup cost.
+    ckpt_log.set_start_step(start_step)
     if start_step == 0:
         ckpt.load_previous_phase()
 
@@ -527,11 +534,20 @@ def train_krea2():
     sampler = None             # lo construye el cargador de caché, más abajo
     saving = {"busy": False, "done_on_exit": False}
 
-    def save_checkpoint_now(current_s):
-        """Save the full resumable state atomically, and non-reentrantly."""
-        ckpt.save(current_s, sampler=sampler, ema=ema, num_images=len(cache_data))
+    def save_checkpoint_now(current_s, reason="periodic"):
+        """Save the full resumable state atomically, and non-reentrantly.
 
-    ckpt.install_signal_handlers(lambda: last_step_executed, save_checkpoint_now)
+        The single funnel for every save in this file — the save_every cadence, the
+        signal handlers, OOM, non-finite gradients and the final one — which is why
+        the checkpoint log is hooked in behind it rather than at each call site.
+        """
+        ckpt.save(current_s, sampler=sampler, ema=ema, num_images=len(cache_data),
+                  reason=reason)
+
+    ckpt.install_signal_handlers(
+        lambda: last_step_executed,
+        lambda s: save_checkpoint_now(s, reason="interrupt"),
+    )
 
     model.train()
     optimizer.zero_grad(set_to_none=True)
@@ -664,7 +680,7 @@ def train_krea2():
               f"({oom_streak}/{OOM_ABORT_AFTER} consecutive)")
         if oom_streak >= OOM_ABORT_AFTER:
             print("[!] Persistent OOM; saving checkpoint and aborting / guardando y abortando.")
-            save_checkpoint_now(last_step_executed)
+            save_checkpoint_now(last_step_executed, reason="interrupt")
             return True
         return False
     running_loss, t_step_avg = 0.0, 0.0
@@ -772,7 +788,7 @@ def train_krea2():
                       f"({nan_count}/{NAN_ABORT_AFTER})")
                 if nan_count >= NAN_ABORT_AFTER:
                     print("[!] Too many non-finite losses; saving and aborting / abortando.")
-                    save_checkpoint_now(last_step_executed)
+                    save_checkpoint_now(last_step_executed, reason="interrupt")
                     return
                 continue
 
@@ -801,7 +817,7 @@ def train_krea2():
                           f"({nan_count}/{NAN_ABORT_AFTER})")
                     if nan_count >= NAN_ABORT_AFTER:
                         print("[!] Too many non-finite gradients; saving and aborting / abortando.")
-                        save_checkpoint_now(last_step_executed)
+                        save_checkpoint_now(last_step_executed, reason="interrupt")
                         return
                 else:
                     grad_norm = gnorm.item()
@@ -879,11 +895,11 @@ def train_krea2():
         # No debería llegar aquí (el guard interno la captura), pero si el guard
         # está desactivado conviene salvar el trabajo antes de morir.
         print(f"\n[!] CUDA OOM at step {last_step_executed}; saving checkpoint / guardando.")
-        save_checkpoint_now(last_step_executed)
+        save_checkpoint_now(last_step_executed, reason="interrupt")
         raise
     except (KeyboardInterrupt, SystemExit):
         if not ckpt.saved_on_exit:
-            save_checkpoint_now(last_step_executed)
+            save_checkpoint_now(last_step_executed, reason="interrupt")
         return
 
     # A5: la ventana final de acumulación se descartaba si total_steps no era
@@ -906,7 +922,7 @@ def train_krea2():
         print(f"[i] Final validation loss: {validation_loss():.4f}")
     # Guardar también el resume_checkpoint al terminar: en el pipeline progresivo
     # es el hand-off de pesos que carga la fase siguiente vía init_lora_from.
-    save_checkpoint_now(TOTAL_STEPS)
+    save_checkpoint_now(TOTAL_STEPS, reason="final")
     final = ckpt.export_final(TOTAL_STEPS, sampler=sampler, ema=ema,
                               num_images=len(cache_data))
     print(f"✓ Final LoRA saved to / Tu LoRA definitivo está en: {final}")

@@ -218,7 +218,7 @@ def summarize(records: Sequence[TrainStepRecord]) -> TrainLogSummary:
         mean_loss_tail=tail,
         loss_delta=(tail - head) if head is not None and tail is not None else None,
         logged_seconds=sum(secs) if secs else None,
-        median_seconds_per_logged_step=_percentile(sorted(secs), 0.5),
+        median_seconds_per_logged_step=percentile(sorted(secs), 0.5),
         peak_vram_gb=max(vram) if vram else None,
         epochs_started=epochs_started,
         # The highest epoch seen is the one in progress, so it is not finished.
@@ -232,8 +232,8 @@ def summarize(records: Sequence[TrainStepRecord]) -> TrainLogSummary:
         # four decimals — rare enough to note rather than engineer around.
         skipped_updates=sum(1 for r in records if r.grad_norm <= 0.0),
         nonfinite_loss_count=sum(1 for r in records if not math.isfinite(r.loss)),
-        grad_norm_p50=_percentile(grad_norms, 0.5),
-        grad_norm_p95=_percentile(grad_norms, 0.95),
+        grad_norm_p50=percentile(grad_norms, 0.5),
+        grad_norm_p95=percentile(grad_norms, 0.95),
         grad_norm_max=grad_norms[-1] if grad_norms else None,
         loss_spike_count=_count_spikes(finite_losses),
     )
@@ -356,7 +356,7 @@ def _steps_per_epoch(records: Sequence[TrainStepRecord]) -> float | None:
     ]
     if not spans:
         return None
-    return _percentile(sorted(spans), 0.5)
+    return percentile(sorted(spans), 0.5)
 
 
 def _bucket_counts(records: Sequence[TrainStepRecord]) -> dict[str, int]:
@@ -372,14 +372,18 @@ def _count_spikes(losses: Sequence[float]) -> int:
     """Losses far above the run's median. Heuristic: high-sigma steps trip it too."""
     if not losses:
         return 0
-    middle = _percentile(sorted(losses), 0.5)
+    middle = percentile(sorted(losses), 0.5)
     if middle is None or middle <= 0:
         return 0
     return sum(1 for loss in losses if loss > SPIKE_FACTOR * middle)
 
 
-def _percentile(ordered: Sequence[float], q: float) -> float | None:
-    """Linear-interpolated percentile of an already-sorted sequence, or None if empty."""
+def percentile(ordered: Sequence[float], q: float) -> float | None:
+    """Linear-interpolated percentile of an already-sorted sequence, or None if empty.
+
+    Public because `checkpoint_log` takes its medians the same way, and two copies of
+    this would eventually disagree about the interpolation.
+    """
     if not ordered:
         return None
     if len(ordered) == 1:

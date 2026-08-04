@@ -34,6 +34,9 @@ class TrainingRun:
     # which leaves a model untouched and then fails to serialize it.
     steps_executed: int | None = None
     metrics: dict = field(default_factory=dict)
+    # And what its checkpoint_log.csv said — the per-checkpoint spans. Same plain-dict
+    # treatment, for the same three reasons.
+    checkpoint_metrics: dict = field(default_factory=dict)
 
 
 def create_training_run(
@@ -113,8 +116,9 @@ def record_train_log_metrics(
     *,
     steps_executed: int | None,
     metrics: dict,
+    checkpoint_metrics: dict | None = None,
 ) -> None:
-    """Attach a train_log.csv snapshot to a run, touching nothing else.
+    """Attach the CSV snapshots to a run, touching nothing else.
 
     Deliberately not folded into update_training_run_status as more keyword
     arguments: that one writes every telemetry column from its defaults on every
@@ -125,10 +129,15 @@ def record_train_log_metrics(
         conn.execute(
             """
             UPDATE training_runs
-            SET steps_executed = ?, metrics_json = ?
+            SET steps_executed = ?, metrics_json = ?, checkpoint_metrics_json = ?
             WHERE training_run_id = ?
             """,
-            (steps_executed, json.dumps(metrics), training_run_id),
+            (
+                steps_executed,
+                json.dumps(metrics),
+                json.dumps(checkpoint_metrics or {}),
+                training_run_id,
+            ),
         )
 
 
@@ -182,6 +191,7 @@ def _row_to_training_run(row: sqlite3.Row) -> TrainingRun:
         error_message=row["error_message"],
         steps_executed=row["steps_executed"],
         metrics=_load_metrics(row["metrics_json"]),
+        checkpoint_metrics=_load_metrics(row["checkpoint_metrics_json"]),
     )
 
 
