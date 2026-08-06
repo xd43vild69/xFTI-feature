@@ -42,6 +42,33 @@ class DatasetSample(BaseModel):
     is_valid: bool = True
     validation_errors: list[str] = Field(default_factory=list)
 
+    # How `image_path` was produced, when the hub produced it. Empty
+    # `source_image_path` means the file is exactly as imported.
+    source_image_path: str = ""
+    rotation_degrees: int = 0
+    # None = the derivation applied no downscale (see database.SAMPLE_COLUMN_MIGRATIONS).
+    derived_max_side: int | None = None
+
+    @property
+    def origin_path(self) -> str:
+        """The untouched file every derivation starts from.
+
+        Falls back to `image_path` for samples imported before provenance was
+        tracked: their original is genuinely unknown, so the current file is the
+        best available starting point — one extra re-encode for those, not a crash.
+        """
+        return self.source_image_path or self.image_path
+
+    @property
+    def is_derived(self) -> bool:
+        return bool(self.source_image_path)
+
+    @field_validator("rotation_degrees")
+    @classmethod
+    def _normalize_rotation(cls, value: int) -> int:
+        """Keep rotation in [0, 360) so four right-turns are stored as none at all."""
+        return value % 360
+
 
 class DuplicateCluster(BaseModel):
     """A group of near-identical images found by perceptual hashing.

@@ -9,11 +9,12 @@ train_settings.json in LoRAlab (see `_cfg()` in train_worker.py).
 
 import csv
 import re
+import shutil
 import sqlite3
 import time
 import uuid
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
@@ -21,6 +22,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from feature_pipeline.domain import checkpoint_log, cost, train_log
+from feature_pipeline.domain.naming import slugify
 from feature_pipeline.domain.worker_contracts import PrecacheSettings, TrainSettings
 from feature_pipeline.infrastructure import checkpoint_files
 from feature_pipeline.infrastructure import training_repository as repo
@@ -497,6 +499,14 @@ class ResumePoint:
     # fields, and a dict in there would make instances unhashable — which breaks the
     # moment one is handed to a widget as an option. training_run_id identifies it.
     config: dict = field(compare=False)
+    # "exact" — the run's own resume_checkpoint/optimizer.pt, restorable in full and the
+    # only thing resume_training will ever touch. "warm" — one of the per-step exports,
+    # weights only. Defaults to "exact" so every pre-existing construction site (and
+    # find_resume_points itself) keeps its meaning unchanged.
+    kind: str = "exact"
+    # The `{prefix}_step_N.safetensors` a warm point starts from; None when kind is
+    # "exact", where the state lives in output_dir itself.
+    source_export: Path | None = None
 
 
 class ResumeUnavailable(RuntimeError):
@@ -527,8 +537,15 @@ def find_resume_points(conn: sqlite3.Connection, dataset_run_id: str) -> list[Re
     directory, so each entry keeps the hyperparameters it was launched with —
     resuming has to reuse them, since a changed rank or alpha makes the saved
     adapter fail to load.
+
+    One entry per `output_dir`, not per row. A resume reuses its parent's output_dir by
+    design, so N launches of one lineage share a single checkpoint — offering it N times
+    would be N identical choices leading to the identical relaunch. Rows arrive
+    newest-first, so the one kept is the latest launch, whose config carries whatever
+    `total_steps` was last raised to.
     """
     points: list[ResumePoint] = []
+    seen: set[Path] = set()
     for run in repo.list_training_runs(conn, dataset_run_id=dataset_run_id):
         if run.kind != "train" or run.status == "running":
             continue
@@ -536,6 +553,9 @@ def find_resume_points(conn: sqlite3.Connection, dataset_run_id: str) -> list[Re
         if not raw_output_dir:
             continue
         output_dir = Path(raw_output_dir)
+        if output_dir in seen:
+            continue
+        seen.add(output_dir)
         step = checkpoint_step(output_dir)
         if step is None:
             continue
@@ -610,6 +630,220 @@ def resume_training(
         pid=pid,
         log_path=log_path,
         config=settings,
+    )
+
+
+class ForkUnavailable(RuntimeError):
+    """A fork was requested that cannot be launched as asked."""
+
+
+# Hyperparameters pinned to the parent on every fork, and never accepted as an
+# override. lora_rank/lora_alpha/model_id are hard constraints — the copied adapter
+# would fail to load against different ones (same reason resume_training carries
+# them). The rest are the confounder this whole feature exists to avoid: lr,
+# lr_scheduler, lr_num_cycles and warmup_steps jointly determine the learning rate at
+# every step past the fork, so two sibling branches with different total_steps are
+# already on different points of their cosine tail before either of them touches a
+# single differing image. batch_size/grad_accum_steps/seed change what a "step" even
+# samples. Only total_steps (unavoidable — it's what "further training" means) and
+# save_every (only changes save cadence, not learning) are accepted overrides.
+_FORK_PINNED_KEYS = (
+    "model_id", "lr", "lr_scheduler", "lr_num_cycles", "warmup_steps",
+    "lora_rank", "lora_alpha", "seed", "batch_size", "grad_accum_steps",
+    "timestep_weighting", "noise_offset", "caption_dropout_rate",
+)
+
+
+@dataclass(frozen=True)
+class BranchSpec:
+    """What distinguishes one forked branch from its siblings."""
+
+    label: str
+    dataset_name: str
+    trigger_word: str
+    dataset_content_hash: str = ""
+    weight_profile: dict = field(default_factory=dict)
+
+
+def find_fork_points(conn: sqlite3.Connection, *, dataset_run_id: str) -> list[ResumePoint]:
+    """Every step of this dataset's past runs that a branch can start from.
+
+    Two kinds, and the difference is not cosmetic. The **exact** points are what
+    find_resume_points returns: a run's `resume_checkpoint/` plus `optimizer.pt`, which
+    restore the optimizer moments, RNG streams and sampler position along with the
+    weights. There is at most one per run, because `krea2.state` rewrites both in place
+    on every save — a finished 3000-step run offers step 3000 and nothing else.
+
+    The **warm** points are the per-step `.safetensors` exports, which is why they exist
+    here at all: they are the only surviving record of steps 300, 600, 900… and forking
+    mid-run is the whole point of the feature. They carry weights alone, so a branch
+    started from one has a cold optimizer. That does not invalidate a sibling comparison
+    — every branch off the same point is equally cold, so the delta between them is
+    still the data intervention — but it does mean such a branch cannot be read against
+    the *parent's* own curve past that step, which is why the UI pushes a control branch.
+
+    Ordered newest run first, and within a run by step descending, so the head of the
+    list is the most recent state available. The exact point of a run sorts ahead of its
+    own warm points at the same step: with both on offer the restorable one always wins.
+    """
+    points: list[ResumePoint] = []
+    for exact in find_resume_points(conn, dataset_run_id):
+        points.append(exact)
+        points.extend(_warm_fork_points(exact))
+    return points
+
+
+def _warm_fork_points(exact: ResumePoint) -> list[ResumePoint]:
+    """The per-step exports under a run's output_dir, newest step first.
+
+    Skips any export at the exact point's own step: they are the same weights, and the
+    restorable version is strictly better. Skips the FINAL export for the same reason —
+    it duplicates the last per-step file (see `domain.checkpoint_log.reconstruct`, which
+    merges the pair for exactly this reason).
+    """
+    warm: list[ResumePoint] = []
+    for info in checkpoint_files.list_checkpoint_files(exact.output_dir):
+        if info.is_final or info.step >= exact.step or info.step <= 0:
+            continue
+        warm.append(
+            replace(exact, step=info.step, kind="warm", source_export=info.path)
+        )
+    return sorted(warm, key=lambda point: point.step, reverse=True)
+
+
+def fork_training(
+    conn: sqlite3.Connection,
+    *,
+    dataset_run_id: str,
+    fork_point: ResumePoint,
+    branch: BranchSpec,
+    total_steps: int,
+    save_every: int | None = None,
+) -> str:
+    """Branch a previous run's checkpoint into an independent training lineage.
+
+    Unlike resume_training, this mints a *fresh* output_dir and copies the parent's
+    checkpoint into it rather than reusing the parent's in place. That is the whole
+    difference, and it is what makes N sibling branches possible from one checkpoint:
+    the parent is left untouched and re-forkable, and each branch gets its own
+    train_log.csv/val_log.csv/checkpoint_log.csv instead of appending to a shared one.
+
+    A `fork_point.kind` of "warm" starts from a per-step export instead: same fresh
+    output_dir, same pinned hyperparameters, but the branch begins with a cold optimizer
+    because that is all those files contain. See find_fork_points for what that costs.
+
+    `branch.dataset_name` must point at a dataset the branch's own export already
+    wrote (see export_service.export_branch_dataset) — this function launches
+    training against it, it does not create it.
+    """
+    if fork_point.kind == "warm":
+        if fork_point.source_export is None or not fork_point.source_export.is_file():
+            raise ForkUnavailable(
+                f"The export this branch would start from is gone: "
+                f"{fork_point.source_export}."
+            )
+        step = fork_point.step
+    else:
+        step = checkpoint_step(fork_point.output_dir) or 0
+        if step == 0:
+            raise ForkUnavailable(
+                f"No complete checkpoint under {fork_point.output_dir} anymore."
+            )
+    if total_steps <= step:
+        raise ForkUnavailable(
+            f"Checkpoint is at step {step}; total_steps must be greater than that "
+            f"to have anything left to train (got {total_steps})."
+        )
+
+    parent_config = dict(fork_point.config)
+    parent_dataset_name = Path(str(parent_config.get("dataset_path", ""))).name
+    if branch.dataset_name == parent_dataset_name:
+        raise ForkUnavailable(
+            "A branch cannot reuse its parent's dataset folder — exporting into it "
+            "would delete the parent's images out from under it."
+        )
+
+    run_dir = training_runtime_dir() / "runs" / f"train-{uuid.uuid4()}"
+    output_dir = run_dir / "checkpoints"
+
+    # Re-verify rather than trust a clean return: a half-staged start reads as "nothing
+    # to restore" to the trainer, which would then train the branch from step 0 without
+    # complaint — this is the entire safety story for the staging below.
+    try:
+        if fork_point.kind == "warm":
+            assert fork_point.source_export is not None  # narrowed above
+            staged_step = checkpoint_files.materialize_warm_start(
+                step_export=fork_point.source_export,
+                adapter_config=(
+                    fork_point.output_dir / "resume_checkpoint" / "adapter_config.json"
+                ),
+                destination_dir=output_dir,
+                step=step,
+                source_label=str(fork_point.source_export),
+            )
+            verified = checkpoint_files.warm_start_step(output_dir)
+        else:
+            staged_step = checkpoint_files.copy_resume_state(
+                fork_point.output_dir, output_dir
+            )
+            verified = checkpoint_step(output_dir)
+    except (OSError, ValueError) as exc:
+        shutil.rmtree(run_dir, ignore_errors=True)
+        raise ForkUnavailable(f"Could not stage the parent checkpoint: {exc}") from exc
+
+    if staged_step != step or verified != step:
+        shutil.rmtree(run_dir, ignore_errors=True)
+        raise ForkUnavailable("Checkpoint staging did not verify; aborting the fork.")
+
+    dataset_path = dataset_dir_for(branch.dataset_name)
+    cache_dir = cache_dir_for(branch.dataset_name)
+    parent_prefix = str(parent_config.get("checkpoint_prefix") or dataset_run_id)
+
+    overrides = {key: parent_config[key] for key in _FORK_PINNED_KEYS if key in parent_config}
+    settings_dict = {
+        **parent_config,
+        **overrides,
+        "dataset_path": str(dataset_path),
+        "cache_dir": str(cache_dir),
+        "output_dir": str(output_dir),
+        "trigger_word": branch.trigger_word,
+        "checkpoint_prefix": f"{parent_prefix}__{slugify(branch.label)}",
+        "total_steps": total_steps,
+    }
+    if save_every is not None:
+        settings_dict["save_every"] = save_every
+    settings = TrainSettings(**settings_dict).model_dump()
+
+    _run_precache_blocking(
+        conn,
+        dataset_run_id=dataset_run_id,
+        model_dir=Path(settings["model_id"]),
+        dataset_path=dataset_path,
+        cache_dir=cache_dir,
+        trigger_word=branch.trigger_word,
+    )
+
+    pid, log_path = training_runner.launch(
+        TRAIN_SCRIPT,
+        settings,
+        run_dir,
+        TRAIN_SETTINGS_ENV,
+        extra_env={"FTI_RUN_ID": str(uuid.uuid4())},
+    )
+    return repo.create_training_run(
+        conn,
+        dataset_run_id=dataset_run_id,
+        kind="train",
+        pid=pid,
+        log_path=log_path,
+        config=settings,
+        experiment=repo.ExperimentLineage(
+            parent_training_run_id=fork_point.training_run_id,
+            fork_step=step,
+            branch_label=branch.label,
+            dataset_content_hash=branch.dataset_content_hash,
+            weight_profile=branch.weight_profile,
+        ),
     )
 
 
@@ -708,6 +942,19 @@ def checkpoint_log_csv_path(training_run: repo.TrainingRun) -> Path:
     if output_dir:
         return Path(output_dir) / "checkpoint_log.csv"
     return Path(training_run.log_path).parent / "checkpoints" / "checkpoint_log.csv"
+
+
+def validation_log_csv_path(training_run: repo.TrainingRun) -> Path:
+    """Where train_worker.py writes val_log.csv — sibling of train_log.csv.
+
+    No summarizer alongside this one: domain/train_log.py states outright that it
+    never reads val_log.csv, and the branch-comparison view charts the raw column
+    rather than a scalar summary.
+    """
+    output_dir = training_run.config.get("output_dir")
+    if output_dir:
+        return Path(output_dir) / "val_log.csv"
+    return Path(training_run.log_path).parent / "checkpoints" / "val_log.csv"
 
 
 def read_checkpoint_log_summary(

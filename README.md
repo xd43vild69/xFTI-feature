@@ -1,5 +1,7 @@
 # xFTI-feature (Feature Pipeline Hub)
 
+uv run python main.py
+
 **Feature Pipeline Hub** is an end-to-end **LoRA (Low-Rank Adaptation) model training dataset curation and training execution** pipeline, usable two ways: interactively, through a Streamlit application with top-level page navigation, and programmatically, through an [MCP server](#-mcp-server-agent-integration) that exposes the same pipeline as tools for autonomous agents. It provides a unified pipeline for importing raw images and captions, visually curating and AI-recaptioning samples, performing perceptual deduplication and quality analytics, exporting versioned clean datasets, and launching/monitoring LoRA model training — with cross-dataset health and cost observability throughout.
 
 ---

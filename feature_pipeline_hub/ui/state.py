@@ -7,6 +7,7 @@ on different threads, and a SQLite connection is not shared across them safely.
 from contextlib import contextmanager
 from pathlib import Path
 
+import pandas as pd
 import streamlit as st
 from PIL import Image
 
@@ -35,6 +36,7 @@ from feature_pipeline.infrastructure.storage import (
     IMAGE_EXTENSIONS,
     append_uploaded_files,
     delete_managed_folder,
+    run_derived_dir,
     run_upload_dir,
     write_caption_sidecar,
 )
@@ -178,6 +180,95 @@ def training_lineages(run_id: str) -> list[training_metrics_service.TrainingLine
     script on every widget interaction.
     """
     return _cached_training_lineages(_training_fingerprint(run_id))
+
+
+def _branch_fingerprint(
+    dataset_run_id: str, parent_training_run_id: str, fork_step: int
+) -> tuple:
+    """Cheap key for the branch-comparison cache: stats *every* sibling's files.
+
+    `_training_fingerprint` above only stats the dataset's single newest launch,
+    which is correct for one lineage but wrong here: three sibling branches forked
+    from the same checkpoint are three independent lineages, and an older one still
+    training would never invalidate a cache keyed only on the newest. So every
+    branch's train_log.csv and val_log.csv gets its own (mtime, size) pair in the key.
+    """
+    with _db() as conn:
+        branches = training_repo.list_experiment_branches(
+            conn, parent_training_run_id, fork_step
+        )
+    stats: list = [dataset_run_id, parent_training_run_id, fork_step]
+    for run in branches:
+        stats.append(run.training_run_id)
+        stats.append(run.status)
+        stats.extend(_stat_or_zero(training_service.training_log_csv_path(run)))
+        stats.extend(_stat_or_zero(training_service.validation_log_csv_path(run)))
+    return tuple(stats)
+
+
+@st.cache_data(max_entries=4, show_spinner=False)
+def _cached_experiment_branches(
+    fingerprint: tuple, dataset_run_id: str, parent_training_run_id: str, fork_step: int
+) -> list[training_metrics_service.TrainingLineage]:
+    with _db() as conn:
+        lineages = training_metrics_service.load_training_lineages(conn, dataset_run_id)
+    return [
+        lineage
+        for lineage in lineages
+        if lineage.latest.fork_parent_run_id == parent_training_run_id
+        and lineage.latest.fork_step == fork_step
+    ]
+
+
+def experiment_branches(
+    dataset_run_id: str, parent_training_run_id: str, fork_step: int
+) -> list[training_metrics_service.TrainingLineage]:
+    """Every branch forked from the same (parent, step), each its own lineage.
+
+    A forked branch always gets a fresh output_dir (see
+    training_service.fork_training), so group_training_lineages already keeps each
+    branch separate — this only filters load_training_lineages down to the siblings
+    that share a fork point, using the fingerprint above rather than
+    `_training_fingerprint`, which would go stale while an older sibling is still
+    training.
+    """
+    fingerprint = _branch_fingerprint(dataset_run_id, parent_training_run_id, fork_step)
+    return _cached_experiment_branches(
+        fingerprint, dataset_run_id, parent_training_run_id, fork_step
+    )
+
+
+@st.cache_data(max_entries=4, show_spinner=False)
+def _cached_branch_curves(
+    fingerprint: tuple, parent_training_run_id: str, fork_step: int
+) -> dict[str, dict[str, pd.DataFrame]]:
+    """{branch_label: {"train": df, "val": df}} — the raw per-step series a scalar
+    summary can't provide, read straight off each branch's own CSVs."""
+    with _db() as conn:
+        branches = training_repo.list_experiment_branches(
+            conn, parent_training_run_id, fork_step
+        )
+    curves: dict[str, dict[str, pd.DataFrame]] = {}
+    for run in branches:
+        label = run.branch_label or run.training_run_id[:8]
+        series: dict[str, pd.DataFrame] = {}
+        for name, path in (
+            ("train", training_service.training_log_csv_path(run)),
+            ("val", training_service.validation_log_csv_path(run)),
+        ):
+            try:
+                series[name] = pd.read_csv(path)
+            except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError):
+                continue
+        curves[label] = series
+    return curves
+
+
+def branch_curves(
+    dataset_run_id: str, parent_training_run_id: str, fork_step: int
+) -> dict[str, dict[str, pd.DataFrame]]:
+    fingerprint = _branch_fingerprint(dataset_run_id, parent_training_run_id, fork_step)
+    return _cached_branch_curves(fingerprint, parent_training_run_id, fork_step)
 
 
 def save_caption(sample_id: str, caption: str) -> None:
@@ -345,6 +436,43 @@ def set_excluded(sample_ids: list[str], excluded: bool) -> None:
         repo.set_samples_excluded(conn, sample_ids, excluded)
 
 
+MAX_TRAINING_SIDE = image_service.MAX_TRAINING_SIDE
+
+
+def oversized_samples(samples: list[DatasetSample]) -> list[DatasetSample]:
+    """Those of `samples` whose longest side is above the training resolution."""
+    return dataset_service.oversized_samples(samples)
+
+
+def normalize_samples(
+    run: IngestionRun, samples: list[DatasetSample]
+) -> list[dataset_service.DerivationOutcome]:
+    """Downscale the oversized samples in `samples` to 1024px on their longest side.
+
+    The resized copies go to `data/raw/<run_id>/derived/` and the samples are
+    repointed at them; the originals stay untouched wherever they came from. Each
+    sample's thumbnail cache invalidates for free, since it is keyed on the path.
+    """
+    with _db() as conn:
+        return dataset_service.normalize_samples(
+            conn, samples, run_derived_dir(run.run_id), MAX_TRAINING_SIDE
+        )
+
+
+def rotate_sample(
+    run_id: str, sample: DatasetSample, quarter_turns: int
+) -> dataset_service.DerivationOutcome:
+    """Rotate one sample 90° per quarter turn (positive = left, negative = right).
+
+    Re-derived from the sample's original file with the accumulated angle, so the
+    fifth rotation costs a JPEG no more than the first did.
+    """
+    with _db() as conn:
+        return dataset_service.rotate_sample(
+            conn, sample, run_derived_dir(run_id), quarter_turns
+        )
+
+
 def is_training_active() -> bool:
     """Whether a training-runtime job (pre-cache/train/progressive/curate) is
     running right now — the GPU can only do one heavy job at a time.
@@ -354,6 +482,21 @@ def is_training_active() -> bool:
     """
     with _db() as conn:
         return training_service.is_training_active(conn)
+
+
+def active_training_run() -> training_repo.TrainingRun | None:
+    """The job holding the GPU right now, or None — the same question
+    `is_training_active` answers, but returning *which* one.
+
+    Goes through `training_service.is_training_active` first rather than reading
+    `find_running_training_run` directly: that call is where a 'running' row whose
+    process actually died gets corrected to 'failed'. Skipping it would let one crashed
+    run keep the launch buttons disabled forever.
+    """
+    with _db() as conn:
+        if not training_service.is_training_active(conn):
+            return None
+        return training_repo.find_running_training_run(conn)
 
 
 def mark_duplicates(run_id: str, sample_ids: list[str]) -> None:

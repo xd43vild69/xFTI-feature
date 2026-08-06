@@ -3,9 +3,10 @@
 import hashlib
 import sqlite3
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 
-from feature_pipeline.application import quality_service
+from feature_pipeline.application import image_service, quality_service
 from feature_pipeline.application.caption_service import inject_trigger_word, swap_trigger_word
 from feature_pipeline.application.image_service import compute_image_metrics
 from feature_pipeline.domain.models import (
@@ -258,6 +259,169 @@ def append_images(
     if added:
         repo.save_ingestion_run(conn, run)
     return added
+
+
+def oversized_samples(
+    samples: list[DatasetSample], max_side: int = image_service.MAX_TRAINING_SIDE
+) -> list[DatasetSample]:
+    """Samples whose stored dimensions exceed `max_side` on their longest side.
+
+    Read off the stored metrics rather than the files, so listing candidates costs
+    nothing — the images are only opened once the user asks for the resize.
+    """
+    return [
+        s
+        for s in samples
+        if image_service.is_oversized(s.metrics.width, s.metrics.height, max_side)
+    ]
+
+
+@dataclass(frozen=True)
+class DerivationOutcome:
+    """Per-sample record of one rewrite (rotation, downscale, or both).
+
+    `source_size` is the *original* file's dimensions, not the ones the sample
+    carried going in — a second edit re-derives from that original, so reporting
+    the intermediate size would describe a file that no longer exists anywhere.
+    """
+
+    sample_id: str
+    filename: str
+    source_size: tuple[int, int]
+    new_size: tuple[int, int]
+    rotation_degrees: int = 0
+    error: str = ""
+
+
+def _rederive(
+    conn: sqlite3.Connection,
+    sample: DatasetSample,
+    destination_dir: str,
+    *,
+    rotation_degrees: int,
+    max_side: int | None,
+) -> DerivationOutcome:
+    """Rebuild one sample's file from its original, and persist what changed.
+
+    The single funnel for every hub-side pixel edit, and the reason a sample records
+    where it came from: both callers pass the *absolute* transform (total rotation,
+    final size limit) against `origin_path` rather than an increment against the
+    current file. Three rotations and a downscale therefore cost one decode and one
+    encode, not four of each — which on a JPEG is the difference between one
+    generation of loss and four.
+
+    The sample keeps its identity — same `sample_id`, same caption, same curation
+    flags — and gains new pixels. Everything the file decides is recomputed:
+    dimensions, aspect ratio, all three perceptual hashes and sharpness are functions
+    of the pixels, so leaving them would have duplicate detection compare a stored
+    hash of one image against a live hash of another. Note pHash and dHash are not
+    rotation-invariant, so a rotated sample legitimately leaves its duplicate cluster.
+    Validation re-runs too, since the resolution rule reads those dimensions.
+
+    A file that fails to open or write is reported in its own outcome and left
+    entirely alone, so one unreadable image never aborts a batch.
+    """
+    origin = sample.origin_path
+    filename = Path(origin).name
+
+    try:
+        result = image_service.apply_transform(
+            origin,
+            destination_dir,
+            rotation_degrees=rotation_degrees,
+            max_side=max_side,
+        )
+        metrics = image_service.compute_image_metrics(result.output_path)
+    except (OSError, ValueError) as exc:
+        return DerivationOutcome(
+            sample_id=sample.sample_id,
+            filename=filename,
+            source_size=(sample.metrics.width, sample.metrics.height),
+            new_size=(sample.metrics.width, sample.metrics.height),
+            rotation_degrees=sample.rotation_degrees,
+            error=str(exc),
+        )
+
+    sample.image_path = result.output_path
+    sample.metrics = metrics
+    sample.rotation_degrees = rotation_degrees % 360
+    sample.derived_max_side = max_side
+    # Only once the rewrite succeeded, and only if this is the first one: a sample
+    # that came back to its original file (rotated full circle, never downscaled)
+    # still needs to remember where that file is for the next edit.
+    if result.rewritten and not sample.source_image_path:
+        sample.source_image_path = origin
+
+    errors = validate_sample(sample)
+    sample.is_valid = not errors
+    sample.validation_errors = errors
+    repo.update_sample_image(conn, sample)
+
+    return DerivationOutcome(
+        sample_id=sample.sample_id,
+        filename=filename,
+        source_size=(result.source_width, result.source_height),
+        new_size=(result.width, result.height),
+        rotation_degrees=sample.rotation_degrees,
+    )
+
+
+def rotate_sample(
+    conn: sqlite3.Connection,
+    sample: DatasetSample,
+    destination_dir: str,
+    quarter_turns: int,
+) -> DerivationOutcome:
+    """Turn one sample by `quarter_turns` × 90° counter-clockwise (negative = clockwise).
+
+    Applied as a new *total* rotation against the original file rather than as a turn
+    of the current one, so the accumulated angle is the only thing that grows. The
+    downscale the sample already had is carried over in the same pass — rotating a
+    normalized image must not quietly restore it to full resolution.
+    """
+    return _rederive(
+        conn,
+        sample,
+        destination_dir,
+        rotation_degrees=sample.rotation_degrees + 90 * quarter_turns,
+        max_side=sample.derived_max_side,
+    )
+
+
+def normalize_samples(
+    conn: sqlite3.Connection,
+    samples: list[DatasetSample],
+    destination_dir: str,
+    max_side: int = image_service.MAX_TRAINING_SIDE,
+) -> list[DerivationOutcome]:
+    """Downscale oversized samples to `max_side` and repoint them at the copies.
+
+    Samples already within `max_side` are skipped silently rather than re-encoded,
+    and any rotation the sample already carries is preserved through the rewrite.
+
+    Sharpness changes by construction: `compute_sharpness` reduces to a fixed 512px
+    before measuring, and a 4000px source reaching that size through one Lanczos pass
+    is not the same as reaching it through two. The ranking stays usable because it is
+    only ever compared within a run — but a half-normalized run is a mixed population,
+    which is the argument for normalizing all of them or none.
+    """
+    outcomes: list[DerivationOutcome] = []
+
+    for sample in samples:
+        if not image_service.is_oversized(sample.metrics.width, sample.metrics.height, max_side):
+            continue
+
+        outcomes.append(
+            _rederive(
+                conn,
+                sample,
+                destination_dir,
+                rotation_degrees=sample.rotation_degrees,
+                max_side=max_side,
+            )
+        )
+
+    return outcomes
 
 
 def _resolved(image_path: str) -> str:

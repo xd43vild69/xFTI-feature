@@ -118,6 +118,17 @@ SAMPLE_COLUMN_MIGRATIONS = {
     "is_excluded": "BOOLEAN NOT NULL DEFAULT 0",
     "is_flagged": "BOOLEAN NOT NULL DEFAULT 0",
     "sharpness": "REAL NOT NULL DEFAULT 0",
+    # Provenance for images the hub rewrote (rotation, downscaling). `file_path` is
+    # whatever the pipeline currently uses; these three say what it was derived from
+    # and how, so an edit re-derives from the untouched original in a single
+    # re-encode instead of stacking a JPEG generation per click. Empty
+    # `source_file_path` means file_path *is* the original and nothing was applied.
+    "source_file_path": "TEXT NOT NULL DEFAULT ''",
+    "rotation_degrees": "INTEGER NOT NULL DEFAULT 0",
+    # NULL means "no downscale in this sample's derivation" — distinct from 0, and
+    # the reason it is stored rather than inferred: an image that happens to sit
+    # under the limit is indistinguishable from one deliberately left at full size.
+    "derived_max_side": "INTEGER",
 }
 
 # Telemetry columns added once workers/_telemetry.py started emitting
@@ -142,6 +153,20 @@ TRAINING_RUN_COLUMN_MIGRATIONS = {
     # column rather than a key inside metrics_json, because the two files are read
     # independently and either can be present without the other.
     "checkpoint_metrics_json": "TEXT NOT NULL DEFAULT '{}'",
+    # Experiment-fork lineage (see application/training_service.fork_training).
+    # fork_parent_run_id + fork_step is the sibling key: two branches are only
+    # comparable when both match. branch_label is the one human-readable axis a
+    # comparison chart's legend needs. dataset_content_hash is what proves a
+    # "control" branch really was byte-identical to its parent's dataset, and it
+    # lives here rather than in config_json because TrainSettings forbids extra
+    # keys. weight_profile_json is the three tier VALUES for this experiment; the
+    # per-image tier ASSIGNMENT is not duplicated here — it lives in the branch's
+    # own curation_report.json on disk, which is the file the trainer actually read.
+    "fork_parent_run_id": "TEXT NOT NULL DEFAULT ''",
+    "fork_step": "INTEGER",
+    "branch_label": "TEXT NOT NULL DEFAULT ''",
+    "dataset_content_hash": "TEXT NOT NULL DEFAULT ''",
+    "weight_profile_json": "TEXT NOT NULL DEFAULT '{}'",
 }
 
 # Per-step telemetry for ingestion runs: durations, error counts, and a cost

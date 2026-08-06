@@ -832,6 +832,387 @@ def test_resume_training_refuses_a_total_below_the_checkpoint(conn, tmp_path):
         )
 
 
+# ── fork_training ────────────────────────────────────────────────────────────
+
+def _branch(label: str = "variant", dataset_name: str = "my_concept__variant"):
+    return training_service.BranchSpec(
+        label=label, dataset_name=dataset_name, trigger_word="sks_test",
+        dataset_content_hash="hash-a", weight_profile={"priority": 1.5, "good": 1.0, "bad": 0.5},
+    )
+
+
+def test_run_id_can_never_be_set_on_a_train_launch():
+    """krea2.state.restore() discards any checkpoint whose run_id.txt does not match
+    cfg.run_id — and TrainSettings has no run_id field, which is the only reason
+    forking (and resuming) a checkpoint is safe at all. Adding the field back would
+    make every fork silently restart at step 0. See krea2/state.py:96."""
+    from feature_pipeline.domain.worker_contracts import TrainSettings
+
+    assert "run_id" not in TrainSettings.model_fields
+
+
+def test_fork_training_uses_a_fresh_output_dir_and_leaves_the_parent_intact(
+    conn, fake_model_dir, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        training_service, "PRECACHE_SCRIPT", _write_stub(tmp_path, SUCCESSFUL_PRECACHE)
+    )
+    monkeypatch.setattr(training_service, "TRAIN_SCRIPT", _write_stub(tmp_path, STUB_TRAIN))
+    parent_output_dir = tmp_path / "train-parent" / "checkpoints"
+    _write_checkpoint(parent_output_dir, 1500)
+    _record_train_run(conn, parent_output_dir)
+    point = training_service.find_resume_points(conn, "run-1")[0]
+
+    branch_id = training_service.fork_training(
+        conn, dataset_run_id="run-1", fork_point=point, branch=_branch(),
+        total_steps=3000,
+    )
+
+    branch = repo.get_training_run(conn, branch_id)
+    assert Path(branch.config["output_dir"]) != parent_output_dir
+    # The parent's checkpoint files still exist — a fork copies, it never moves.
+    assert (parent_output_dir / "optimizer.pt").is_file()
+    assert (parent_output_dir / "resume_checkpoint" / "adapter_model.safetensors").is_file()
+    assert (parent_output_dir / "current_step.txt").read_text().strip() == "1500"
+    # And the branch's own copy is there too.
+    assert (Path(branch.config["output_dir"]) / "optimizer.pt").is_file()
+
+    from feature_pipeline.infrastructure import training_runner
+
+    training_runner.stop_process(branch.pid, grace_period_seconds=1)
+
+
+def test_two_sibling_forks_share_lineage_but_get_different_output_dirs(
+    conn, fake_model_dir, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        training_service, "PRECACHE_SCRIPT", _write_stub(tmp_path, SUCCESSFUL_PRECACHE)
+    )
+    monkeypatch.setattr(training_service, "TRAIN_SCRIPT", _write_stub(tmp_path, STUB_TRAIN))
+    parent_output_dir = tmp_path / "train-parent" / "checkpoints"
+    _write_checkpoint(parent_output_dir, 1500)
+    parent_id = _record_train_run(conn, parent_output_dir)
+    point = training_service.find_resume_points(conn, "run-1")[0]
+
+    first_id = training_service.fork_training(
+        conn, dataset_run_id="run-1", fork_point=point,
+        branch=_branch("control", "my_concept__control"), total_steps=3000,
+    )
+    second_id = training_service.fork_training(
+        conn, dataset_run_id="run-1", fork_point=point,
+        branch=_branch("variant", "my_concept__variant"), total_steps=3000,
+    )
+
+    first = repo.get_training_run(conn, first_id)
+    second = repo.get_training_run(conn, second_id)
+    assert first.config["output_dir"] != second.config["output_dir"]
+    assert first.fork_parent_run_id == parent_id
+    assert second.fork_parent_run_id == parent_id
+    assert first.fork_step == second.fork_step == 1500
+
+    from feature_pipeline.infrastructure import training_runner
+
+    training_runner.stop_process(first.pid, grace_period_seconds=1)
+    training_runner.stop_process(second.pid, grace_period_seconds=1)
+
+
+def test_fork_training_pins_hyperparameters_to_the_parent(
+    conn, fake_model_dir, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        training_service, "PRECACHE_SCRIPT", _write_stub(tmp_path, SUCCESSFUL_PRECACHE)
+    )
+    monkeypatch.setattr(training_service, "TRAIN_SCRIPT", _write_stub(tmp_path, STUB_TRAIN))
+    parent_output_dir = tmp_path / "train-parent" / "checkpoints"
+    _write_checkpoint(parent_output_dir, 1500)
+    _record_train_run(conn, parent_output_dir)
+    point = training_service.find_resume_points(conn, "run-1")[0]
+
+    branch_id = training_service.fork_training(
+        conn, dataset_run_id="run-1", fork_point=point, branch=_branch(),
+        total_steps=3000, save_every=50,
+    )
+
+    config = repo.get_training_run(conn, branch_id).config
+    assert config["lr"] == point.config["lr"]
+    assert config["lora_rank"] == point.config["lora_rank"]
+    assert config["lora_alpha"] == point.config["lora_alpha"]
+    assert config["seed"] == point.config["seed"]
+    assert config["batch_size"] == point.config["batch_size"]
+    assert config["grad_accum_steps"] == point.config["grad_accum_steps"]
+    assert config["lr_scheduler"] == point.config["lr_scheduler"]
+    assert config["warmup_steps"] == point.config["warmup_steps"]
+    # The only two knobs a fork is allowed to change.
+    assert config["total_steps"] == 3000
+    assert config["save_every"] == 50
+
+    from feature_pipeline.infrastructure import training_runner
+
+    training_runner.stop_process(repo.get_training_run(conn, branch_id).pid, grace_period_seconds=1)
+
+
+def test_fork_training_points_the_branch_at_its_own_dataset_and_cache(
+    conn, fake_model_dir, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        training_service, "PRECACHE_SCRIPT", _write_stub(tmp_path, SUCCESSFUL_PRECACHE)
+    )
+    monkeypatch.setattr(training_service, "TRAIN_SCRIPT", _write_stub(tmp_path, STUB_TRAIN))
+    parent_output_dir = tmp_path / "train-parent" / "checkpoints"
+    _write_checkpoint(parent_output_dir, 1500)
+    _record_train_run(conn, parent_output_dir)
+    point = training_service.find_resume_points(conn, "run-1")[0]
+
+    branch_id = training_service.fork_training(
+        conn, dataset_run_id="run-1", fork_point=point,
+        branch=_branch("variant", "my_concept__variant"), total_steps=3000,
+    )
+
+    config = repo.get_training_run(conn, branch_id).config
+    assert config["dataset_path"] == str(training_service.dataset_dir_for("my_concept__variant"))
+    assert config["cache_dir"] == str(training_service.cache_dir_for("my_concept__variant"))
+    assert config["dataset_path"] != point.config["dataset_path"]
+
+    from feature_pipeline.infrastructure import training_runner
+
+    training_runner.stop_process(repo.get_training_run(conn, branch_id).pid, grace_period_seconds=1)
+
+
+def test_fork_training_refuses_a_total_at_or_below_the_checkpoint(conn, tmp_path):
+    output_dir = tmp_path / "train-parent" / "checkpoints"
+    _write_checkpoint(output_dir, 1500)
+    _record_train_run(conn, output_dir, total_steps=1500)
+    point = training_service.find_resume_points(conn, "run-1")[0]
+
+    with pytest.raises(training_service.ForkUnavailable, match="step 1500"):
+        training_service.fork_training(
+            conn, dataset_run_id="run-1", fork_point=point, branch=_branch(),
+            total_steps=1500,
+        )
+
+
+def test_fork_training_refuses_a_missing_checkpoint(conn, tmp_path):
+    output_dir = tmp_path / "train-parent" / "checkpoints"
+    _write_checkpoint(output_dir, 1500)
+    _record_train_run(conn, output_dir)
+    point = training_service.find_resume_points(conn, "run-1")[0]
+    # The parent's checkpoint gets reclaimed after the resume point was read.
+    (output_dir / "optimizer.pt").unlink()
+
+    with pytest.raises(training_service.ForkUnavailable):
+        training_service.fork_training(
+            conn, dataset_run_id="run-1", fork_point=point, branch=_branch(),
+            total_steps=3000,
+        )
+
+
+def test_fork_training_refuses_reusing_the_parents_dataset_folder(conn, tmp_path):
+    output_dir = tmp_path / "train-parent" / "checkpoints"
+    _write_checkpoint(output_dir, 1500)
+    _record_train_run(conn, output_dir)
+    point = training_service.find_resume_points(conn, "run-1")[0]
+    parent_dataset_name = Path(point.config["dataset_path"]).name
+
+    with pytest.raises(training_service.ForkUnavailable):
+        training_service.fork_training(
+            conn, dataset_run_id="run-1", fork_point=point,
+            branch=training_service.BranchSpec(
+                label="variant", dataset_name=parent_dataset_name, trigger_word="sks_test",
+            ),
+            total_steps=3000,
+        )
+
+
+# ── warm fork points ────────────────────────────────────────────────────────
+#
+# krea2.state rewrites resume_checkpoint/ and optimizer.pt in place on every save, so a
+# finished run has exactly one restorable state — its last. Steps 300, 600, 900… survive
+# only as per-step exports, which carry weights and nothing else. These pin that those
+# show up as forkable, that the restorable one still wins where both exist, and that a
+# branch started from an export is staged as a warm start rather than a copy.
+
+
+def _write_step_export(output_dir: Path, step: int, *, final: bool = False) -> Path:
+    """A per-step export: `transformer.*` keys over a blob, the way export_lora writes."""
+    import json
+    import struct
+
+    name = "my_concept_FINAL" if final else f"my_concept_step_{step}"
+    path = output_dir / f"{name}.safetensors"
+    header = {
+        "__metadata__": {"training_info": json.dumps({"step": step, "epoch": 0})},
+        "transformer.img_in.lora_A.default.weight": {
+            "dtype": "BF16", "shape": [2, 2], "data_offsets": [0, 8],
+        },
+    }
+    encoded = json.dumps(header).encode("utf-8")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(struct.pack("<Q", len(encoded)) + encoded + bytes(8))
+    return path
+
+
+def test_find_fork_points_offers_the_per_step_exports_below_the_checkpoint(conn, tmp_path):
+    output_dir = tmp_path / "train-parent" / "checkpoints"
+    _write_checkpoint(output_dir, 900)
+    for step in (300, 600, 900):
+        _write_step_export(output_dir, step)
+    _record_train_run(conn, output_dir)
+
+    points = training_service.find_fork_points(conn, dataset_run_id="run-1")
+
+    assert [(p.step, p.kind) for p in points] == [
+        (900, "exact"), (600, "warm"), (300, "warm")
+    ]
+
+
+def test_find_fork_points_never_offers_a_warm_duplicate_of_the_checkpoint(conn, tmp_path):
+    """Step 900 exists both ways here; the restorable one is strictly better."""
+    output_dir = tmp_path / "train-parent" / "checkpoints"
+    _write_checkpoint(output_dir, 900)
+    _write_step_export(output_dir, 900)
+    _record_train_run(conn, output_dir)
+
+    points = training_service.find_fork_points(conn, dataset_run_id="run-1")
+
+    assert [p.kind for p in points if p.step == 900] == ["exact"]
+
+
+def test_find_fork_points_skips_the_final_export(conn, tmp_path):
+    """It duplicates the last per-step file — two entries would offer one state twice."""
+    output_dir = tmp_path / "train-parent" / "checkpoints"
+    _write_checkpoint(output_dir, 900)
+    _write_step_export(output_dir, 600)
+    _write_step_export(output_dir, 600, final=True)
+    _record_train_run(conn, output_dir)
+
+    warm = [p for p in training_service.find_fork_points(conn, dataset_run_id="run-1")
+            if p.kind == "warm"]
+
+    assert [p.step for p in warm] == [600]
+
+
+def test_a_resumed_lineage_offers_its_checkpoint_once_not_once_per_launch(conn, tmp_path):
+    """A resume reuses its parent's output_dir, so N launches share one checkpoint.
+    Offering it N times is N identical choices leading to the identical relaunch — and
+    with warm points each duplicate drags every per-step export along with it."""
+    output_dir = tmp_path / "train-parent" / "checkpoints"
+    _write_checkpoint(output_dir, 900)
+    _write_step_export(output_dir, 300)
+    _record_train_run(conn, output_dir)
+    _record_train_run(conn, output_dir)  # the resume: same output_dir, new row
+    _record_train_run(conn, output_dir)
+
+    points = training_service.find_fork_points(conn, dataset_run_id="run-1")
+
+    assert [(p.step, p.kind) for p in points] == [(900, "exact"), (300, "warm")]
+
+
+def test_the_kept_launch_of_a_resumed_lineage_is_the_newest(conn, tmp_path):
+    """Its config carries whatever total_steps was last raised to; an older row's would
+    send the branch back to a target the lineage has already passed."""
+    output_dir = tmp_path / "train-parent" / "checkpoints"
+    _write_checkpoint(output_dir, 900)
+    _record_train_run(conn, output_dir, total_steps=1200)
+    _record_train_run(conn, output_dir, total_steps=4000)
+
+    points = training_service.find_resume_points(conn, "run-1")
+
+    assert [p.total_steps for p in points] == [4000]
+
+
+def test_distinct_lineages_are_all_offered(conn, tmp_path):
+    """Deduplication is per output_dir, not per dataset — two separate trainings of one
+    dataset are two genuinely different starting points."""
+    first = tmp_path / "train-a" / "checkpoints"
+    second = tmp_path / "train-b" / "checkpoints"
+    _write_checkpoint(first, 900)
+    _write_checkpoint(second, 600)
+    _record_train_run(conn, first)
+    _record_train_run(conn, second)
+
+    points = training_service.find_resume_points(conn, "run-1")
+
+    assert sorted(p.output_dir for p in points) == sorted([first, second])
+
+
+def test_find_resume_points_still_returns_only_restorable_state(conn, tmp_path):
+    """The UI filters on `kind` to decide what resume may offer; if find_resume_points
+    ever started returning warm points, resume would silently start losing optimizers."""
+    output_dir = tmp_path / "train-parent" / "checkpoints"
+    _write_checkpoint(output_dir, 900)
+    _write_step_export(output_dir, 300)
+    _record_train_run(conn, output_dir)
+
+    points = training_service.find_resume_points(conn, "run-1")
+
+    assert [(p.step, p.kind) for p in points] == [(900, "exact")]
+
+
+def test_forking_a_warm_point_stages_weights_without_an_optimizer(
+    conn, fake_model_dir, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        training_service, "PRECACHE_SCRIPT", _write_stub(tmp_path, SUCCESSFUL_PRECACHE)
+    )
+    monkeypatch.setattr(training_service, "TRAIN_SCRIPT", _write_stub(tmp_path, STUB_TRAIN))
+    parent_output_dir = tmp_path / "train-parent" / "checkpoints"
+    _write_checkpoint(parent_output_dir, 900)
+    _write_step_export(parent_output_dir, 300)
+    parent_id = _record_train_run(conn, parent_output_dir)
+    warm = [p for p in training_service.find_fork_points(conn, dataset_run_id="run-1")
+            if p.kind == "warm"][0]
+
+    branch_id = training_service.fork_training(
+        conn, dataset_run_id="run-1", fork_point=warm, branch=_branch(), total_steps=3000,
+    )
+
+    branch = repo.get_training_run(conn, branch_id)
+    branch_output_dir = Path(branch.config["output_dir"])
+    assert (branch_output_dir / "resume_checkpoint" / "adapter_model.safetensors").is_file()
+    assert (branch_output_dir / "warm_start.json").is_file()
+    # No restorable state was invented — the trainer must take the warm path, and the
+    # hub's own checkpoint_step must keep saying there is nothing to resume here.
+    assert not (branch_output_dir / "optimizer.pt").exists()
+    assert training_service.checkpoint_step(branch_output_dir) is None
+    assert branch.fork_step == 300
+    assert branch.fork_parent_run_id == parent_id
+
+    from feature_pipeline.infrastructure import training_runner
+
+    training_runner.stop_process(branch.pid, grace_period_seconds=1)
+
+
+def test_forking_a_warm_point_refuses_a_total_at_or_below_that_step(conn, tmp_path):
+    output_dir = tmp_path / "train-parent" / "checkpoints"
+    _write_checkpoint(output_dir, 900)
+    _write_step_export(output_dir, 300)
+    _record_train_run(conn, output_dir)
+    warm = [p for p in training_service.find_fork_points(conn, dataset_run_id="run-1")
+            if p.kind == "warm"][0]
+
+    with pytest.raises(training_service.ForkUnavailable, match="step 300"):
+        training_service.fork_training(
+            conn, dataset_run_id="run-1", fork_point=warm, branch=_branch(), total_steps=300,
+        )
+
+
+def test_forking_a_warm_point_whose_export_vanished_is_refused(conn, tmp_path):
+    """The exports rotate (max_checkpoints_to_keep), so the one an operator picked can
+    be gone by the time they press the button."""
+    output_dir = tmp_path / "train-parent" / "checkpoints"
+    _write_checkpoint(output_dir, 900)
+    export = _write_step_export(output_dir, 300)
+    _record_train_run(conn, output_dir)
+    warm = [p for p in training_service.find_fork_points(conn, dataset_run_id="run-1")
+            if p.kind == "warm"][0]
+    export.unlink()
+
+    with pytest.raises(training_service.ForkUnavailable, match="gone"):
+        training_service.fork_training(
+            conn, dataset_run_id="run-1", fork_point=warm, branch=_branch(), total_steps=3000,
+        )
+
+
 def test_training_log_csv_path_follows_the_recorded_output_dir():
     """A resumed run's output_dir is the original run's, not a sibling of its log."""
     run = repo.TrainingRun(

@@ -37,6 +37,29 @@ class TrainingRun:
     # And what its checkpoint_log.csv said — the per-checkpoint spans. Same plain-dict
     # treatment, for the same three reasons.
     checkpoint_metrics: dict = field(default_factory=dict)
+    # Experiment-fork lineage — empty/None for every ordinary launch and resume.
+    # See ExperimentLineage and application/training_service.fork_training.
+    fork_parent_run_id: str = ""
+    fork_step: int | None = None
+    branch_label: str = ""
+    dataset_content_hash: str = ""
+    weight_profile: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ExperimentLineage:
+    """The fork identity attached to a branch's training_runs row.
+
+    A single dataclass rather than four loose kwargs on create_training_run, so
+    every non-fork caller (start_training, resume_training, launch_precache) keeps
+    passing nothing instead of four Nones.
+    """
+
+    parent_training_run_id: str
+    fork_step: int
+    branch_label: str
+    dataset_content_hash: str = ""
+    weight_profile: dict = field(default_factory=dict)
 
 
 def create_training_run(
@@ -47,6 +70,7 @@ def create_training_run(
     pid: int,
     log_path: str,
     config: dict,
+    experiment: ExperimentLineage | None = None,
 ) -> str:
     training_run_id = str(uuid.uuid4())
     with conn:
@@ -54,8 +78,9 @@ def create_training_run(
             """
             INSERT INTO training_runs
                 (training_run_id, dataset_run_id, kind, status, pid, log_path,
-                 config_json, started_at)
-            VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+                 config_json, started_at, fork_parent_run_id, fork_step,
+                 branch_label, dataset_content_hash, weight_profile_json)
+            VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 training_run_id,
@@ -65,6 +90,11 @@ def create_training_run(
                 log_path,
                 json.dumps(config),
                 datetime.now(timezone.utc).isoformat(),
+                experiment.parent_training_run_id if experiment else "",
+                experiment.fork_step if experiment else None,
+                experiment.branch_label if experiment else "",
+                experiment.dataset_content_hash if experiment else "",
+                json.dumps(experiment.weight_profile if experiment else {}),
             ),
         )
     return training_run_id
@@ -172,6 +202,35 @@ def find_running_training_run(conn: sqlite3.Connection) -> TrainingRun | None:
     return _row_to_training_run(row) if row is not None else None
 
 
+def list_experiment_branches(
+    conn: sqlite3.Connection, parent_training_run_id: str, fork_step: int
+) -> list[TrainingRun]:
+    """Every branch forked from the same checkpoint, oldest first for a stable legend.
+
+    Scoped to (parent, fork_step) rather than parent alone: a parent that was later
+    resumed and re-forked at a different step produces a second, unrelated sibling
+    group that should not be charted together with the first.
+    """
+    rows = conn.execute(
+        """
+        SELECT * FROM training_runs
+        WHERE fork_parent_run_id = ? AND fork_step = ?
+        ORDER BY started_at ASC
+        """,
+        (parent_training_run_id, fork_step),
+    ).fetchall()
+    return [_row_to_training_run(row) for row in rows]
+
+
+def count_forks_of(conn: sqlite3.Connection, training_run_id: str) -> int:
+    """How many branches have already been forked from this run's checkpoint(s)."""
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM training_runs WHERE fork_parent_run_id = ?",
+        (training_run_id,),
+    ).fetchone()
+    return int(row["n"])
+
+
 def _row_to_training_run(row: sqlite3.Row) -> TrainingRun:
     return TrainingRun(
         training_run_id=row["training_run_id"],
@@ -192,6 +251,11 @@ def _row_to_training_run(row: sqlite3.Row) -> TrainingRun:
         steps_executed=row["steps_executed"],
         metrics=_load_metrics(row["metrics_json"]),
         checkpoint_metrics=_load_metrics(row["checkpoint_metrics_json"]),
+        fork_parent_run_id=row["fork_parent_run_id"],
+        fork_step=row["fork_step"],
+        branch_label=row["branch_label"],
+        dataset_content_hash=row["dataset_content_hash"],
+        weight_profile=_load_metrics(row["weight_profile_json"]),
     )
 
 

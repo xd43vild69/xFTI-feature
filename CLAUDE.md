@@ -63,6 +63,12 @@ training_runtime/venv/bin/python tests/workers/golden/capture_behavior.py --chec
 
 The first two compare ~100 recorded values (config resolution, tensor math, samplers, EMA, curation, checkpointing) against baselines captured before the refactor. The third runs 12 real training steps on the GPU and compares `train_log.csv` — it is the only thing covering the loop itself. Drop `--check` / use `record` to re-baseline, and only when a behavior change is intended and understood.
 
+A fourth, needed only when touching the warm-start path (see *Forking mid-run* below), covers a seam the others cannot: the hub stages `warm_start.json` with no torch installed and the trainer reads it with torch and PEFT, so no single interpreter sees both ends. It needs no GPU.
+
+```bash
+training_runtime/venv/bin/python tests/workers/golden/verify_warm_start.py
+```
+
 The smoke run compares by tolerance, not diff: the loop is **not bit-reproducible against itself** (`cudnn.benchmark` picks kernels by timing, TF32 is on, reductions are unordered). Measured drift on unchanged code is ~3e-4 on loss and ~2% on grad_norm. See `tests/workers/golden/compare_smoke.py`.
 - **`mcp_server/`** (hub root, not under `src/`) — a `FastMCP` server exposing the pipeline as tools for autonomous agents (LangGraph etc.), stdio transport, no auth (the app has none anywhere). `server.py` tools are thin wrappers over `application/`/`infrastructure/` — never reimplement business logic here. Runs as its own process against the same SQLite DB, same per-operation-connection convention as `ui/state.py`.
 
@@ -107,9 +113,31 @@ Two things make the reconstruction honest rather than approximate. Passing the l
 
 Adding a column to `train_log.csv` would break `tests/workers/golden/compare_smoke.py`, which diffs it against a recorded baseline — that is why this is a separate file rather than two more columns.
 
-A resume carries every hyperparameter over untouched except `total_steps`: the saved adapter was shaped by the original rank/alpha and `lora_io.load_lora_weights` exits rather than load a mismatch. `total_steps` must be raised above the checkpoint's step or the trainer reports "nothing to do" — `resume_training` rejects that up front. `find_resume_points` decides what is offerable using `checkpoint_step`, which mirrors `CheckpointManager.has_checkpoint()`; keep the two in agreement.
+A resume carries every hyperparameter over untouched except `total_steps`: the saved adapter was shaped by the original rank/alpha and `lora_io.load_lora_weights` exits rather than load a mismatch. `total_steps` must be raised above the checkpoint's step or the trainer reports "nothing to do" — `resume_training` rejects that up front. `find_resume_points` decides what is offerable using `checkpoint_step`, which mirrors `CheckpointManager.has_checkpoint()`; keep the two in agreement. It returns **one point per `output_dir`, not per row** — a resume reuses its parent's directory, so a lineage of N launches shares one checkpoint, and the newest row is the one kept because its config carries whatever `total_steps` was last raised to.
 
 The per-step `Krea2_LoRA_step_N.safetensors` files are **not** resume points — `lora_io.export_lora` rewrites keys to the `transformer.*` layout inference loaders want, which `set_peft_model_state_dict` won't take back. Only `resume_checkpoint/` (written by `save_pretrained`, PEFT layout) plus `optimizer.pt` and `current_step.txt` can be resumed from.
+
+### Forking mid-run: why warm starts exist
+
+`CheckpointManager._save_adapter` and `_save_run_state` overwrite `resume_checkpoint/` and `optimizer.pt` **in place** on every save, so a run keeps exactly one restorable state — its last. A finished 3000-step run offers step 3000 and nothing else, however many `_step_N` exports sit beside it. Forking mid-run is the whole point of experiment branches, so those exports are the only way to reach step 900, and `find_fork_points` offers them as a second kind of point.
+
+The key rewrite above is invertible, and that is what makes this possible without torch: `data_offsets` in a safetensors header are relative to the start of the blob, so `checkpoint_files.rewrite_export_to_resume_layout` renames keys in the header and copies the tensor bytes through verbatim. The inverse (`transformer.X.lora_A.default.weight` → `base_model.model.X.lora_A.weight`) is a verified bijection against a real export: 528 tensors, key set identical to the `resume_checkpoint` PEFT wrote for the same run, every tensor bit-identical once loaded. Both files are bf16, so a warm start loses **no weight fidelity** — it loses the optimizer moments, the RNG streams, the sampler position and the EMA shadow, and nothing else.
+
+`materialize_warm_start` stages that into a branch's `output_dir` and writes `warm_start.json` **last**, the same commit-last ordering `current_step.txt` has, and for the same reason. It deliberately writes neither `optimizer.pt` nor `current_step.txt`: their absence is what keeps `has_checkpoint()`/`checkpoint_step()` answering "nothing restorable here", which is true. The marker is what gates `CheckpointManager._restore_warm_start` — without it a missing `optimizer.pt` keeps meaning "no checkpoint", so a run interrupted between the adapter write and the optimizer write can never come back as a silent cold restart.
+
+What this costs the experiment: a warm-started branch has a cold Adam, so its first stretch is unsettled while the second-moment estimates rebuild. Sibling branches off the same point are **all** equally cold, so comparing them to each other stays valid — the delta is still the data intervention. Comparing one against the *parent's* own curve past that step is not, which is why the UI states it and pushes a control branch. The `kind` field on `ResumePoint` is what keeps the two apart; `find_resume_points` still returns only `"exact"` points, and resume must never be offered a warm one.
+
+### Image derivation: rotation and resolution normalization (curation step)
+
+Two hub-side pixel edits share one pipeline, `image_service.apply_transform`: EXIF orientation resolved into the pixels, then rotation, then downscale to 1024px on the longest side. The order is fixed — scaling before rotating would fit the wrong axis to the limit. Lanczos does the resampling, the same filter `precache_worker.vae_latent` uses to fit an image to its latent bucket, so doing it earlier makes the reduction reviewable rather than different. No sharpening pass: an unsharp mask would put halos into the pixels the VAE encodes, and a LoRA learns halos as readily as it learns the subject. Rotation is `Image.transpose`, an exact permutation — the only thing that can cost quality is the re-encode.
+
+Which is why a sample records **where it came from and what was applied**, in three `samples` columns: `source_file_path`, `rotation_degrees`, `derived_max_side` (NULL = no downscale in this sample's derivation, deliberately distinct from a sample that merely fits). `dataset_service._rederive` is the single funnel for both operations, and both pass the *absolute* transform against `sample.origin_path` rather than an increment against the current file. Four rotations plus a normalize therefore cost one decode and one encode, not five of each — on a JPEG, one generation of loss instead of five. A sample with no `source_file_path` predates this and falls back to its current file.
+
+Derived files land in `data/raw/<run_id>/derived/` under the source's filename (so re-deriving overwrites rather than accumulating) and the sample is repointed there; the original is never touched, whatever the run's `source_kind` — that folder is a subdirectory of `run_upload_dir`, so `delete_run` already reclaims it. Everything the pixels decide is recomputed (dimensions, aspect ratio, all three hashes, sharpness) and validation re-runs, persisted through `repo.update_sample_image`, which touches only those columns so captions and curation flags survive. pHash and dHash are **not** rotation-invariant, so a rotated sample legitimately leaves its duplicate cluster.
+
+Sharpness changes by construction — `compute_sharpness` reduces to 512px before measuring, and reaching that through two Lanczos passes is not the same as reaching it through one. The ranking stays usable because it is only compared within a run, which is the argument for normalizing all of a run's oversized images rather than some.
+
+`make_square_thumbnail` applies `exif_transpose`, and that is not cosmetic: `render_original_image` hands the file to the browser, which honours the orientation tag. Without it the grid shows a phone photo on its side while the zoom view shows it upright, and an operator reaching for the rotate buttons would be correcting a discrepancy that only ever existed in the thumbnail. `compute_image_metrics` and `describe_original` still report stored orientation, so an EXIF-tagged image's landscape/portrait bucket in the statistics does not match what the grid draws.
 
 ### Runs, concepts, and versions (SQLite: `feature_pipeline.db`)
 

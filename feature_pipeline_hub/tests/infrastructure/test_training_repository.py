@@ -2,9 +2,12 @@ import pytest
 
 from feature_pipeline.infrastructure.database import get_connection
 from feature_pipeline.infrastructure.training_repository import (
+    ExperimentLineage,
+    count_forks_of,
     create_training_run,
     find_running_training_run,
     get_training_run,
+    list_experiment_branches,
     list_training_runs,
     record_train_log_metrics,
     update_training_run_status,
@@ -182,3 +185,104 @@ def test_an_unreadable_metrics_blob_degrades_to_empty_rather_than_raising(conn):
 
     assert get_training_run(conn, training_run_id).metrics == {}
     assert len(list_training_runs(conn)) == 1
+
+
+# ── experiment-fork lineage ─────────────────────────────────────────────────
+
+def test_a_run_created_without_experiment_reads_back_the_documented_defaults(conn):
+    """The migration test: rows from before this feature existed look like this."""
+    training_run_id = _create(conn)
+
+    run = get_training_run(conn, training_run_id)
+
+    assert run.fork_parent_run_id == ""
+    assert run.fork_step is None
+    assert run.branch_label == ""
+    assert run.dataset_content_hash == ""
+    assert run.weight_profile == {}
+
+
+def test_experiment_lineage_round_trips(conn):
+    parent = _create(conn, pid=1)
+    branch = create_training_run(
+        conn,
+        dataset_run_id="run-1",
+        kind="train",
+        pid=2,
+        log_path="/tmp/branch.log",
+        config={"total_steps": 4000},
+        experiment=ExperimentLineage(
+            parent_training_run_id=parent,
+            fork_step=1500,
+            branch_label="variant",
+            dataset_content_hash="abc123",
+            weight_profile={"priority": 2.0, "good": 1.0, "bad": 0.25},
+        ),
+    )
+
+    run = get_training_run(conn, branch)
+    assert run.fork_parent_run_id == parent
+    assert run.fork_step == 1500
+    assert run.branch_label == "variant"
+    assert run.dataset_content_hash == "abc123"
+    assert run.weight_profile == {"priority": 2.0, "good": 1.0, "bad": 0.25}
+
+
+def test_list_experiment_branches_returns_siblings_oldest_first(conn):
+    parent = _create(conn, pid=1)
+    first = create_training_run(
+        conn, dataset_run_id="run-1", kind="train", pid=2, log_path="/tmp/a.log",
+        config={}, experiment=ExperimentLineage(parent, 1500, "control"),
+    )
+    second = create_training_run(
+        conn, dataset_run_id="run-1", kind="train", pid=3, log_path="/tmp/b.log",
+        config={}, experiment=ExperimentLineage(parent, 1500, "variant"),
+    )
+
+    branches = list_experiment_branches(conn, parent, 1500)
+
+    assert [b.training_run_id for b in branches] == [first, second]
+
+
+def test_list_experiment_branches_excludes_the_parent(conn):
+    parent = _create(conn, pid=1)
+    create_training_run(
+        conn, dataset_run_id="run-1", kind="train", pid=2, log_path="/tmp/a.log",
+        config={}, experiment=ExperimentLineage(parent, 1500, "variant"),
+    )
+
+    branches = list_experiment_branches(conn, parent, 1500)
+
+    assert parent not in [b.training_run_id for b in branches]
+
+
+def test_list_experiment_branches_excludes_forks_at_a_different_step(conn):
+    parent = _create(conn, pid=1)
+    create_training_run(
+        conn, dataset_run_id="run-1", kind="train", pid=2, log_path="/tmp/a.log",
+        config={}, experiment=ExperimentLineage(parent, 1500, "variant"),
+    )
+    create_training_run(
+        conn, dataset_run_id="run-1", kind="train", pid=3, log_path="/tmp/b.log",
+        config={}, experiment=ExperimentLineage(parent, 2000, "later-variant"),
+    )
+
+    branches = list_experiment_branches(conn, parent, 1500)
+
+    assert [b.branch_label for b in branches] == ["variant"]
+
+
+def test_count_forks_of_counts_every_branch_of_a_checkpoint(conn):
+    parent = _create(conn, pid=1)
+    assert count_forks_of(conn, parent) == 0
+
+    create_training_run(
+        conn, dataset_run_id="run-1", kind="train", pid=2, log_path="/tmp/a.log",
+        config={}, experiment=ExperimentLineage(parent, 1500, "control"),
+    )
+    create_training_run(
+        conn, dataset_run_id="run-1", kind="train", pid=3, log_path="/tmp/b.log",
+        config={}, experiment=ExperimentLineage(parent, 1500, "variant"),
+    )
+
+    assert count_forks_of(conn, parent) == 2

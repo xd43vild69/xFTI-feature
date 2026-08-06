@@ -62,8 +62,9 @@ def save_ingestion_run(conn: sqlite3.Connection, run: IngestionRun) -> None:
                 (sample_id, run_id, file_path, caption, original_caption,
                  width, height, aspect_ratio, image_format, phash, dhash, colorhash,
                  sharpness, is_duplicate, is_excluded, is_flagged, is_valid,
-                 validation_errors, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 validation_errors, updated_at,
+                 source_file_path, rotation_degrees, derived_max_side)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -86,6 +87,9 @@ def save_ingestion_run(conn: sqlite3.Connection, run: IngestionRun) -> None:
                     int(s.is_valid),
                     json.dumps(s.validation_errors),
                     now,
+                    s.source_image_path,
+                    s.rotation_degrees,
+                    s.derived_max_side,
                 )
                 for s in concept.samples
             ],
@@ -151,6 +155,9 @@ def load_ingestion_run(conn: sqlite3.Connection, run_id: str) -> IngestionRun | 
             is_flagged=bool(row["is_flagged"]),
             is_valid=bool(row["is_valid"]),
             validation_errors=json.loads(row["validation_errors"]),
+            source_image_path=row["source_file_path"],
+            rotation_degrees=row["rotation_degrees"],
+            derived_max_side=row["derived_max_side"],
         )
         for row in sample_rows
     ]
@@ -175,6 +182,44 @@ def update_sample_caption(conn: sqlite3.Connection, sample_id: str, caption: str
         conn.execute(
             "UPDATE samples SET caption = ?, updated_at = ? WHERE sample_id = ?",
             (caption, datetime.now(timezone.utc).isoformat(), sample_id),
+        )
+
+
+def update_sample_image(conn: sqlite3.Connection, sample: DatasetSample) -> None:
+    """Persist a sample whose file was rewritten: path, provenance, metrics, verdict.
+
+    Everything the pixels decide, and nothing else — the caption, the curation flags
+    and the run membership are left as they are, so normalizing an image mid-curation
+    does not undo the curation.
+    """
+    with conn:
+        conn.execute(
+            """
+            UPDATE samples SET
+                file_path = ?, width = ?, height = ?, aspect_ratio = ?, image_format = ?,
+                phash = ?, dhash = ?, colorhash = ?, sharpness = ?,
+                is_valid = ?, validation_errors = ?, updated_at = ?,
+                source_file_path = ?, rotation_degrees = ?, derived_max_side = ?
+            WHERE sample_id = ?
+            """,
+            (
+                sample.image_path,
+                sample.metrics.width,
+                sample.metrics.height,
+                sample.metrics.aspect_ratio,
+                sample.metrics.format,
+                sample.metrics.phash,
+                sample.metrics.dhash,
+                sample.metrics.colorhash,
+                sample.metrics.sharpness,
+                int(sample.is_valid),
+                json.dumps(sample.validation_errors),
+                datetime.now(timezone.utc).isoformat(),
+                sample.source_image_path,
+                sample.rotation_degrees,
+                sample.derived_max_side,
+                sample.sample_id,
+            ),
         )
 
 

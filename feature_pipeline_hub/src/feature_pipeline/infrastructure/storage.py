@@ -237,6 +237,20 @@ def run_upload_dir(run_id: str) -> str:
     return str(raw_data_dir() / run_id)
 
 
+def run_derived_dir(run_id: str) -> str:
+    """Per-run folder for images the hub rewrote — rotated, downscaled, or both.
+
+    A subfolder of `run_upload_dir` rather than a sibling, so `delete_run` already
+    reclaims it: it wipes `data/raw/<run_id>/` whole. Keeping the copies here (rather
+    than beside the originals) means a run ingested by path never has a file written
+    into the user's own folder, whatever its source_kind.
+
+    One file per sample at most: a derivation keeps the source's filename, so
+    re-deriving overwrites rather than accumulating a copy per edit.
+    """
+    return str(Path(run_upload_dir(run_id)) / "derived")
+
+
 def delete_managed_folder(folder_path: str) -> bool:
     """Delete a folder only if it lives under `data/raw/`.
 

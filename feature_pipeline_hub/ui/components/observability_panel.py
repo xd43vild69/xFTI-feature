@@ -11,6 +11,10 @@ achievement. Every figure below is measured, and anything unmeasured shows as "�
 rather than borrowing a number from the configuration.
 """
 
+import json
+from pathlib import Path
+
+import pandas as pd
 import streamlit as st
 
 import state
@@ -130,6 +134,10 @@ def render() -> None:
 
     if lineage is not None:
         _render_training_detail(lineage, total_items)
+
+        group_key = _fork_group_key(lineage, lineages)
+        if group_key is not None:
+            _render_branch_comparison(run.run_id, group_key)
 
 
 def _select_lineage(lineages, run_id: str):
@@ -355,6 +363,8 @@ def _render_checkpoints(lineage) -> None:
             "to infer them from — so it either stopped before its first save, or its "
             "runtime directory has since been reclaimed."
         )
+        # Still worth showing: what it was launched with survives the checkpoints.
+        _render_launch_config(lineage)
         return
 
     save_every = lineage.latest.config.get("save_every")
@@ -435,6 +445,63 @@ def _render_checkpoints(lineage) -> None:
            " · checkpoint_log.csv is gone — showing the snapshot stored when it finished")
     )
 
+    _render_launch_config(lineage)
+
+
+def _render_launch_config(lineage) -> None:
+    """The exact settings this training was launched with, ready to copy or reuse.
+
+    Read from the stored `config_json` rather than from the run's settings.json on
+    disk: it is the same content — training_runner writes one from the other — but the
+    row outlives the runtime directory, and the numbers above are worth nothing
+    without the configuration that produced them.
+
+    Per launch, because a resume can differ from the launch it continues — it carries
+    everything over except `total_steps`, which only has to clear the checkpoint's
+    step, not the original target — and because it writes its settings to a run
+    directory of its own, so the path below is not the one the checkpoints are in.
+    """
+    launches = lineage.launches
+    run = launches[-1]
+
+    with st.expander("Launch configuration (JSON)"):
+        if len(launches) > 1:
+            run = st.selectbox(
+                "Launch",
+                launches,
+                index=len(launches) - 1,
+                format_func=lambda item: _launch_label(item, launches),
+                key=f"ckpt_config_{lineage.latest.training_run_id}",
+                help="Every launch carried its own settings. A resume copies them "
+                     "except for total_steps, which it may raise — and it writes them "
+                     "to a run directory of its own while keeping the original's "
+                     "output_dir, which is what makes it a resume.",
+            )
+
+        payload = json.dumps(run.config, indent=2, sort_keys=True)
+        # st.code renders a copy button of its own in the corner.
+        st.code(payload, language="json")
+        st.download_button(
+            "Download settings.json",
+            payload,
+            file_name=f"settings-{run.training_run_id[:8]}.json",
+            mime="application/json",
+            key=f"ckpt_config_dl_{run.training_run_id}",
+        )
+        st.caption(f"Launched from `{Path(run.log_path).parent / 'settings.json'}`")
+
+
+def _launch_label(run, launches) -> str:
+    """One launch as a line: its position, when it started, how it ended."""
+    position = launches.index(run) + 1
+    started = run.started_at
+    return " · ".join([
+        f"Launch {position}",
+        started.strftime("%Y-%m-%d %H:%M") if started is not None else "unknown date",
+        f"{int(run.config.get('total_steps') or 0):,} steps",
+        run.status,
+    ])
+
 
 def _money(value: float | None) -> str:
     """A dash when FTI_GPU_HOURLY_RATE is unset — an unpriced run is not a free one."""
@@ -473,3 +540,137 @@ def _provenance(lineage) -> str:
 
 def _fmt(value: float | None, places: int) -> str:
     return f"{value:.{places}f}" if value is not None else "—"
+
+
+def _fork_group_key(lineage, lineages) -> tuple[str, int] | None:
+    """(parent_training_run_id, fork_step) if the selected training is part of a
+    fork lineage — either a branch itself, or a checkpoint that has been forked.
+
+    Fork identity (fork_parent_run_id/fork_step) is fixed at creation and never
+    changes, so reading it off the already-fetched `lineages` list is safe even
+    though that list is cached on a fingerprint that can lag a sibling's CSV
+    growth — that staleness only matters for the chart data, fetched separately
+    below through `state.experiment_branches`/`branch_curves`.
+    """
+    if lineage.latest.fork_parent_run_id and lineage.latest.fork_step is not None:
+        return (lineage.latest.fork_parent_run_id, lineage.latest.fork_step)
+    for other in lineages:
+        if other.latest.fork_parent_run_id == lineage.latest.training_run_id:
+            return (lineage.latest.training_run_id, other.latest.fork_step)
+    return None
+
+
+def _render_branch_comparison(dataset_run_id: str, group_key: tuple[str, int]) -> None:
+    """Overlay every sibling branch forked from the same checkpoint.
+
+    Reads train_log.csv/val_log.csv straight off each branch's own output_dir
+    rather than the persisted metrics_json: a branch still training has no
+    persisted snapshot at all (that only gets written when a launch finishes), and
+    a scalar summary has no per-step series to chart in the first place. Each
+    branch owns its output_dir — unlike a resume, nothing here is shared, so
+    reading the live CSV is safe and describes that branch alone.
+    """
+    parent_training_run_id, fork_step = group_key
+    branches = state.experiment_branches(dataset_run_id, parent_training_run_id, fork_step)
+    if not branches:
+        return
+
+    st.divider()
+    st.subheader("🌿 Branch comparison")
+    st.caption(f"Forked from checkpoint step {fork_step:,} · {len(branches)} branch(es)")
+    st.caption(
+        LOSS_CAVEAT + " Siblings share a seed and a fork point, which makes a "
+        "cross-branch comparison less invalid than comparing unrelated runs — but "
+        "a lower curve still is not 'better images', only 'lower loss'."
+    )
+
+    control = next(
+        (b for b in branches if b.latest.branch_label == "control"),
+        branches[0],
+    )
+    total_steps_by_branch = {b.latest.branch_label: b.total_steps_target for b in branches}
+    if len(set(total_steps_by_branch.values())) > 1:
+        st.caption(
+            ":material/warning: Branches target different total_steps — their LR "
+            "schedules diverge from the fork point onward, on top of whatever the "
+            "dataset intervention changed."
+        )
+
+    mismatched_hash = any(
+        b.latest.dataset_content_hash != control.latest.dataset_content_hash for b in branches
+    )
+
+    curves = state.branch_curves(dataset_run_id, parent_training_run_id, fork_step)
+
+    train_series = {}
+    for branch in branches:
+        label = branch.latest.branch_label or branch.latest.training_run_id[:8]
+        df = curves.get(label, {}).get("train")
+        if df is not None and "step" in df.columns and "loss_avg" in df.columns:
+            train_series[label] = df.set_index("step")["loss_avg"]
+    if train_series:
+        st.line_chart(pd.concat(train_series, axis=1))
+    else:
+        st.caption("No train_log.csv yet for any branch.")
+
+    if mismatched_hash:
+        st.caption(
+            ":material/info: Validation curve hidden — branches hold out different "
+            "images (choose_holdout is a stride over the sorted dataset, so adding "
+            "or removing an image moves it), so val_loss is not comparable across "
+            "them here."
+        )
+    else:
+        val_series = {}
+        for branch in branches:
+            label = branch.latest.branch_label or branch.latest.training_run_id[:8]
+            df = curves.get(label, {}).get("val")
+            if df is not None and "step" in df.columns and "val_loss" in df.columns:
+                val_series[label] = df.set_index("step")["val_loss"]
+        if val_series:
+            st.line_chart(pd.concat(val_series, axis=1))
+
+    running_labels = [
+        b.latest.branch_label or b.latest.training_run_id[:8]
+        for b in branches if b.status == "running"
+    ]
+    if running_labels:
+        st.caption(
+            "Still training: " + ", ".join(running_labels) + " — their series stop "
+            "short on the chart above; that means in progress, not diverged."
+        )
+
+    rows = []
+    for branch in branches:
+        label = branch.latest.branch_label or branch.latest.training_run_id[:8]
+        log = branch.train_log
+        content_hash = branch.latest.dataset_content_hash
+        rows.append(
+            {
+                "Branch": label,
+                "Weights": (
+                    "/".join(
+                        f"{k}×{v}" for k, v in branch.latest.weight_profile.items()
+                    )
+                    if branch.latest.weight_profile else "—"
+                ),
+                "Content hash": (
+                    f"{content_hash[:8]} ✓"
+                    if content_hash and content_hash == control.latest.dataset_content_hash
+                    else (content_hash[:8] if content_hash else "—")
+                ),
+                "Steps": _steps_label(branch),
+                "Final loss": _fmt(log.final_loss_avg, 4) if log else "—",
+                "Best loss": _fmt(log.best_loss_avg, 4) if log else "—",
+                "Status": branch.status,
+                "Cost": _money(branch.cost_estimate),
+            }
+        )
+    st.dataframe(rows, use_container_width=True, hide_index=True)
+
+    st.caption(
+        ":material/info: A fingerprint warning in each branch's log is expected — "
+        "it's the new cache directory, not a corrupt checkpoint. Loss is logged "
+        "before any curation weight is applied, by design, so the chart will not "
+        "visibly react to a weight-only change even though training does."
+    )

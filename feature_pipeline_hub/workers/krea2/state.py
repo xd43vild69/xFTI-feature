@@ -38,6 +38,11 @@ FORMAT_VERSION = 2
 
 ADAPTER_FILENAME = "adapter_model.safetensors"
 
+# Written by the hub to ask for a weights-only start, never by the trainer. See
+# _restore_warm_start for why its absence has to keep meaning "no checkpoint".
+WARM_START_FILENAME = "warm_start.json"
+WARM_START_FORMAT_VERSION = 1
+
 
 @dataclass
 class RestoreResult:
@@ -91,7 +96,10 @@ class CheckpointManager:
         weights with the LR reset to warmup, and nothing would look wrong.
         """
         if not self.has_checkpoint():
-            return RestoreResult()
+            warm = self._restore_warm_start()
+            if warm.start_step <= 0:
+                return warm
+            return self._flag_if_complete(warm)
 
         if not checkpoints.belongs_to_run(self.cfg.run_id_file, self.cfg.run_id):
             self.log("=" * 65)
@@ -124,12 +132,76 @@ class CheckpointManager:
             result = RestoreResult()
         self.log("=" * 65)
 
+        return self._flag_if_complete(result)
+
+    def _flag_if_complete(self, result: RestoreResult) -> RestoreResult:
+        """Mark a restore that has nothing left to run, rather than looping zero times."""
         if result.start_step >= self.cfg.total_steps:
             self.log(f"[!] Checkpoint step {result.start_step} >= total_steps "
                      f"{self.cfg.total_steps}; nothing to do / nada que hacer. "
                      f"Increase total_steps to continue.")
             result.already_complete = True
         return result
+
+    def _restore_warm_start(self) -> RestoreResult:
+        """Start from exported weights alone, when the hub explicitly asked for it.
+
+        `resume_checkpoint/` and `optimizer.pt` are rewritten in place on every save, so
+        a finished run keeps exactly one resumable state — its last. The per-step
+        `{prefix}_step_N.safetensors` exports are the only surviving record of the steps
+        in between, and they carry weights and nothing else: no optimizer moments, no
+        RNG streams, no sampler position, no EMA shadow. Starting from one is therefore
+        a warm start, not a resume, and it is the caller's job to know the difference —
+        branches forked this way are comparable to each other (they are all equally
+        cold) but not to the parent's own curve past that step.
+
+        Gated on a marker file so that a missing optimizer.pt keeps meaning "no
+        checkpoint" everywhere else: without the gate, a run interrupted between the
+        adapter write and the optimizer write would come back as a silent cold restart
+        at the old step, which is the exact failure the commit protocol exists to
+        prevent. The marker stays behind afterwards but goes inert — once this branch
+        saves once, has_checkpoint() is true and this path is never consulted again.
+        """
+        marker = os.path.join(self.cfg.output_dir, WARM_START_FILENAME)
+        if not os.path.exists(marker):
+            return RestoreResult()
+
+        self.log("=" * 65)
+        self.log("Warm start requested / Arranque en caliente solicitado.")
+        try:
+            with open(marker, "r", encoding="utf-8") as handle:
+                spec = json.load(handle)
+            version = int(spec.get("format_version", 0))
+            if version != WARM_START_FORMAT_VERSION:
+                raise ValueError(f"unsupported warm_start.json version {version}")
+            start_step = int(spec["step"])
+            if start_step <= 0:
+                raise ValueError(f"warm start step must be positive, got {start_step}")
+            # sys.exit(1) from load_lora_weights on a rank/target mismatch is a
+            # SystemExit, so it passes through this handler untouched — a branch whose
+            # adapter does not fit must abort, not fall back to step 0.
+            with open(self.adapter_path, "rb") as handle:
+                lora_io.load_lora_weights(self.model, handle.read(),
+                                          self.adapter_path, log=self.log)
+        except Exception as exc:
+            self.log(f"[!] ERROR: warm start requested but could not be applied / "
+                     f"se pidió pero no se pudo aplicar: {exc}")
+            if self.cfg.resume_on_corrupt != "restart":
+                self.log("[!] Refusing to silently train from step 0 a branch that asked "
+                         "to start elsewhere / Me niego a entrenar desde 0 en silencio.")
+                sys.exit(2)
+            self.log("[!] resume_on_corrupt='restart': starting from step 0 / "
+                     "empezando desde 0.")
+            self.log("=" * 65)
+            return RestoreResult()
+
+        self.log(f"    source / origen: {spec.get('source') or '?'}")
+        self.log("[i] Weights only — optimizer moments, RNG streams, sampler position "
+                 "and EMA all start cold / sólo pesos: optimizador, RNG, posición del "
+                 "sampler y EMA arrancan en frío.")
+        self.log(f"Starting from step / Empezando desde el paso {start_step}...")
+        self.log("=" * 65)
+        return RestoreResult(start_step=start_step)
 
     def _load_state(self, ema: Any) -> RestoreResult:
         """Read optimizer.pt, tolerating the version-1 format still in flight."""

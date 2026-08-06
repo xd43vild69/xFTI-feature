@@ -3,6 +3,7 @@ from pathlib import Path
 from PIL import Image, ImageFilter
 
 from feature_pipeline.application.image_service import (
+    apply_transform,
     classify_aspect_ratio,
     classify_orientation,
     color_distance,
@@ -11,7 +12,9 @@ from feature_pipeline.application.image_service import (
     compute_sharpness,
     describe_original,
     hamming_distance,
+    is_oversized,
     make_square_thumbnail,
+    normalize_to_max_side,
 )
 
 
@@ -245,3 +248,135 @@ def test_describe_original_reads_the_real_format_not_the_extension(tmp_path: Pat
     facts = describe_original(str(image_path))
 
     assert facts.image_format == "PNG"
+
+
+def test_normalize_to_max_side_puts_longest_side_on_the_limit(tmp_path: Path):
+    source = tmp_path / "wide.png"
+    _make_patterned_image(source, (3000, 2000), seed=7)
+    destination = tmp_path / "normalized"
+
+    result = normalize_to_max_side(str(source), str(destination))
+
+    assert (result.source_width, result.source_height) == (3000, 2000)
+    assert (result.width, result.height) == (1024, 683)
+    assert Path(result.output_path) == destination / "wide.png"
+    with Image.open(result.output_path) as written:
+        assert written.size == (1024, 683)
+
+
+def test_normalize_to_max_side_scales_the_tall_axis_for_a_portrait(tmp_path: Path):
+    source = tmp_path / "tall.png"
+    _make_image(source, (1200, 2400), "green")
+
+    result = normalize_to_max_side(str(source), str(tmp_path / "out"))
+
+    assert (result.width, result.height) == (512, 1024)
+
+
+def test_normalize_to_max_side_leaves_an_image_within_the_limit_alone(tmp_path: Path):
+    source = tmp_path / "small.png"
+    _make_image(source, (1024, 768), "blue")
+
+    result = normalize_to_max_side(str(source), str(tmp_path / "out"))
+
+    # Returns the original path rather than a re-encoded copy.
+    assert result.output_path == str(source)
+    assert (result.width, result.height) == (1024, 768)
+    assert not (tmp_path / "out").exists()
+
+
+def test_normalize_to_max_side_drops_alpha_for_jpeg(tmp_path: Path):
+    source = tmp_path / "alpha.jpg"
+    Image.new("RGB", (2048, 2048), color="red").save(source)
+
+    result = normalize_to_max_side(str(source), str(tmp_path / "out"))
+
+    with Image.open(result.output_path) as written:
+        assert written.format == "JPEG"
+        assert written.size == (1024, 1024)
+
+
+def test_normalize_to_max_side_preserves_the_original(tmp_path: Path):
+    source = tmp_path / "keep.png"
+    _make_image(source, (2000, 2000), "red")
+
+    normalize_to_max_side(str(source), str(tmp_path / "out"))
+
+    with Image.open(source) as original:
+        assert original.size == (2000, 2000)
+
+
+def test_is_oversized_is_exclusive_at_the_limit():
+    assert is_oversized(1025, 100) is True
+    assert is_oversized(100, 1025) is True
+    assert is_oversized(1024, 1024) is False
+
+
+def test_apply_transform_swaps_the_axes_on_a_quarter_turn(tmp_path: Path):
+    source = tmp_path / "wide.png"
+    _make_patterned_image(source, (400, 200), seed=3)
+
+    result = apply_transform(str(source), str(tmp_path / "out"), rotation_degrees=90, max_side=None)
+
+    assert (result.source_width, result.source_height) == (400, 200)
+    assert (result.width, result.height) == (200, 400)
+    assert result.rewritten is True
+
+
+def test_apply_transform_rotation_is_an_exact_pixel_permutation(tmp_path: Path):
+    source = tmp_path / "exact.png"
+    _make_patterned_image(source, (64, 32), seed=5)
+
+    left = apply_transform(str(source), str(tmp_path / "l"), rotation_degrees=90, max_side=None)
+    back = apply_transform(str(left.output_path), str(tmp_path / "b"), rotation_degrees=270, max_side=None)
+
+    with Image.open(source) as original, Image.open(back.output_path) as round_tripped:
+        assert original.convert("RGB").tobytes() == round_tripped.convert("RGB").tobytes()
+
+
+def test_apply_transform_rotates_and_downscales_in_one_pass(tmp_path: Path):
+    source = tmp_path / "tall.png"
+    _make_patterned_image(source, (1600, 2400), seed=9)
+
+    result = apply_transform(str(source), str(tmp_path / "out"), rotation_degrees=90)
+
+    # Rotated to 2400x1600 first, so the limit lands on the (now) horizontal axis.
+    assert (result.width, result.height) == (1024, 683)
+
+
+def test_apply_transform_writes_nothing_when_there_is_nothing_to_do(tmp_path: Path):
+    source = tmp_path / "small.png"
+    _make_image(source, (800, 600), "blue")
+
+    result = apply_transform(str(source), str(tmp_path / "out"), rotation_degrees=0)
+
+    assert result.rewritten is False
+    assert result.output_path == str(source)
+    assert not (tmp_path / "out").exists()
+
+
+def test_apply_transform_treats_a_full_turn_as_no_rotation(tmp_path: Path):
+    source = tmp_path / "full.png"
+    _make_image(source, (800, 600), "red")
+
+    result = apply_transform(str(source), str(tmp_path / "out"), rotation_degrees=360)
+
+    assert result.rewritten is False
+
+
+def test_make_square_thumbnail_honours_exif_orientation(tmp_path: Path):
+    """A landscape image tagged 'rotate 90°' must letterbox as a portrait."""
+    source = tmp_path / "rotated.jpg"
+    image = Image.new("RGB", (400, 200), color="red")
+    exif = image.getexif()
+    exif[274] = 6  # Orientation: rotate 90° clockwise for display
+    image.save(source, exif=exif)
+
+    thumbnail = make_square_thumbnail(str(source), size=512)
+
+    # The visible (non-transparent) region is taller than it is wide once the tag
+    # is applied; without it, it would be the other way round.
+    bbox = thumbnail.getchannel("A").getbbox()
+    assert bbox is not None
+    width, height = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    assert height > width

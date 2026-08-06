@@ -21,6 +21,9 @@ FILTERS = {
     "Invalid": lambda s, trigger: not s.is_valid and not s.is_excluded,
     "No caption": lambda s, trigger: not s.is_excluded
     and quality.describes_nothing(s.caption, trigger),
+    # The companion to the normalize dialog: pick this, select what it shows, resize.
+    "Oversized": lambda s, trigger: not s.is_excluded
+    and max(s.metrics.width, s.metrics.height) > state.MAX_TRAINING_SIDE,
     "Excluded": lambda s, trigger: s.is_excluded,
 }
 
@@ -138,6 +141,70 @@ def _render_append_form(run: IngestionRun, targets: list[DatasetSample]) -> None
         st.rerun()
 
 
+@st.dialog("Normalizar resolución")
+def _render_normalize_dialog(run: IngestionRun, visible: list[DatasetSample]) -> None:
+    """Downscale oversized images to 1024px on the longest side.
+
+    Same scope selector as the caption dialog, filtered down to the images that
+    actually exceed the limit: an image already within it is not offered, since
+    re-encoding it would cost quality and gain nothing.
+    """
+    st.write(
+        f"Reduce las imágenes cuyo lado mayor supera **{state.MAX_TRAINING_SIDE}px**, "
+        "conservando la proporción (filtro Lanczos, sin recortar). Los archivos "
+        "originales no se tocan: las copias van a la carpeta del dataset y las "
+        "imágenes pasan a apuntar ahí."
+    )
+
+    scopes = {
+        "Seleccionadas": state.selected_samples(run),
+        "Filtro actual": visible,
+        "Todas": run.concept.samples,
+    }
+    scope = st.radio(
+        "Aplicar a",
+        list(scopes),
+        horizontal=True,
+        index=0 if scopes["Seleccionadas"] else 2,
+        key=f"normalize_scope_{run.run_id}",
+    )
+
+    targets = state.oversized_samples(scopes[scope])
+    if not targets:
+        st.info("No hay imágenes por encima del límite en este alcance.")
+        return
+
+    biggest = max(max(s.metrics.width, s.metrics.height) for s in targets)
+    st.caption(
+        f"{len(targets)} imagen(es) por encima del límite · lado mayor máximo: {biggest}px."
+    )
+    with st.expander("Ver cuáles"):
+        for sample in targets:
+            st.caption(
+                f"{Path(sample.image_path).name} · "
+                f"{sample.metrics.width}×{sample.metrics.height}"
+            )
+
+    if st.button(
+        f"Normalizar {len(targets)} imagen(es)",
+        type="primary",
+        use_container_width=True,
+        key=f"btn_normalize_apply_{run.run_id}",
+    ):
+        with st.spinner("Redimensionando…"):
+            outcomes = state.normalize_samples(run, targets)
+
+        failed = [o for o in outcomes if o.error]
+        resized = len(outcomes) - len(failed)
+        message = f"{resized} imagen(es) normalizada(s) a {state.MAX_TRAINING_SIDE}px."
+        if failed:
+            message += f" {len(failed)} fallaron: " + "; ".join(
+                f"{o.filename} ({o.error})" for o in failed
+            )
+        st.session_state["append_message"] = message
+        st.rerun()
+
+
 @st.dialog("Añadir imágenes")
 def _render_append_dialog(run: IngestionRun) -> None:
     st.write(
@@ -248,6 +315,17 @@ def render() -> None:
         ):
             _render_append_dialog(run)
 
+        oversized = state.oversized_samples(run.concept.samples)
+        if st.button(
+            f"Normalizar ({len(oversized)})" if oversized else "Normalizar",
+            icon=":material/photo_size_select_large:",
+            help=f"Reducir a {state.MAX_TRAINING_SIDE}px el lado mayor de las imágenes "
+            "que lo superan",
+            disabled=not oversized,
+            key=f"btn_normalize_{run.run_id}",
+        ):
+            _render_normalize_dialog(run, samples)
+
     # After the toolbar, not before it: a filter matching nothing is exactly when
     # adding images is most likely to be what the user wants.
     if not samples:
@@ -266,6 +344,8 @@ def _render_card(sample: DatasetSample, run: IngestionRun, thumbnail_size: int) 
     image_zoom.clickable_thumbnail(
         sample.image_path,
         f"gallery_{run.run_id}_{sample.sample_id}",
+        sample=sample,
+        run_id=run.run_id,
         size=thumbnail_size,
     )
 

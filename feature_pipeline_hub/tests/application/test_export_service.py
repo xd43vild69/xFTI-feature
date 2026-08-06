@@ -1,7 +1,8 @@
 from datetime import datetime, timezone
 from pathlib import Path
 
-from feature_pipeline.application.export_service import export_active_samples
+from feature_pipeline.application.export_service import export_active_samples, export_branch_dataset
+from feature_pipeline.domain.curation_report import WeightProfile
 from feature_pipeline.domain.models import ConceptGroup, DatasetSample, ImageMetrics, IngestionRun
 from feature_pipeline.infrastructure.storage import training_dataset_dir
 
@@ -87,3 +88,64 @@ def test_an_all_excluded_run_exports_nothing(tmp_path: Path, monkeypatch):
 
     assert result.exported_count == 0
     assert training_dataset_dir("my_concept").exists()
+
+
+# ── export_branch_dataset ────────────────────────────────────────────────────
+
+def test_branch_export_without_tiers_writes_no_report(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("FTI_TRAINING_RUNTIME_DIR", str(tmp_path))
+    samples = [_sample("a", tmp_path / "src" / "a.png", "sks, a car")]
+
+    result = export_branch_dataset(samples, "concept__control")
+
+    dest = training_dataset_dir("concept__control")
+    assert result.report_path is None
+    assert result.weights_are_effective is False
+    assert not (dest / "curation_report.json").exists()
+
+
+def test_branch_export_with_tiers_writes_a_report_keyed_by_exported_stem(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setenv("FTI_TRAINING_RUNTIME_DIR", str(tmp_path))
+    a = _sample("a", tmp_path / "src" / "a.png", "sks, a car")
+    b = _sample("b", tmp_path / "src" / "b.png", "sks, a truck")
+
+    result = export_branch_dataset(
+        [a, b], "concept__variant",
+        tiers={"a": "priority", "b": "bad"},
+        profile=WeightProfile(),
+    )
+
+    dest = training_dataset_dir("concept__variant")
+    assert result.report_path == dest / "curation_report.json"
+    assert result.weights_are_effective is True
+    assert set(result.stems) == {"a", "b"}
+
+    import json
+    report = json.loads((dest / "curation_report.json").read_text())
+    assert set(report["images"]) == {"a", "b"}
+    assert report["baselines"] == ["a.png"]
+
+
+def test_branch_export_removes_a_stale_curation_overrides_file(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("FTI_TRAINING_RUNTIME_DIR", str(tmp_path))
+    dest = training_dataset_dir("concept__variant")
+    dest.mkdir(parents=True)
+    (dest / "curation_overrides.json").write_text('{"threshold": 0.9}')
+
+    samples = [_sample("a", tmp_path / "src" / "a.png", "sks, a car")]
+    export_branch_dataset(samples, "concept__variant")
+
+    assert not (dest / "curation_overrides.json").exists()
+
+
+def test_branch_export_with_all_neutral_weights_is_not_effective(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("FTI_TRAINING_RUNTIME_DIR", str(tmp_path))
+    samples = [_sample("a", tmp_path / "src" / "a.png", "sks, a car")]
+
+    result = export_branch_dataset(
+        samples, "concept__variant", tiers={}, profile=WeightProfile()
+    )
+
+    assert result.weights_are_effective is False

@@ -176,3 +176,54 @@ def test_format_summary_renders_a_percentage_and_baselines() -> None:
                            "w_good": 1.0, "w_bad": 0.5, "threshold": 0.6})
     assert "60%" in text
     assert "Alta Prioridad" in text
+
+
+# ── hub-built reports feed load_weights correctly ──────────────────────────
+# The hub (feature_pipeline.domain.curation_report) builds curation_report.json
+# synthetically, from tiers an operator picked rather than a score. These tests
+# run both sides — the hub's writer and this module's reader — in one process to
+# pin that a hub-built report resolves exactly as build_curation_report/
+# resolved_weights predict. Import is local to keep the two packages' sys.path
+# setup (this file inserts workers/ above) from leaking into the rest of the
+# domain test suite.
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+
+from feature_pipeline.domain.curation_report import (  # noqa: E402
+    WeightProfile, build_curation_report, resolved_weights,
+)
+
+
+def test_hub_report_resolves_to_the_same_weights_predicted_by_resolved_weights(
+    tmp_path: Path,
+) -> None:
+    files_by_stem = {
+        "hero": "hero.png", "good1": "good1.png", "bad1": "bad1.png",
+    }
+    tiers = {"hero": "priority", "bad1": "bad"}
+    profile = WeightProfile(priority=1.5, good=1.0, bad=0.5)
+    report = build_curation_report(files_by_stem, tiers, profile)
+    (tmp_path / "curation_report.json").write_text(report.model_dump_json())
+
+    from_trainer = weights(tmp_path, ["hero", "good1", "bad1"])
+    assert from_trainer == resolved_weights(report)
+    assert from_trainer == {"hero": 1.5, "good1": 1.0, "bad1": 0.5}
+
+
+def test_hub_report_flip_variant_inherits_the_source_tier(tmp_path: Path) -> None:
+    files_by_stem = {"img_0001": "img_0001.png"}
+    tiers = {"img_0001": "bad"}
+    report = build_curation_report(files_by_stem, tiers, WeightProfile())
+    (tmp_path / "curation_report.json").write_text(report.model_dump_json())
+
+    result = weights(tmp_path, ["img_0001", "img_0001__flip"])
+    assert result == {"img_0001": 0.5, "img_0001__flip": 0.5}
+
+
+def test_hub_report_with_default_profile_collapses_to_none(tmp_path: Path) -> None:
+    """An all-good, untouched-profile report must be a true no-op for the trainer."""
+    files_by_stem = {"a": "a.png", "b": "b.png"}
+    report = build_curation_report(files_by_stem, {}, WeightProfile())
+    (tmp_path / "curation_report.json").write_text(report.model_dump_json())
+
+    assert weights(tmp_path, ["a", "b"]) is None

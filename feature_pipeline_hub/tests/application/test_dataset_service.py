@@ -9,7 +9,10 @@ from feature_pipeline.application.dataset_service import (
     compute_content_hash,
     create_ingestion_run,
     ingest_concept_from_folder,
+    normalize_samples,
+    oversized_samples,
     revalidate_samples,
+    rotate_sample,
 )
 from feature_pipeline.domain.models import (
     ConceptGroup,
@@ -17,10 +20,22 @@ from feature_pipeline.domain.models import (
     ImageMetrics,
     IngestionRun,
 )
+from feature_pipeline.infrastructure.database import get_connection
+from feature_pipeline.infrastructure.ingestion_repository import (
+    load_ingestion_run,
+    save_ingestion_run,
+)
 
 
 def _make_image(path: Path, size=(512, 512)) -> None:
-    Image.new("RGB", size, color="blue").save(path)
+    """A gradient rather than a flat fill: a solid colour has no detail to resample."""
+    width, height = size
+    img = Image.new("RGB", size)
+    pixels = img.load()
+    for x in range(width):
+        for y in range(height):
+            pixels[x, y] = (x % 256, y % 256, (x * y) % 256)
+    img.save(path)
 
 
 def test_ingest_concept_from_folder_builds_samples_with_trigger_injected(tmp_path: Path):
@@ -478,3 +493,219 @@ def test_clone_skips_source_images_that_are_gone_from_disk(tmp_path: Path):
     )
 
     assert len(clone.concept.samples) == 1
+
+
+def _oversized_run(tmp_path: Path, size=(2400, 1600)) -> IngestionRun:
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    _make_image(source_dir / "big.png", size)
+    (source_dir / "big.txt").write_text("a wide shot")
+    return create_ingestion_run(
+        folder_path=str(source_dir),
+        concept_name="cyberpunk_style",
+        trigger_word="sks_style",
+        source_kind="folder",
+    )
+
+
+def test_oversized_samples_reads_stored_metrics(tmp_path: Path):
+    run = _oversized_run(tmp_path)
+
+    assert [s.sample_id for s in oversized_samples(run.concept.samples)] == [
+        run.concept.samples[0].sample_id
+    ]
+    assert oversized_samples(run.concept.samples, max_side=4000) == []
+
+
+def test_normalize_samples_repoints_the_sample_and_recomputes_its_metrics(tmp_path: Path):
+    run = _oversized_run(tmp_path)
+    sample = run.concept.samples[0]
+    original_path = sample.image_path
+    original_phash = sample.metrics.phash
+    destination = tmp_path / "normalized"
+
+    conn = get_connection(str(tmp_path / "test.db"))
+    try:
+        save_ingestion_run(conn, run)
+        outcomes = normalize_samples(conn, run.concept.samples, str(destination))
+        reloaded = load_ingestion_run(conn, run.run_id)
+    finally:
+        conn.close()
+
+    assert len(outcomes) == 1
+    assert outcomes[0].source_size == (2400, 1600)
+    assert outcomes[0].new_size == (1024, 683)
+    assert outcomes[0].error == ""
+
+    assert sample.image_path == str(destination / "big.png")
+    assert (sample.metrics.width, sample.metrics.height) == (1024, 683)
+    # The hashes describe the new pixels, not the ones that are no longer in use.
+    assert sample.metrics.phash != original_phash or sample.metrics.sharpness > 0
+
+    assert reloaded is not None
+    stored = reloaded.concept.samples[0]
+    assert stored.image_path == str(destination / "big.png")
+    assert (stored.metrics.width, stored.metrics.height) == (1024, 683)
+    assert stored.metrics.phash == sample.metrics.phash
+    # Curation and captions survive the resize untouched.
+    assert stored.caption == sample.caption
+    assert Path(original_path).exists()
+
+
+def test_normalize_samples_skips_images_already_within_the_limit(tmp_path: Path):
+    run = _oversized_run(tmp_path, size=(800, 600))
+
+    conn = get_connection(str(tmp_path / "test.db"))
+    try:
+        save_ingestion_run(conn, run)
+        outcomes = normalize_samples(conn, run.concept.samples, str(tmp_path / "normalized"))
+    finally:
+        conn.close()
+
+    assert outcomes == []
+    assert not (tmp_path / "normalized").exists()
+
+
+def test_normalize_samples_reports_a_broken_file_without_touching_the_sample(tmp_path: Path):
+    run = _oversized_run(tmp_path)
+    sample = run.concept.samples[0]
+    Path(sample.image_path).write_bytes(b"not an image")
+
+    conn = get_connection(str(tmp_path / "test.db"))
+    try:
+        save_ingestion_run(conn, run)
+        outcomes = normalize_samples(conn, run.concept.samples, str(tmp_path / "normalized"))
+    finally:
+        conn.close()
+
+    assert len(outcomes) == 1
+    assert outcomes[0].error
+    assert sample.metrics.width == 2400
+
+
+def test_rotate_sample_swaps_dimensions_and_records_provenance(tmp_path: Path):
+    run = _oversized_run(tmp_path, size=(800, 400))
+    sample = run.concept.samples[0]
+    original_path = sample.image_path
+    derived = tmp_path / "derived"
+
+    conn = get_connection(str(tmp_path / "test.db"))
+    try:
+        save_ingestion_run(conn, run)
+        outcome = rotate_sample(conn, sample, str(derived), quarter_turns=1)
+        reloaded = load_ingestion_run(conn, run.run_id)
+    finally:
+        conn.close()
+
+    assert outcome.error == ""
+    assert outcome.new_size == (400, 800)
+    assert sample.rotation_degrees == 90
+    assert sample.source_image_path == original_path
+    assert sample.image_path == str(derived / "big.png")
+    assert (sample.metrics.width, sample.metrics.height) == (400, 800)
+    assert Path(original_path).exists()
+
+    assert reloaded is not None
+    stored = reloaded.concept.samples[0]
+    assert stored.rotation_degrees == 90
+    assert stored.source_image_path == original_path
+    assert stored.derived_max_side is None
+
+
+def test_rotate_sample_accumulates_the_angle_from_the_original(tmp_path: Path):
+    run = _oversized_run(tmp_path, size=(800, 400))
+    sample = run.concept.samples[0]
+    derived = tmp_path / "derived"
+
+    conn = get_connection(str(tmp_path / "test.db"))
+    try:
+        save_ingestion_run(conn, run)
+        for _ in range(3):
+            outcome = rotate_sample(conn, sample, str(derived), quarter_turns=1)
+    finally:
+        conn.close()
+
+    assert sample.rotation_degrees == 270
+    # Every turn re-derives from the untouched 800x400 original, never from the
+    # previous derivation — so the reported source size is still the original's.
+    assert outcome.source_size == (800, 400)
+    assert (sample.metrics.width, sample.metrics.height) == (400, 800)
+
+
+def test_four_quarter_turns_come_back_to_the_original_pixels(tmp_path: Path):
+    run = _oversized_run(tmp_path, size=(800, 400))
+    sample = run.concept.samples[0]
+    original_phash = sample.metrics.phash
+
+    conn = get_connection(str(tmp_path / "test.db"))
+    try:
+        save_ingestion_run(conn, run)
+        for _ in range(4):
+            rotate_sample(conn, sample, str(tmp_path / "derived"), quarter_turns=1)
+    finally:
+        conn.close()
+
+    assert sample.rotation_degrees == 0
+    assert (sample.metrics.width, sample.metrics.height) == (800, 400)
+    assert sample.metrics.phash == original_phash
+
+
+def test_rotate_sample_keeps_the_downscale_it_already_had(tmp_path: Path):
+    run = _oversized_run(tmp_path, size=(2400, 1600))
+    sample = run.concept.samples[0]
+    derived = tmp_path / "derived"
+
+    conn = get_connection(str(tmp_path / "test.db"))
+    try:
+        save_ingestion_run(conn, run)
+        normalize_samples(conn, [sample], str(derived))
+        assert (sample.metrics.width, sample.metrics.height) == (1024, 683)
+
+        rotate_sample(conn, sample, str(derived), quarter_turns=1)
+    finally:
+        conn.close()
+
+    # Rotated *and* still within the limit: the 1600x2400 turn is re-fitted to 1024
+    # on its long axis rather than restored to full resolution.
+    assert (sample.metrics.width, sample.metrics.height) == (683, 1024)
+    assert sample.derived_max_side == 1024
+    assert sample.rotation_degrees == 90
+
+
+def test_rotate_sample_preserves_caption_and_curation(tmp_path: Path):
+    run = _oversized_run(tmp_path, size=(800, 400))
+    sample = run.concept.samples[0]
+    sample.is_excluded = True
+    sample.is_flagged = True
+
+    conn = get_connection(str(tmp_path / "test.db"))
+    try:
+        save_ingestion_run(conn, run)
+        rotate_sample(conn, sample, str(tmp_path / "derived"), quarter_turns=-1)
+        reloaded = load_ingestion_run(conn, run.run_id)
+    finally:
+        conn.close()
+
+    assert sample.rotation_degrees == 270
+    assert reloaded is not None
+    stored = reloaded.concept.samples[0]
+    assert stored.caption == "sks_style, a wide shot"
+    assert stored.is_excluded is True
+    assert stored.is_flagged is True
+
+
+def test_normalize_samples_records_the_original_as_the_source(tmp_path: Path):
+    run = _oversized_run(tmp_path)
+    sample = run.concept.samples[0]
+    original_path = sample.image_path
+
+    conn = get_connection(str(tmp_path / "test.db"))
+    try:
+        save_ingestion_run(conn, run)
+        normalize_samples(conn, [sample], str(tmp_path / "derived"))
+    finally:
+        conn.close()
+
+    assert sample.source_image_path == original_path
+    assert sample.derived_max_side == 1024
+    assert sample.rotation_degrees == 0
