@@ -16,6 +16,7 @@ import streamlit as st
 from pydantic import ValidationError
 
 import state
+from components import image_zoom
 from feature_pipeline.application import dataset_service, export_service, training_service
 from feature_pipeline.domain import naming
 from feature_pipeline.domain.curation_report import Tier, WeightProfile, tier_counts
@@ -40,6 +41,32 @@ def _launch_config_state(run_id: str) -> dict:
     key = f"train_launch_config_{run_id}"
     if key not in st.session_state:
         st.session_state[key] = training_service.TrainingConfig().model_dump()
+    return st.session_state[key]
+
+
+def _fork_form_state(run_id: str) -> dict:
+    """What the branch form has been filled in with, outside any widget's own state.
+
+    Streamlit discards a keyed widget's state on any rerun where the widget is not
+    rendered, and the branch form now lives behind the mode selector — so stepping over
+    to the Monitor and back used to reset every tier and weight that had been set, which
+    on a 200-image dataset is a lot of work to lose silently. Widgets are seeded from
+    this dict and write their value straight back into it, the same shape
+    `_launch_config_state` gives the new-run form.
+
+    `rows` is keyed by sample_id rather than by position, so it survives the sample list
+    changing underneath it (an image excluded in Curate, a re-import) — an unknown id is
+    simply dropped and a new one picks up the defaults.
+    """
+    key = f"fork_form_{run_id}"
+    if key not in st.session_state:
+        st.session_state[key] = {
+            "label": "",
+            "weights": {"priority": 1.5, "good": 1.0, "bad": 0.5},
+            "rows": {},
+            "total_steps": None,
+            "save_every": None,
+        }
     return st.session_state[key]
 
 
@@ -622,16 +649,117 @@ _FORK_PINNED_LABELS = (
 )
 
 
-def _fork_images_dataframe(samples: list[DatasetSample]) -> pd.DataFrame:
-    return pd.DataFrame(
-        {
-            "sample_id": [s.sample_id for s in samples],
-            "incluir": [not s.is_excluded for s in samples],
-            "imagen": [Path(s.image_path).stem for s in samples],
-            "tier": ["good" for _ in samples],
-            "caption": [s.caption for s in samples],
-        }
+_FORK_TIER_ICONS = {
+    "priority": ":material/star:",
+    "good": ":material/check:",
+    "bad": ":material/arrow_downward:",
+}
+
+
+def _render_fork_images(
+    run: IngestionRun, samples: list[DatasetSample], rows: dict[str, dict]
+) -> None:
+    """Pick the branch's images from thumbnails, not from filenames.
+
+    A grid rather than a table because the question here is visual — which of these
+    forty pictures is the blurry one — and `st.data_editor` cannot open anything on
+    click: it takes no `on_select` (only `st.dataframe` does, and that one is not
+    editable). So this reuses `image_zoom.clickable_thumbnail`, the same click-to-modal
+    the curation and quality grids use, and the branch is picked from the same view of
+    the dataset that curating it produced.
+
+    `sample=` is deliberately not passed: that would put the rotation controls in the
+    modal, and rotating here would re-derive the pixels of the *parent* dataset from a
+    form whose whole purpose is to leave the parent untouched. The modal stays
+    read-only — zoom to 100% and nothing else.
+
+    Writes each card's state straight into `rows` (see `_fork_form_state`), since the
+    per-sample widgets are dropped by Streamlit whenever the branch mode is not the one
+    being rendered.
+    """
+    image_zoom.inject_styles()
+
+    with st.container(horizontal=True, vertical_alignment="center"):
+        columns_per_row = st.select_slider(
+            "Columns", options=[2, 3, 4, 5, 6], value=5,
+            key=f"fork_columns_{run.run_id}", label_visibility="collapsed",
+            help="Grid density",
+        )
+        if st.button("Include all", key="fork_include_all", type="tertiary"):
+            for sample in samples:
+                rows.setdefault(sample.sample_id, {})["include"] = True
+            _remount_fork_cards(run.run_id)
+        if st.button("Exclude all", key="fork_exclude_all", type="tertiary"):
+            for sample in samples:
+                rows.setdefault(sample.sample_id, {})["include"] = False
+            _remount_fork_cards(run.run_id)
+        st.caption("Click an image to inspect it full size.")
+
+    thumbnail_size = state.thumbnail_size_for_columns(int(columns_per_row))
+    version = st.session_state.get(f"fork_cards_version_{run.run_id}", 0)
+
+    for start in range(0, len(samples), int(columns_per_row)):
+        batch = samples[start : start + int(columns_per_row)]
+        for column, sample in zip(st.columns(int(columns_per_row)), batch):
+            with column:
+                _render_fork_card(run, sample, rows, thumbnail_size, version)
+
+
+def _remount_fork_cards(run_id: str) -> None:
+    """Force every card's widgets to be recreated so they pick up `rows` again.
+
+    A keyed checkbox ignores a new `value=` while its key survives, so a bulk toggle
+    would change the stored state and leave every box drawn the way it was. Bumping a
+    version inside the keys is how the caption editors solve the same problem
+    (`state.caption_widget_key`).
+    """
+    key = f"fork_cards_version_{run_id}"
+    st.session_state[key] = st.session_state.get(key, 0) + 1
+    st.rerun()
+
+
+def _render_fork_card(
+    run: IngestionRun,
+    sample: DatasetSample,
+    rows: dict[str, dict],
+    thumbnail_size: int,
+    version: int,
+) -> None:
+    """One image: click it to inspect, tick it to include, tier it to weight it."""
+    stored = rows.get(sample.sample_id, {})
+    include = bool(stored.get("include", not sample.is_excluded))
+    tier = str(stored.get("tier", "good"))
+    name = Path(sample.image_path).name
+
+    image_zoom.clickable_thumbnail(
+        sample.image_path,
+        f"fork_{run.run_id}_{sample.sample_id}",
+        size=thumbnail_size,
     )
+
+    include = st.checkbox(
+        name, value=include, key=f"fork_inc_{sample.sample_id}_v{version}",
+        help=name,
+    )
+    chosen = st.segmented_control(
+        "Tier",
+        list(Tier.__args__),
+        default=tier,
+        format_func=lambda name: _FORK_TIER_ICONS[name],
+        key=f"fork_tier_{sample.sample_id}_v{version}",
+        label_visibility="collapsed",
+        help="priority / good / bad — the weight this image trains at",
+    )
+    # Read-only, and truncated to keep the card one line tall: the caption is what the
+    # branch will train against, so it belongs on the card, but editing it here would
+    # change the *parent* dataset — that is Curate's job.
+    if sample.caption:
+        st.caption(
+            sample.caption if len(sample.caption) <= 70 else sample.caption[:69] + "…",
+            help=sample.caption,
+        )
+
+    rows[sample.sample_id] = {"include": include, "tier": str(chosen or tier)}
 
 
 def _fork_lineage_label(point: training_service.ResumePoint) -> str:
@@ -737,22 +865,30 @@ def _render_fork_form(
         f"precache of its own dataset, control included."
     )
 
+    form_state = _fork_form_state(run.run_id)
     label = st.text_input(
-        "Branch label", value="", key="fork_branch_label",
+        "Branch label", value=form_state["label"], key="fork_branch_label",
         help="Used for the exported dataset folder and the checkpoint filename prefix.",
     )
+    form_state["label"] = label
 
     with st.container(horizontal=True):
+        # Clamped rather than restored verbatim: a stored total from a checkpoint at step
+        # 300 is below the minimum of one picked at step 2700, and number_input rejects a
+        # value under its own min_value.
+        stored_total = form_state["total_steps"]
         total_steps = st.number_input(
             "Total steps", min_value=point.step + 1,
-            value=max(point.total_steps, point.step + 1), step=100,
+            value=max(int(stored_total or point.total_steps), point.step + 1), step=100,
             key="fork_total_steps",
         )
         save_every = st.number_input(
             "Save every", min_value=1, step=25,
-            value=int(point.config.get("save_every") or 300),
+            value=int(form_state["save_every"] or point.config.get("save_every") or 300),
             key="fork_save_every",
         )
+    form_state["total_steps"] = int(total_steps)
+    form_state["save_every"] = int(save_every)
 
     pinned = " · ".join(f"{name}={point.config.get(name)}" for name in _FORK_PINNED_LABELS)
     st.caption(
@@ -763,34 +899,30 @@ def _render_fork_form(
     images_tab, weights_tab = st.tabs(["Images", "Weights"])
 
     with images_tab:
-        edited = st.data_editor(
-            _fork_images_dataframe(samples),
-            column_config={
-                "sample_id": None,
-                "incluir": st.column_config.CheckboxColumn("Include"),
-                "imagen": st.column_config.TextColumn("Image", disabled=True),
-                "tier": st.column_config.SelectboxColumn("Tier", options=list(Tier.__args__)),
-                "caption": st.column_config.TextColumn("Caption", disabled=True),
-            },
-            hide_index=True,
-            key="fork_images_editor",
-            height=min(400, 40 + 35 * len(samples)),
-        )
+        _render_fork_images(run, samples, form_state["rows"])
+    included_ids = {
+        sample_id for sample_id, row in form_state["rows"].items() if row["include"]
+    }
 
     with weights_tab:
+        weights = form_state["weights"]
         with st.container(horizontal=True):
             w_priority = st.number_input(
-                "Priority weight", min_value=0.01, value=1.5, step=0.1, key="fork_w_priority"
+                "Priority weight", min_value=0.01, value=float(weights["priority"]),
+                step=0.1, key="fork_w_priority",
             )
             w_good = st.number_input(
-                "Good weight", min_value=0.01, value=1.0, step=0.1, key="fork_w_good"
+                "Good weight", min_value=0.01, value=float(weights["good"]),
+                step=0.1, key="fork_w_good",
             )
             w_bad = st.number_input(
-                "Bad weight", min_value=0.01, value=0.5, step=0.1, key="fork_w_bad"
+                "Bad weight", min_value=0.01, value=float(weights["bad"]),
+                step=0.1, key="fork_w_bad",
             )
-        included_rows = edited[edited["incluir"]]
+        weights.update(priority=float(w_priority), good=float(w_good), bad=float(w_bad))
         counts = tier_counts(
-            dict(zip(included_rows["sample_id"], included_rows["tier"])), len(included_rows)
+            {sample_id: form_state["rows"][sample_id]["tier"] for sample_id in included_ids},
+            len(included_ids),
         )
         st.caption(
             f"{counts['priority']} priority (×{w_priority}) · "
@@ -819,9 +951,11 @@ def _render_fork_form(
             tiers: dict[str, Tier] = {}
             profile = None
         else:
-            included_rows_final = edited[edited["incluir"]]
-            selected_ids = set(included_rows_final["sample_id"])
-            tiers = dict(zip(included_rows_final["sample_id"], included_rows_final["tier"]))
+            selected_ids = set(included_ids)
+            tiers = {
+                sample_id: form_state["rows"][sample_id]["tier"]
+                for sample_id in included_ids
+            }
             profile = WeightProfile(priority=w_priority, good=w_good, bad=w_bad)
 
         if not selected_ids:

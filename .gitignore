@@ -1,3 +1,21 @@
+# --- Runtime trees: code only, never the data it operates on ----------------
+# Matched BY NAME at any depth, not by the one path they use today. Both
+# locations are configurable — FTI_TRAINING_RUNTIME_DIR and FTI_DATA_DIR — and
+# feature_pipeline_hub/.gitignore only covers the defaults, so pointing either
+# somewhere else inside the repo would silently drop 68 GB of weights, runs and
+# source photographs out from under the rules.
+#
+# training_runtime/ is the model copy (~40 GB), the dedicated venv, the latent
+# cache and every run's checkpoints. It is rebuilt by
+# scripts/setup_training_runtime.sh — that script is the code, this tree is not.
+training_runtime/
+
+# Ingested and derived images. Contents only, so the deeper .gitignore can still
+# re-include its .gitkeep skeleton (a rule in a nested .gitignore overrides this
+# one, but only if the directory itself was never excluded).
+**/data/raw/**
+**/data/processed/**
+
 # --- Datasets & media -------------------------------------------------------
 # This is an ML dataset-curation project: images and captions are data, never
 # source. Dataset folders keep only their .gitkeep skeleton (see
@@ -10,21 +28,57 @@ fti_upload_*/
 
 # Media files anywhere in the tree. If you ever need to commit a real asset
 # (a logo, a doc screenshot), add it explicitly with: git add -f <path>
-*.png
-*.jpg
-*.jpeg
-*.webp
-*.gif
-*.bmp
-*.tiff
-*.psd
-*.mp4
-*.mov
-*.avi
-*.webm
+#
+# Written as character classes because gitignore matching is CASE-SENSITIVE on
+# Linux and macOS-with-a-case-sensitive-volume: a plain `*.jpg` does not match
+# `IMG_4021.JPG`, which is exactly what every phone and camera produces. There
+# are 39 such files in data/raw today, saved only by the directory rules in
+# feature_pipeline_hub/.gitignore — this is the second line of defence, so it
+# has to hold on its own. `.suffix.lower()` in storage.py/validators.py is why
+# the app happily ingests them in the first place.
+*.[pP][nN][gG]
+*.[jJ][pP][gG]
+*.[jJ][pP][eE][gG]
+*.[jJ][fF][iI][fF]
+*.[wW][eE][bB][pP]
+*.[gG][iI][fF]
+*.[bB][mM][pP]
+*.[tT][iI][fF]
+*.[tT][iI][fF][fF]
+*.[hH][eE][iI][cC]
+*.[hH][eE][iI][fF]
+*.[aA][vV][iI][fF]
+*.[pP][sS][dD]
+# Not *.svg: no camera or dataset produces one, and docs/training-architecture.svg
+# is a tracked diagram — ignoring the extension would only get in the way.
+# Camera raw: not ingestible by the app, but an operator's source folder is full
+# of them and they carry the same faces plus GPS in EXIF.
+*.[dD][nN][gG]
+*.[cC][rR]2
+*.[nN][eE][fF]
+*.[aA][rR][wW]
+*.[oO][rR][fF]
+*.[rR][wW]2
+*.[mM][pP]4
+*.[mM][oO][vV]
+*.[aA][vV][iI]
+*.[wW][eE][bB][mM]
+*.[mM][kK][vV]
 
-# Caption sidecars that ship next to training images
+# Caption sidecars that ship next to training images.
+#
+# `.txt` is the format the exporter actually writes (`.caption` is the other
+# convention, kept for imported datasets). Ignoring it wholesale is deliberate:
+# a caption in this project is a detailed physical description of a real person,
+# so it is more identifying than the filename and about as identifying as the
+# image. Nothing in this repo tracks a .txt today; if that ever changes, the
+# `git add -f` escape hatch above applies here too.
 *.caption
+*.txt
+
+# Curation artefacts: not images, but they list every filename in a dataset.
+curation_report.json
+curation_overrides.json
 
 # --- Model & artifact formats ----------------------------------------------
 *.safetensors
