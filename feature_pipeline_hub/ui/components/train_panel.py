@@ -24,6 +24,13 @@ from feature_pipeline.domain.models import DatasetSample, IngestionRun
 from feature_pipeline.infrastructure import training_repository as training_repo
 from feature_pipeline.infrastructure import training_runner
 from feature_pipeline.infrastructure.database import get_connection
+from feature_pipeline.infrastructure.model_prerequisites import (
+    ModelPrerequisitesMissingError,
+    check_model_status,
+    download_model_prerequisites,
+    get_saved_hf_token,
+    save_hf_token,
+)
 
 LOG_TAIL_BYTES = 8000
 
@@ -37,10 +44,13 @@ def _db():
         conn.close()
 
 
-def _launch_config_state(run_id: str) -> dict:
-    key = f"train_launch_config_{run_id}"
+def _launch_config_state(run_id: str, target_model: str = "krea2") -> dict:
+    key = f"train_launch_config_{run_id}_{target_model}"
     if key not in st.session_state:
-        st.session_state[key] = training_service.TrainingConfig().model_dump()
+        if target_model == "ltx23":
+            st.session_state[key] = training_service.LTX23TrainingConfig().model_dump()
+        else:
+            st.session_state[key] = training_service.TrainingConfig().model_dump()
     return st.session_state[key]
 
 
@@ -70,43 +80,48 @@ def _fork_form_state(run_id: str) -> dict:
     return st.session_state[key]
 
 
-def _field_key(run_id: str, name: str) -> str:
-    version = st.session_state.get(f"train_launch_field_version_{run_id}", 0)
-    return f"train_field_{name}_v{version}"
+def _field_key(run_id: str, name: str, target_model: str = "krea2") -> str:
+    version = st.session_state.get(f"train_launch_field_version_{run_id}_{target_model}", 0)
+    return f"train_field_{name}_{target_model}_v{version}"
 
 
-def _json_key(run_id: str) -> str:
-    version = st.session_state.get(f"train_launch_json_version_{run_id}", 0)
-    return f"train_json_v{version}"
+def _json_key(run_id: str, target_model: str = "krea2") -> str:
+    version = st.session_state.get(f"train_launch_json_version_{run_id}_{target_model}", 0)
+    return f"train_json_{target_model}_v{version}"
 
 
 def _bump(key: str) -> None:
     st.session_state[key] = st.session_state.get(key, 0) + 1
 
 
-def _sync_fields_to_json(run_id: str) -> None:
+def _sync_fields_to_json(run_id: str, target_model: str = "krea2") -> None:
     """on_change callback for every field widget: fold its new value into the
     canonical config and force the JSON tab's textarea to remount with it."""
-    config = _launch_config_state(run_id)
-    for name in training_service.TrainingConfig.model_fields:
-        widget_key = _field_key(run_id, name)
+    config = _launch_config_state(run_id, target_model)
+    model_cls = (
+        training_service.LTX23TrainingConfig
+        if target_model == "ltx23"
+        else training_service.TrainingConfig
+    )
+    for name in model_cls.model_fields:
+        widget_key = _field_key(run_id, name, target_model)
         if widget_key in st.session_state:
             config[name] = st.session_state[widget_key]
-    _bump(f"train_launch_json_version_{run_id}")
-    st.session_state[f"train_launch_json_error_{run_id}"] = None
+    _bump(f"train_launch_json_version_{run_id}_{target_model}")
+    st.session_state[f"train_launch_json_error_{run_id}_{target_model}"] = None
 
 
-def _sync_json_to_fields(run_id: str) -> None:
+def _sync_json_to_fields(run_id: str, target_model: str = "krea2") -> None:
     """on_change callback for the JSON textarea: parse, validate, merge, and force
     the field widgets to remount with the result — or leave everything untouched
     and surface an error if the pasted text doesn't parse/validate."""
-    raw = st.session_state[_json_key(run_id)]
-    error_key = f"train_launch_json_error_{run_id}"
+    raw = st.session_state[_json_key(run_id, target_model)]
+    error_key = f"train_launch_json_error_{run_id}_{target_model}"
     try:
         overrides = json.loads(raw)
         if not isinstance(overrides, dict):
             raise ValueError("Blueprint must be a JSON object of field: value pairs.")
-        config = _launch_config_state(run_id)
+        config = _launch_config_state(run_id, target_model)
         new_config, extra_keys = training_service.merge_training_config_overrides(
             config, overrides
         )
@@ -117,7 +132,7 @@ def _sync_json_to_fields(run_id: str) -> None:
     st.session_state[error_key] = (
         f"Ignored unknown field(s): {', '.join(extra_keys)}" if extra_keys else None
     )
-    _bump(f"train_launch_field_version_{run_id}")
+    _bump(f"train_launch_field_version_{run_id}_{target_model}")
 
 
 MODE_NEW = "New training"
@@ -145,14 +160,23 @@ def _mode_key(run_id: str) -> str:
     return f"train_mode_{run_id}"
 
 
+def _pending_mode_key(run_id: str) -> str:
+    return f"train_mode_pending_{run_id}"
+
+
 def _go_to_monitor(run_id: str) -> None:
     """Hand off to the Monitor after a launch, then rerun.
 
     Explicit because the mode selector is keyed: without this the operator would be left
     looking at the form they just submitted. The old page switched by accident, since
     render() checked the newest run's status before drawing anything.
+
+    The switch is staged rather than written straight to the widget's key: the launch
+    buttons fire *after* the segmented control has been instantiated this run, and
+    Streamlit refuses to modify a widget's state once that has happened. The selector
+    consumes this on the next run, before drawing itself.
     """
-    st.session_state[_mode_key(run_id)] = MODE_MONITOR
+    st.session_state[_pending_mode_key(run_id)] = MODE_MONITOR
     st.rerun()
 
 
@@ -211,11 +235,18 @@ def _render_status_strip(
         where = "this dataset" if any(
             r.training_run_id == active.training_run_id for r in train_runs
         ) else "another dataset"
-        st.warning(
-            f":material/bolt: GPU busy — a **{active.kind}** job for {where} has been "
-            f"running since {active.started_at:%Y-%m-%d %H:%M}. Launching is disabled "
-            f"until it finishes.",
-        )
+        col1, col2 = st.columns([4, 1])
+        with col1:
+            st.warning(
+                f":material/bolt: GPU busy — a **{active.kind}** job for {where} has been "
+                f"running since {active.started_at:%Y-%m-%d %H:%M}. Launching is disabled "
+                f"until it finishes.",
+            )
+        with col2:
+            if st.button("Stop & Release GPU", type="secondary", icon=":material/stop:", key="stop_active_gpu_run"):
+                with _db() as conn:
+                    training_service.stop_training(conn, active.training_run_id)
+                st.rerun()
         return
     if train_runs:
         latest = train_runs[0]  # newest first
@@ -232,7 +263,11 @@ def _render_mode_selector(
     branching exists before there is a checkpoint to branch from.
     """
     key = _mode_key(run.run_id)
-    if key not in st.session_state:
+    pending = st.session_state.pop(_pending_mode_key(run.run_id), None)
+    if pending is not None:
+        # Safe here, and only here: the widget has not been instantiated yet this run.
+        st.session_state[key] = pending
+    elif key not in st.session_state:
         # Only ever the *initial* mode; once the operator picks one it is theirs to keep.
         st.session_state[key] = MODE_MONITOR if active is not None else MODE_NEW
 
@@ -334,13 +369,74 @@ def _render_new_run_form(run: IngestionRun, *, busy: bool) -> None:
         "Branch."
     )
 
-    config = _launch_config_state(run.run_id)
+    model_choice = st.radio(
+        "Base Model Architecture",
+        ["Krea 2 (Image DiT)", "LTX 2.3 (Spatio-Temporal DiT)"],
+        index=None,
+        horizontal=True,
+        key=f"target_model_choice_{run.run_id}",
+        help="Selecciona el modelo base para el entrenamiento LoRA.",
+    )
+
+    if model_choice is None:
+        st.info("👈 Selecciona una arquitectura de modelo base (**Krea 2** o **LTX 2.3**) para continuar.")
+        return
+
+    is_ltx = "LTX 2.3" in model_choice
+    target_model: training_service.ModelArch = "ltx23" if is_ltx else "krea2"
+
+    # Status check of local model weights in training_runtime
+    model_status = check_model_status(target_model)
+    if model_status.is_ready:
+        st.success(
+            f":material/check_circle: Modelo {target_model.upper()} listo en local "
+            f"({model_status.disk_size_gb:.1f} GB) — `{model_status.model_dir.name}`"
+        )
+    else:
+        st.warning(
+            f":material/warning: El modelo base {target_model.upper()} no está descargado en `training_runtime`. "
+            f"Faltan componentes: {', '.join(model_status.missing_items)}"
+        )
+        saved_token = get_saved_hf_token() or ""
+
+        def _on_token_change() -> None:
+            raw_t = st.session_state.get(f"hf_token_input_{target_model}_{run.run_id}", "").strip()
+            if raw_t:
+                save_hf_token(raw_t)
+
+        with st.container():
+            token_col, btn_col = st.columns([3, 1], vertical_alignment="bottom")
+            with token_col:
+                token_input = st.text_input(
+                    "Hugging Face Token (HF_TOKEN)",
+                    value=saved_token,
+                    type="password",
+                    key=f"hf_token_input_{target_model}_{run.run_id}",
+                    on_change=_on_token_change,
+                    help="Token de Hugging Face requerido para descargar los modelos base y checkpoints. Se guardará localmente fuera de git.",
+                )
+            with btn_col:
+                if st.button("Descargar Modelo", icon=":material/download:", key=f"dl_btn_{target_model}_{run.run_id}"):
+                    actual_token = token_input.strip() or saved_token
+                    if not actual_token:
+                        st.error("Se requiere un Hugging Face Token para iniciar la descarga.")
+                    else:
+                        with st.spinner(f"Descargando {target_model.upper()} a training_runtime... (puede tardar varios minutos)"):
+                            try:
+                                save_hf_token(actual_token)
+                                download_model_prerequisites(target_model=target_model, hf_token=actual_token)
+                                st.success("¡Modelo descargado y validado exitosamente!")
+                                st.rerun()
+                            except Exception as exc:
+                                st.error(f"Error en la descarga: {exc}")
+
+    config = _launch_config_state(run.run_id, target_model)
 
     st.text_input(
         "Checkpoint name",
         value=config["checkpoint_name"] or run.concept.concept_name,
-        key=_field_key(run.run_id, "checkpoint_name"),
-        on_change=_sync_fields_to_json, args=(run.run_id,),
+        key=_field_key(run.run_id, "checkpoint_name", target_model),
+        on_change=_sync_fields_to_json, args=(run.run_id, target_model),
         help=(
             "Nombre base de los archivos .safetensors generados: "
             "{nombre}_step_N.safetensors y {nombre}_FINAL.safetensors. "
@@ -354,8 +450,8 @@ def _render_new_run_form(run: IngestionRun, *, busy: bool) -> None:
         with st.container(horizontal=True):
             st.number_input(
                 "Total steps", min_value=1, step=100,
-                value=config["total_steps"], key=_field_key(run.run_id, "total_steps"),
-                on_change=_sync_fields_to_json, args=(run.run_id,),
+                value=config["total_steps"], key=_field_key(run.run_id, "total_steps", target_model),
+                on_change=_sync_fields_to_json, args=(run.run_id, target_model),
                 help=(
                     "Número total de micro-pasos de entrenamiento. Las actualizaciones "
                     "reales del modelo son total_steps / grad_accum_steps. Más pasos = "
@@ -365,8 +461,8 @@ def _render_new_run_form(run: IngestionRun, *, busy: bool) -> None:
             )
             st.number_input(
                 "Learning rate", min_value=0.0, step=1e-5, format="%.6f",
-                value=config["lr"], key=_field_key(run.run_id, "lr"),
-                on_change=_sync_fields_to_json, args=(run.run_id,),
+                value=config["lr"], key=_field_key(run.run_id, "lr", target_model),
+                on_change=_sync_fields_to_json, args=(run.run_id, target_model),
                 help=(
                     "Tasa de aprendizaje máxima, alcanzada tras el warmup y luego "
                     "decaída según el scheduler. Más alta aprende más rápido pero "
@@ -375,8 +471,8 @@ def _render_new_run_form(run: IngestionRun, *, busy: bool) -> None:
             )
             st.number_input(
                 "LoRA rank", min_value=1, step=1,
-                value=config["lora_rank"], key=_field_key(run.run_id, "lora_rank"),
-                on_change=_sync_fields_to_json, args=(run.run_id,),
+                value=config["lora_rank"], key=_field_key(run.run_id, "lora_rank", target_model),
+                on_change=_sync_fields_to_json, args=(run.run_id, target_model),
                 help=(
                     "Capacidad del adaptador LoRA. Rank bajo (4-8) es rápido, liviano "
                     "y menos propenso a sobreajuste en datasets chicos; rank alto "
@@ -386,8 +482,8 @@ def _render_new_run_form(run: IngestionRun, *, busy: bool) -> None:
             )
             st.number_input(
                 "LoRA alpha", min_value=1, step=1,
-                value=config["lora_alpha"], key=_field_key(run.run_id, "lora_alpha"),
-                on_change=_sync_fields_to_json, args=(run.run_id,),
+                value=config["lora_alpha"], key=_field_key(run.run_id, "lora_alpha", target_model),
+                on_change=_sync_fields_to_json, args=(run.run_id, target_model),
                 help=(
                     "Junto con el rank define la escala (alpha/rank) con la que el "
                     "adaptador se aplica al modelo base. Subir alpha sin subir el "
@@ -400,8 +496,8 @@ def _render_new_run_form(run: IngestionRun, *, busy: bool) -> None:
         with st.container(horizontal=True):
             st.number_input(
                 "Batch size", min_value=1, step=1,
-                value=config["batch_size"], key=_field_key(run.run_id, "batch_size"),
-                on_change=_sync_fields_to_json, args=(run.run_id,),
+                value=config["batch_size"], key=_field_key(run.run_id, "batch_size", target_model),
+                on_change=_sync_fields_to_json, args=(run.run_id, target_model),
                 help=(
                     "Imágenes procesadas juntas por micro-paso. Más alto da un "
                     "gradiente más estable pero usa más VRAM; en GPUs limitadas se "
@@ -410,8 +506,8 @@ def _render_new_run_form(run: IngestionRun, *, busy: bool) -> None:
             )
             st.number_input(
                 "Grad accumulation steps", min_value=1, step=1,
-                value=config["grad_accum_steps"], key=_field_key(run.run_id, "grad_accum_steps"),
-                on_change=_sync_fields_to_json, args=(run.run_id,),
+                value=config["grad_accum_steps"], key=_field_key(run.run_id, "grad_accum_steps", target_model),
+                on_change=_sync_fields_to_json, args=(run.run_id, target_model),
                 help=(
                     "Micro-pasos acumulados antes de cada actualización real del "
                     "optimizador. Subirlo simula un batch más grande sin más VRAM, "
@@ -419,128 +515,156 @@ def _render_new_run_form(run: IngestionRun, *, busy: bool) -> None:
                 ),
             )
             st.number_input(
-                "Save every", min_value=1, step=25,
-                value=config["save_every"], key=_field_key(run.run_id, "save_every"),
-                on_change=_sync_fields_to_json, args=(run.run_id,),
+                "Save every", min_value=1, step=25 if target_model == "krea2" else 100,
+                value=config["save_every"], key=_field_key(run.run_id, "save_every", target_model),
+                on_change=_sync_fields_to_json, args=(run.run_id, target_model),
                 help=(
-                    "Cada cuántos micro-pasos se guarda un checkpoint completo "
-                    "(modelo, optimizador, EMA, RNG). Más bajo da más seguridad ante "
-                    "fallos pero más uso de disco/I-O; más alto reduce overhead pero "
-                    "arriesga más trabajo perdido si se interrumpe."
+                    "Frecuencia (en micro-pasos) con la que se escribe un checkpoint "
+                    "periódico ({nombre}_step_N.safetensors) y se refresca el estado "
+                    "reanudable. Checkpoints más frecuentes dan más puntos de rollback "
+                    "pero usan más disco."
                 ),
             )
             st.number_input(
                 "Seed", min_value=0, step=1,
-                value=config["seed"], key=_field_key(run.run_id, "seed"),
-                on_change=_sync_fields_to_json, args=(run.run_id,),
-                help=(
-                    "Semilla aleatoria que fija torch/CUDA/numpy y el muestreo de "
-                    "ruido. Con el mismo seed y los mismos pasos, dos corridas dan "
-                    "resultados idénticos — útil para comparar cambios de forma "
-                    "controlada."
-                ),
+                value=config["seed"], key=_field_key(run.run_id, "seed", target_model),
+                on_change=_sync_fields_to_json, args=(run.run_id, target_model),
+                help="Semilla para reproducibilidad de muestreo y shuffle del dataset.",
             )
 
-        with st.container(horizontal=True):
-            st.number_input(
-                "Warmup steps", min_value=0, step=10,
-                value=config["warmup_steps"], key=_field_key(run.run_id, "warmup_steps"),
-                on_change=_sync_fields_to_json, args=(run.run_id,),
-                help=(
-                    "Actualizaciones iniciales donde la tasa de aprendizaje sube "
-                    "gradualmente desde 0 hasta lr. Si el valor iguala o supera el "
-                    "total de actualizaciones, el sistema lo recorta automáticamente "
-                    "al 10% del total."
-                ),
-            )
-            st.selectbox(
-                "LR scheduler", ["cosine", "constant", "linear", "cosine_with_restarts", "step"],
-                key=_field_key(run.run_id, "lr_scheduler"),
-                index=["cosine", "constant", "linear", "cosine_with_restarts", "step"].index(
-                    config["lr_scheduler"]
-                ),
-                on_change=_sync_fields_to_json, args=(run.run_id,),
-                help=(
-                    "Cómo decae la tasa de aprendizaje tras el warmup: cosine (curva "
-                    "suave, la más usada), constant (fija en lr), linear (línea "
-                    "recta), cosine_with_restarts (repite la curva varias veces, ver "
-                    "'LR restarts') o step (baja en saltos)."
-                ),
-            )
-            st.number_input(
-                "LR restarts (cosine_with_restarts only)", min_value=1, step=1,
-                value=config["lr_num_cycles"], key=_field_key(run.run_id, "lr_num_cycles"),
-                on_change=_sync_fields_to_json, args=(run.run_id,),
-                help=(
-                    "Solo aplica con cosine_with_restarts: cuántas veces se repite "
-                    "el ciclo de subida/bajada de la tasa de aprendizaje. Más ciclos "
-                    "dan más 'reinicios' (más exploración, afinado final menos "
-                    "suave); sin efecto con otros schedulers."
-                ),
-            )
+        if not is_ltx:
+            with st.container(horizontal=True):
+                st.number_input(
+                    "Warmup steps", min_value=0, step=10,
+                    value=config["warmup_steps"], key=_field_key(run.run_id, "warmup_steps", target_model),
+                    on_change=_sync_fields_to_json, args=(run.run_id, target_model),
+                    help=(
+                        "Actualizaciones iniciales donde la tasa de aprendizaje sube "
+                        "gradualmente desde 0 hasta lr."
+                    ),
+                )
+                st.selectbox(
+                    "LR scheduler", ["cosine", "constant", "linear", "cosine_with_restarts", "step"],
+                    index=["cosine", "constant", "linear", "cosine_with_restarts", "step"].index(
+                        config["lr_scheduler"]
+                    ),
+                    key=_field_key(run.run_id, "lr_scheduler", target_model),
+                    on_change=_sync_fields_to_json, args=(run.run_id, target_model),
+                    help="Curva de decaimiento del learning rate tras el warmup.",
+                )
+                if config["lr_scheduler"] == "cosine_with_restarts":
+                    st.number_input(
+                        "LR restarts", min_value=1, step=1,
+                        value=config["lr_num_cycles"], key=_field_key(run.run_id, "lr_num_cycles", target_model),
+                        on_change=_sync_fields_to_json, args=(run.run_id, target_model),
+                        help="Cantidad de ciclos con cosine_with_restarts.",
+                    )
+                st.selectbox(
+                    "Timestep weighting", ["none", "bell", "half_bell"],
+                    index=["none", "bell", "half_bell"].index(config["timestep_weighting"]),
+                    key=_field_key(run.run_id, "timestep_weighting", target_model),
+                    on_change=_sync_fields_to_json, args=(run.run_id, target_model),
+                    help="Ponderación de la pérdida según el nivel de ruido.",
+                )
 
-        with st.container(horizontal=True):
-            st.selectbox(
-                "Timestep weighting", ["none", "bell", "half_bell"],
-                key=_field_key(run.run_id, "timestep_weighting"),
-                index=["none", "bell", "half_bell"].index(config["timestep_weighting"]),
-                on_change=_sync_fields_to_json, args=(run.run_id,),
-                help=(
-                    "Cómo se pondera la pérdida según el nivel de ruido de cada "
-                    "muestra: none pondera igual todos los niveles, bell da más peso "
-                    "a niveles intermedios, half_bell hace lo mismo solo en la mitad "
-                    "inferior. Los pesos están normalizados para no alterar la tasa "
-                    "de aprendizaje efectiva."
-                ),
-            )
-            st.number_input(
-                "Noise offset", min_value=0.0, step=0.01, format="%.3f",
-                value=config["noise_offset"], key=_field_key(run.run_id, "noise_offset"),
-                on_change=_sync_fields_to_json, args=(run.run_id,),
-                help=(
-                    "Agrega un desplazamiento constante al ruido de entrenamiento. "
-                    "Desaconsejado para este modelo (usa rectified flow, donde el "
-                    "ruido puro ya es la distribución esperada) — se deja en 0 salvo "
-                    "que se replique una configuración externa que lo use."
-                ),
-            )
-            st.number_input(
-                "Caption dropout rate", min_value=0.0, max_value=1.0, step=0.01, format="%.2f",
-                value=config["caption_dropout_rate"],
-                key=_field_key(run.run_id, "caption_dropout_rate"),
-                on_change=_sync_fields_to_json, args=(run.run_id,),
-                help=(
-                    "Probabilidad de que, en un micro-paso, se use el prompt vacío "
-                    "en vez del caption real. Subirlo mejora la fidelidad al prompt "
-                    "en inferencia (como classifier-free guidance) pero reduce la "
-                    "señal de aprendizaje del caption en cada paso."
-                ),
-            )
+            with st.container(horizontal=True):
+                st.number_input(
+                    "Noise offset", min_value=0.0, step=0.01, format="%.3f",
+                    value=config["noise_offset"], key=_field_key(run.run_id, "noise_offset", target_model),
+                    on_change=_sync_fields_to_json, args=(run.run_id, target_model),
+                    help="Offset de ruido (0.0 recomendado para rectified flow).",
+                )
+                st.number_input(
+                    "Caption dropout rate", min_value=0.0, max_value=1.0, step=0.01, format="%.2f",
+                    value=config["caption_dropout_rate"],
+                    key=_field_key(run.run_id, "caption_dropout_rate", target_model),
+                    on_change=_sync_fields_to_json, args=(run.run_id, target_model),
+                    help="Probabilidad de usar prompt vacío en vez del caption.",
+                )
 
-        if config["noise_offset"] > 0:
-            st.caption(
-                ":material/warning: noise_offset is discouraged under rectified flow "
-                "(Krea2's own math_ops.py docstring) — usually leave at 0 for this model."
-            )
+            if config["noise_offset"] > 0:
+                st.caption(
+                    ":material/warning: noise_offset is discouraged under rectified flow "
+                    "(Krea2's own math_ops.py docstring) — usually leave at 0 for this model."
+                )
+        else:
+            with st.container(horizontal=True):
+                st.number_input(
+                    "Warmup steps", min_value=0, step=10,
+                    value=config["warmup_steps"], key=_field_key(run.run_id, "warmup_steps", target_model),
+                    on_change=_sync_fields_to_json, args=(run.run_id, target_model),
+                    help="Pasos iniciales de calentamiento del LR.",
+                )
+                st.number_input(
+                    "Min LR ratio", min_value=0.0, max_value=1.0, step=0.05, format="%.2f",
+                    value=config["min_lr_ratio"], key=_field_key(run.run_id, "min_lr_ratio", target_model),
+                    on_change=_sync_fields_to_json, args=(run.run_id, target_model),
+                    help="Ratio mínimo de decaimiento del learning rate.",
+                )
+                st.number_input(
+                    "Weight decay", min_value=0.0, step=0.01, format="%.4f",
+                    value=config["weight_decay"], key=_field_key(run.run_id, "weight_decay", target_model),
+                    on_change=_sync_fields_to_json, args=(run.run_id, target_model),
+                    help="Regularización L2 para penalizar pesos grandes.",
+                )
+                st.number_input(
+                    "Max grad norm", min_value=0.0, step=0.1, format="%.2f",
+                    value=config["max_grad_norm"], key=_field_key(run.run_id, "max_grad_norm", target_model),
+                    on_change=_sync_fields_to_json, args=(run.run_id, target_model),
+                    help="Norma máxima de recorte de gradientes (gradient clipping).",
+                )
+
+            with st.container(horizontal=True):
+                st.number_input(
+                    "Frame rate", min_value=1.0, max_value=60.0, step=1.0,
+                    value=config["frame_rate"], key=_field_key(run.run_id, "frame_rate", target_model),
+                    on_change=_sync_fields_to_json, args=(run.run_id, target_model),
+                    help="Frecuencia de cuadros base del modelo de video.",
+                )
+                st.number_input(
+                    "Max text tokens", min_value=64, max_value=1024, step=64,
+                    value=config["max_text_tokens"], key=_field_key(run.run_id, "max_text_tokens", target_model),
+                    on_change=_sync_fields_to_json, args=(run.run_id, target_model),
+                    help="Límite máximo de tokens de texto codificados.",
+                )
+                st.checkbox(
+                    "LoRA only attention",
+                    value=config["lora_only_attn"], key=_field_key(run.run_id, "lora_only_attn", target_model),
+                    on_change=_sync_fields_to_json, args=(run.run_id, target_model),
+                    help="Aplica LoRA solo en capas de atención (excluye feedforward).",
+                )
+                st.checkbox(
+                    "Cast frozen to BF16",
+                    value=config["cast_frozen_bf16"], key=_field_key(run.run_id, "cast_frozen_bf16", target_model),
+                    on_change=_sync_fields_to_json, args=(run.run_id, target_model),
+                    help="Convierte pesos congelados a bfloat16 para optimizar VRAM.",
+                )
 
     with json_tab:
         st.text_area(
             "Hyperparameter blueprint (JSON)",
             value=json.dumps(config, indent=2),
-            key=_json_key(run.run_id),
+            key=_json_key(run.run_id, target_model),
             height=320,
-            on_change=_sync_json_to_fields, args=(run.run_id,),
+            on_change=_sync_json_to_fields, args=(run.run_id, target_model),
         )
-        error = st.session_state.get(f"train_launch_json_error_{run.run_id}")
+        error = st.session_state.get(f"train_launch_json_error_{run.run_id}_{target_model}")
         if error:
             if error.startswith("Ignored unknown"):
                 st.warning(error)
             else:
                 st.error(error)
 
+    start_disabled = busy or not model_status.is_ready
+    start_help = (
+        _BUSY_HELP if busy else (
+            "Descarga el modelo base antes de iniciar el entrenamiento." if not model_status.is_ready else None
+        )
+    )
+
     if st.button(
         "Start training", icon=":material/play_arrow:",
-        disabled=busy, help=_BUSY_HELP if busy else None,
+        disabled=start_disabled, help=start_help,
     ):
         checkpoint_name = naming.slugify(config["checkpoint_name"] or "")
         if not checkpoint_name:
@@ -548,7 +672,14 @@ def _render_new_run_form(run: IngestionRun, *, busy: bool) -> None:
             return
         config["checkpoint_name"] = checkpoint_name
         try:
-            validated_config = training_service.TrainingConfig(**config)
+            if is_ltx:
+                validated_config: training_service.TrainingConfig | training_service.LTX23TrainingConfig = training_service.LTX23TrainingConfig(**{
+                    k: v for k, v in config.items() if k in training_service.LTX23TrainingConfig.model_fields
+                })
+            else:
+                validated_config = training_service.TrainingConfig(**{
+                    k: v for k, v in config.items() if k in training_service.TrainingConfig.model_fields
+                })
         except ValidationError as exc:
             st.error(str(exc))
             return
@@ -561,8 +692,9 @@ def _render_new_run_form(run: IngestionRun, *, busy: bool) -> None:
                         dataset_name=run.concept.concept_name,
                         trigger_word=run.concept.trigger_word,
                         config=validated_config,
+                        target_model=target_model,
                     )
-                except training_service.PrecacheFailed as exc:
+                except (training_service.PrecacheFailed, ModelPrerequisitesMissingError) as exc:
                     st.error(str(exc))
                     return
         _go_to_monitor(run.run_id)

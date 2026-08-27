@@ -10,6 +10,7 @@ dependencies = [
     "numpy>=1.26",
     "streamlit>=1.35",
     "mcp>=1.9,<2.0",
+    "huggingface_hub>=0.23.0",
 ]
 
 [dependency-groups]
@@ -27,6 +28,7 @@ packages = ["src/feature_pipeline"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src", "workers"]
 
 [tool.mypy]
 plugins = ["pydantic.mypy"]
@@ -46,6 +48,11 @@ files = [
     "workers/krea2/metrics.py",
     "workers/krea2/schedule.py",
     "workers/krea2/checkpoints.py",
+    "workers/ltx23/__init__.py",
+    "workers/ltx23/cache_index.py",
+    "workers/ltx23/config.py",
+    "workers/ltx23/metrics.py",
+    "workers/ltx23/checkpoints.py",
 ]
 mypy_path = "workers"
 warn_return_any = true

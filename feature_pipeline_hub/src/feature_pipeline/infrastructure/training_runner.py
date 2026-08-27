@@ -40,7 +40,7 @@ class TrainingUnavailable(RuntimeError):
     """The training runtime hasn't been set up yet."""
 
 
-def resolve_environment() -> TrainingEnvironment:
+def resolve_environment(target_model: str = "krea2") -> TrainingEnvironment:
     """Locate the training runtime's own interpreter and model copy, or explain what's missing."""
     runtime_dir = training_runtime_dir()
 
@@ -54,14 +54,15 @@ def resolve_environment() -> TrainingEnvironment:
             f"first, or set {PYTHON_ENV} if it lives elsewhere."
         )
 
-    model_dir = runtime_dir / "model"
-    required = ["transformer", "text_encoder", "vae"]
-    missing = [name for name in required if not (model_dir / name).is_dir()]
-    if missing:
-        raise TrainingUnavailable(
-            f"Incomplete model copy at {model_dir} (missing {', '.join(missing)}). "
-            "Run scripts/setup_training_runtime.sh first."
-        )
+    if target_model == "krea2":
+        model_dir = runtime_dir / "model"
+        required = ["transformer", "text_encoder", "vae"]
+        missing = [name for name in required if not (model_dir / name).is_dir()]
+        if missing and not any((model_dir / f).is_file() for f in ["index.json", "model_index.json", "config.json"]):
+            raise TrainingUnavailable(
+                f"Incomplete model copy at {model_dir} (missing {', '.join(missing)}). "
+                "Run scripts/setup_training_runtime.sh first."
+            )
 
     return TrainingEnvironment(runtime_dir=runtime_dir, python=python)
 
@@ -188,6 +189,13 @@ def is_process_alive(pid: int) -> bool:
     way, a zombie counts as not-alive.
     """
     try:
+        wpid, _ = os.waitpid(pid, os.WNOHANG)
+        if wpid == pid:
+            return False
+    except (ChildProcessError, OSError):
+        pass
+
+    try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
@@ -198,17 +206,16 @@ def is_process_alive(pid: int) -> bool:
 
     try:
         state = Path(f"/proc/{pid}/stat").read_text().split(") ", 1)[1].split()[0]
+        if state == "Z":
+            try:
+                os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                pass
+            return False
     except (FileNotFoundError, IndexError):
-        return True  # not on Linux, or the process just vanished — assume alive
+        pass
 
-    if state != "Z":
-        return True
-
-    try:
-        os.waitpid(pid, os.WNOHANG)
-    except ChildProcessError:
-        pass  # not our child (e.g. app restarted since launch) — can't reap it
-    return False
+    return True
 
 
 def stop_process(pid: int, grace_period_seconds: float = 10.0) -> None:

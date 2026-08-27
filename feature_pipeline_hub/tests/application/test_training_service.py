@@ -45,6 +45,11 @@ def fake_model_dir(tmp_path, monkeypatch):
     model = runtime / "model"
     for part in ("transformer", "text_encoder", "vae"):
         (model / part).mkdir(parents=True)
+    (model / "model_index.json").write_text("{}", encoding="utf-8")
+    ltx = runtime / "LTX23-NF4"
+    ltx.mkdir(parents=True)
+    (ltx / "model_index.json").write_text("{}", encoding="utf-8")
+    (ltx / "index.json").write_text("{}", encoding="utf-8")
     (runtime / "venv" / "bin").mkdir(parents=True)
     (runtime / "venv" / "bin" / "python").symlink_to(sys.executable)
     monkeypatch.setenv("FTI_TRAINING_RUNTIME_DIR", str(runtime))
@@ -1285,3 +1290,40 @@ def test_checkpoint_log_csv_path_is_next_to_the_checkpoints():
     assert training_service.checkpoint_log_csv_path(run) == Path(
         "/x/runs/train-abc/checkpoints/checkpoint_log.csv"
     )
+
+
+def test_start_training_ltx23_launches_ltx23_workers(conn, fake_model_dir, tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        training_service, "PRECACHE_SCRIPT_LTX23", _write_stub(tmp_path, SUCCESSFUL_PRECACHE)
+    )
+    monkeypatch.setattr(
+        training_service, "TRAIN_SCRIPT_LTX23", _write_stub(tmp_path, STUB_TRAIN)
+    )
+
+    training_run_id = training_service.start_training(
+        conn,
+        dataset_run_id="run-ltx-1",
+        dataset_name="video_concept",
+        trigger_word="sks_test",
+        config=training_service.LTX23TrainingConfig(total_steps=50, lora_rank=32),
+        target_model="ltx23",
+    )
+
+    train_run = repo.get_training_run(conn, training_run_id)
+    assert train_run.kind == "train"
+    assert train_run.status == "running"
+    assert train_run.config["total_steps"] == 50
+    assert train_run.config["lora_rank"] == 32
+    assert train_run.config["lora_key_prefix"] == "diffusion_model."
+
+    from feature_pipeline.infrastructure import training_runner
+    training_runner.stop_process(train_run.pid, grace_period_seconds=1)
+
+
+def test_cache_and_model_dir_resolution_for_ltx23(fake_model_dir, tmp_path, monkeypatch):
+    cache_path = training_service.cache_dir_for("test_ds", target_model="ltx23")
+    assert "cached_data_ltx23" in str(cache_path)
+
+    krea_cache = training_service.cache_dir_for("test_ds", target_model="krea2")
+    assert "cache" in str(krea_cache) and "cached_data_ltx23" not in str(krea_cache)
+

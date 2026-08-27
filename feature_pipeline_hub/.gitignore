@@ -15,3 +15,11 @@ data/processed/**
 # dedicated venv, exported datasets, caches, and run logs/checkpoints. Never
 # code, never tracked — see scripts/setup_training_runtime.sh.
 training_runtime/
+
+# Hugging Face tokens and local credentials (never track secrets)
+HF_token.json
+*token*.json
+*.token
+.hf_token
+.env
+.env.*

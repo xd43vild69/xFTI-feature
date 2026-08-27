@@ -235,27 +235,20 @@ def copy_resume_state(source_dir: Path, destination_dir: Path) -> int:
 
 
 def _resume_layout_key(key: str) -> str:
-    """Invert `lora_io.export_lora`'s key rewrite.
-
-    That function maps `base_model.model.<X>.lora_A.default.weight` to
-    `transformer.<X>.lora_A.default.weight` for inference loaders; PEFT's
-    `save_pretrained` — the layout `set_peft_model_state_dict` actually accepts — writes
-    `base_model.model.<X>.lora_A.weight`, dropping the adapter name. So the inverse is
-    both a prefix swap and a `.default` strip, and it is a verified bijection on a real
-    export: 528 tensors in, 528 out, shapes and dtypes matching the resume checkpoint
-    written by the same run.
-    """
-    if not key.startswith(_EXPORT_PREFIX):
+    """Invert export key rewrite for both Krea 2 (transformer.) and LTX 2.3 (diffusion_model.)."""
+    matched_prefix: str | None = None
+    for p in ("transformer.", "diffusion_model."):
+        if key.startswith(p):
+            matched_prefix = p
+            break
+    if matched_prefix is None:
         raise ValueError(f"not an exported LoRA key: {key!r}")
     if key.endswith(_ALPHA_SUFFIX):
-        # export_alpha_tensors adds these. They are not `lora_*` keys, so PEFT would
-        # report them as unexpected and `load_lora_weights` would exit(1) — and dropping
-        # them is not free, since their bytes sit inside the blob this copies verbatim.
         raise ValueError(
             "export carries per-module alpha tensors, which cannot be warm-started from; "
             "re-export with export_alpha_tensors off"
         )
-    body = key[len(_EXPORT_PREFIX):]
+    body = key[len(matched_prefix):]
     if body.endswith(_ADAPTER_NAME_SUFFIX):
         body = body[: -len(_ADAPTER_NAME_SUFFIX)] + ".weight"
     return _RESUME_PREFIX + body

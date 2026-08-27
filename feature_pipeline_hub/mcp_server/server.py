@@ -26,6 +26,7 @@ from feature_pipeline.application import (
     training_service,
 )
 from feature_pipeline.domain.models import IngestionRun
+from feature_pipeline.domain.worker_contracts import ModelArch
 from feature_pipeline.infrastructure import ingestion_repository as repo
 from feature_pipeline.infrastructure import training_repository as training_repo
 from feature_pipeline.infrastructure import training_runner
@@ -144,6 +145,7 @@ def quality_summary(run_id: str) -> dict:
 @mcp.tool()
 def start_lora_training(
     dataset_run_id: str,
+    target_model: str = "krea2",
     total_steps: int = 1200,
     lr: float = 1e-4,
     lora_rank: int = 16,
@@ -155,12 +157,14 @@ def start_lora_training(
 ) -> dict:
     """Start a LoRA training run: launches pre-cache and returns immediately (does not block).
 
+    `target_model` can be "krea2" (default) or "ltx23".
     The dataset must already be exported via `export_dataset` under its concept name.
     Only one training-runtime job (pre-cache or train) can run at a time; call fails
     if one is already active. Poll `get_training_status` with the returned
     `training_run_id` until phase="precache" reports status="completed", then call
     `continue_lora_training` with the SAME hyperparameters to launch the train phase.
     """
+    model_arch: ModelArch = "ltx23" if target_model.strip().lower() == "ltx23" else "krea2"
     with _db() as conn:
         if training_service.is_training_active(conn):
             raise RuntimeError("A training-runtime job is already running; wait for it to finish.")
@@ -171,6 +175,7 @@ def start_lora_training(
             dataset_run_id=dataset_run_id,
             dataset_name=run.concept.concept_name,
             trigger_word=run.concept.trigger_word,
+            target_model=model_arch,
         )
         return {"training_run_id": training_run_id, "phase": "precache", "status": "running"}
 
@@ -179,6 +184,7 @@ def start_lora_training(
 def continue_lora_training(
     dataset_run_id: str,
     precache_training_run_id: str,
+    target_model: str = "krea2",
     total_steps: int = 1200,
     lr: float = 1e-4,
     lora_rank: int = 16,
@@ -191,6 +197,7 @@ def continue_lora_training(
 ) -> dict:
     """Launch the training phase after `start_lora_training`'s pre-cache has completed.
 
+    `target_model` can be "krea2" (default) or "ltx23".
     Call `get_training_status(precache_training_run_id)` first and only call this once
     it reports phase="precache", status="completed". Hyperparameters should match the
     call to `start_lora_training` (they were not persisted between the two calls).
@@ -199,29 +206,45 @@ def continue_lora_training(
     (`{checkpoint_name}_step_N.safetensors`, `{checkpoint_name}_FINAL.safetensors`);
     left empty, it falls back to the dataset's concept name.
     """
+    model_arch: ModelArch = "ltx23" if target_model.strip().lower() == "ltx23" else "krea2"
     with _db() as conn:
         status = training_service.precache_status(conn, precache_training_run_id)
         if status != "completed":
             raise RuntimeError(f"Pre-cache is not complete yet (status={status!r}).")
 
         run = _require_run(conn, dataset_run_id)
-        config = training_service.TrainingConfig(
-            total_steps=total_steps,
-            lr=lr,
-            lora_rank=lora_rank,
-            lora_alpha=lora_alpha,
-            batch_size=batch_size,
-            grad_accum_steps=grad_accum_steps,
-            save_every=save_every,
-            seed=seed,
-            checkpoint_name=checkpoint_name,
-        )
+        config: training_service.TrainingConfig | training_service.LTX23TrainingConfig
+        if model_arch == "ltx23":
+            config = training_service.LTX23TrainingConfig(
+                total_steps=total_steps,
+                lr=lr,
+                lora_rank=lora_rank,
+                lora_alpha=lora_alpha,
+                batch_size=batch_size,
+                grad_accum_steps=grad_accum_steps,
+                save_every=save_every,
+                seed=seed,
+                checkpoint_name=checkpoint_name,
+            )
+        else:
+            config = training_service.TrainingConfig(
+                total_steps=total_steps,
+                lr=lr,
+                lora_rank=lora_rank,
+                lora_alpha=lora_alpha,
+                batch_size=batch_size,
+                grad_accum_steps=grad_accum_steps,
+                save_every=save_every,
+                seed=seed,
+                checkpoint_name=checkpoint_name,
+            )
         training_run_id = training_service.launch_train(
             conn,
             dataset_run_id=dataset_run_id,
             dataset_name=run.concept.concept_name,
             trigger_word=run.concept.trigger_word,
             config=config,
+            target_model=model_arch,
         )
         return {"training_run_id": training_run_id, "phase": "train", "status": "running"}
 

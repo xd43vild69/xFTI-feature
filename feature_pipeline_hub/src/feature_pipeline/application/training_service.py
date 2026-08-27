@@ -8,6 +8,7 @@ train_settings.json in LoRAlab (see `_cfg()` in train_worker.py).
 """
 
 import csv
+import os
 import re
 import shutil
 import sqlite3
@@ -23,15 +24,31 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from feature_pipeline.domain import checkpoint_log, cost, train_log
 from feature_pipeline.domain.naming import slugify
-from feature_pipeline.domain.worker_contracts import PrecacheSettings, TrainSettings
+from feature_pipeline.domain.worker_contracts import (
+    LTX23PrecacheSettings,
+    LTX23TrainSettings,
+    ModelArch,
+    PrecacheSettings,
+    TrainSettings,
+)
 from feature_pipeline.infrastructure import checkpoint_files
 from feature_pipeline.infrastructure import training_repository as repo
 from feature_pipeline.infrastructure import training_runner
+from feature_pipeline.infrastructure.model_prerequisites import (
+    ModelPrerequisitesMissingError,
+    check_model_status,
+    default_model_dir,
+)
 from feature_pipeline.infrastructure.storage import training_runtime_dir, write_caption_sidecar
 
 WORKERS_DIR = Path(__file__).resolve().parents[3] / "workers"
-PRECACHE_SCRIPT = WORKERS_DIR / "precache_worker.py"
-TRAIN_SCRIPT = WORKERS_DIR / "train_worker.py"
+PRECACHE_SCRIPT_KREA2 = WORKERS_DIR / "precache_worker.py"
+TRAIN_SCRIPT_KREA2 = WORKERS_DIR / "train_worker.py"
+PRECACHE_SCRIPT_LTX23 = WORKERS_DIR / "precache_ltx23_worker.py"
+TRAIN_SCRIPT_LTX23 = WORKERS_DIR / "train_ltx23_worker.py"
+
+PRECACHE_SCRIPT = PRECACHE_SCRIPT_KREA2
+TRAIN_SCRIPT = TRAIN_SCRIPT_KREA2
 
 PRECACHE_SETTINGS_ENV = "PRECACHE_SETTINGS_PATH"  # name LoRAlab's own script reads
 TRAIN_SETTINGS_ENV = "TRAIN_SETTINGS_PATH"
@@ -46,8 +63,16 @@ OPTIMIZER_STATE_FILE = "optimizer.pt"
 RESUME_ADAPTER = Path("resume_checkpoint") / "adapter_model.safetensors"
 
 
+def precache_script_for(target_model: ModelArch = "krea2") -> Path:
+    return PRECACHE_SCRIPT_LTX23 if target_model == "ltx23" else PRECACHE_SCRIPT
+
+
+def train_script_for(target_model: ModelArch = "krea2") -> Path:
+    return TRAIN_SCRIPT_LTX23 if target_model == "ltx23" else TRAIN_SCRIPT
+
+
 class TrainingConfig(BaseModel):
-    """LoRA hyperparameters chosen in the UI.
+    """LoRA hyperparameters chosen in the UI (Krea 2).
 
     Bounds are enforced here rather than only by the Streamlit widgets, so a value
     that would waste a run (zero steps, a negative learning rate) is rejected at
@@ -71,6 +96,40 @@ class TrainingConfig(BaseModel):
     timestep_weighting: Literal["none", "bell", "half_bell"] = "none"
     noise_offset: float = Field(default=0.0, ge=0.0)
     caption_dropout_rate: float = Field(default=0.05, ge=0.0, le=1.0)
+
+
+class LTX23TrainingConfig(BaseModel):
+    """LTX 2.3 LoRA hyperparameters chosen in the UI."""
+
+    model_config = ConfigDict(frozen=True)
+
+    checkpoint_name: str = ""
+    total_steps: int = Field(default=1500, gt=0)
+    lr: float = Field(default=2e-4, gt=0)
+    lora_rank: int = Field(default=32, gt=0)
+    lora_alpha: int = Field(default=32, gt=0)
+    batch_size: int = Field(default=1, gt=0)
+    grad_accum_steps: int = Field(default=4, gt=0)
+    save_every: int = Field(default=100, gt=0)
+    seed: int = Field(default=314159, ge=0)
+    warmup_steps: int = Field(default=100, ge=0)
+    min_lr_ratio: float = Field(default=0.1, ge=0.0, le=1.0)
+    weight_decay: float = Field(default=0.0, ge=0.0)
+    max_grad_norm: float = Field(default=1.0, gt=0.0)
+    frame_rate: float = 24.0
+    max_text_tokens: int = 256
+    lora_only_attn: bool = True
+    cast_frozen_bf16: bool = True
+    use_audio_loss: bool = False
+    low_vram_12gb: bool = True
+    activation_offload: bool = True
+    loss_chunk_elements: int = 2000000
+    lora_key_prefix: str = "diffusion_model."
+    preview_every: int = 0
+    preview_steps: int = 30
+    preview_cfg: float = 3.0
+    preview_mode: Literal["gen", "recon", "onestep"] = "gen"
+    preview_vae_fp32: bool = True
 
 
 def merge_training_config_overrides(
@@ -131,8 +190,13 @@ def dataset_dir_for(dataset_name: str) -> Path:
     return training_runtime_dir() / "datasets" / dataset_name
 
 
-def cache_dir_for(dataset_name: str) -> Path:
-    return training_runtime_dir() / "cache" / dataset_name
+def cache_dir_for(dataset_name: str, target_model: ModelArch = "krea2") -> Path:
+    prefix = "cached_data_ltx23" if target_model == "ltx23" else "cache"
+    return training_runtime_dir() / prefix / dataset_name
+
+
+def model_dir_for(target_model: ModelArch = "krea2") -> Path:
+    return default_model_dir(target_model)
 
 
 _VERSIONED_NAME = re.compile(r"^(.+)_v(\d+)$")
@@ -250,17 +314,19 @@ def start_training(
     dataset_run_id: str,
     dataset_name: str,
     trigger_word: str,
-    config: TrainingConfig,
+    config: TrainingConfig | LTX23TrainingConfig,
+    target_model: ModelArch = "krea2",
 ) -> str:
-    """Run pre-cache to completion, then launch training detached.
-
-    Returns the training_run_id of the **train** job (the one the UI polls for
-    progress) — the pre-cache job gets its own row too, but it's already
-    finished by the time this returns.
-    """
+    """Run pre-cache to completion, then launch training detached."""
     dataset_path = dataset_dir_for(dataset_name)
-    cache_dir = cache_dir_for(dataset_name)
-    model_dir = training_runner.resolve_environment().model_dir
+    cache_dir = cache_dir_for(dataset_name, target_model=target_model)
+    model_dir = model_dir_for(target_model=target_model)
+
+    status = check_model_status(target_model=target_model, custom_dir=model_dir)
+    if not status.is_ready:
+        raise ModelPrerequisitesMissingError(
+            f"Cannot start training: Base model '{target_model}' prerequisites are missing. {status.message}"
+        )
 
     _run_precache_blocking(
         conn,
@@ -269,6 +335,7 @@ def start_training(
         dataset_path=dataset_path,
         cache_dir=cache_dir,
         trigger_word=trigger_word,
+        target_model=target_model,
     )
 
     return _launch_train(
@@ -280,6 +347,7 @@ def start_training(
         cache_dir=cache_dir,
         trigger_word=trigger_word,
         config=config,
+        target_model=target_model,
     )
 
 
@@ -289,6 +357,7 @@ def launch_precache(
     dataset_run_id: str,
     dataset_name: str,
     trigger_word: str,
+    target_model: ModelArch = "krea2",
 ) -> str:
     """Launch pre-cache detached and return its training_run_id immediately.
 
@@ -297,8 +366,15 @@ def launch_precache(
     `PRECACHE_TIMEOUT_SECONDS`. Poll completion with `precache_status`.
     """
     dataset_path = dataset_dir_for(dataset_name)
-    cache_dir = cache_dir_for(dataset_name)
-    model_dir = training_runner.resolve_environment().model_dir
+    cache_dir = cache_dir_for(dataset_name, target_model=target_model)
+    model_dir = model_dir_for(target_model=target_model)
+
+    status = check_model_status(target_model=target_model, custom_dir=model_dir)
+    if not status.is_ready:
+        raise ModelPrerequisitesMissingError(
+            f"Cannot start pre-cache: Base model '{target_model}' prerequisites are missing. {status.message}"
+        )
+
     return _launch_precache(
         conn,
         dataset_run_id=dataset_run_id,
@@ -306,6 +382,7 @@ def launch_precache(
         dataset_path=dataset_path,
         cache_dir=cache_dir,
         trigger_word=trigger_word,
+        target_model=target_model,
     )
 
 
@@ -325,7 +402,7 @@ def precache_status(conn: sqlite3.Connection, training_run_id: str) -> str:
         return "running"
 
     log_text, _ = training_runner.read_log_tail(run.log_path)
-    if "Pre-caching finished" in log_text:
+    if "Pre-caching finished" in log_text or "Pre-cache LTX 2.3 completado" in log_text:
         finalize_dead_run(conn, run, fallback_status="completed")
         return "completed"
     finalize_dead_run(conn, run, fallback_status="failed")
@@ -389,18 +466,29 @@ def _launch_precache(
     dataset_path: Path,
     cache_dir: Path,
     trigger_word: str,
+    target_model: ModelArch = "krea2",
 ) -> str:
     precache_run_id = str(uuid.uuid4())
     run_dir = training_runtime_dir() / "runs" / f"precache-{precache_run_id}"
-    settings = PrecacheSettings(
-        model_id=str(model_dir),
-        dataset_path=str(dataset_path),
-        cache_dir=str(cache_dir),
-        trigger_word=trigger_word,
-    ).model_dump()
+    script = precache_script_for(target_model)
+
+    if target_model == "ltx23":
+        settings = LTX23PrecacheSettings(
+            model_id=str(model_dir),
+            dataset_path=str(dataset_path),
+            cache_dir=str(cache_dir),
+            trigger_word=trigger_word,
+        ).model_dump()
+    else:
+        settings = PrecacheSettings(
+            model_id=str(model_dir),
+            dataset_path=str(dataset_path),
+            cache_dir=str(cache_dir),
+            trigger_word=trigger_word,
+        ).model_dump()
 
     pid, log_path = training_runner.launch(
-        PRECACHE_SCRIPT,
+        script,
         settings,
         run_dir,
         PRECACHE_SETTINGS_ENV,
@@ -424,6 +512,7 @@ def _run_precache_blocking(
     dataset_path: Path,
     cache_dir: Path,
     trigger_word: str,
+    target_model: ModelArch = "krea2",
 ) -> None:
     training_run_id = _launch_precache(
         conn,
@@ -432,6 +521,7 @@ def _run_precache_blocking(
         dataset_path=dataset_path,
         cache_dir=cache_dir,
         trigger_word=trigger_word,
+        target_model=target_model,
     )
     run = repo.get_training_run(conn, training_run_id)
     assert run is not None
@@ -448,7 +538,9 @@ def _run_precache_blocking(
     if status != "completed":
         log_text, _ = training_runner.read_log_tail(run.log_path)
         tail = "\n".join(log_text.splitlines()[-15:])
-        raise PrecacheFailed(f"Pre-cache did not report success. Last log lines:\n{tail}")
+        raise PrecacheFailed(
+            f"Pre-cache failed for dataset {dataset_path.name}:\n{tail}"
+        )
 
 
 def launch_train(
@@ -457,17 +549,20 @@ def launch_train(
     dataset_run_id: str,
     dataset_name: str,
     trigger_word: str,
-    config: TrainingConfig,
+    config: TrainingConfig | LTX23TrainingConfig,
+    target_model: ModelArch = "krea2",
 ) -> str:
-    """Launch the training phase detached, given pre-cache has already completed.
-
-    The public counterpart to `_launch_train`'s internal use from `start_training`,
-    for callers (like the MCP server) that split pre-cache and train into two
-    separate steps instead of running them back-to-back in one blocking call.
-    """
+    """Launch the training phase detached, given pre-cache has already completed."""
     dataset_path = dataset_dir_for(dataset_name)
-    cache_dir = cache_dir_for(dataset_name)
-    model_dir = training_runner.resolve_environment().model_dir
+    cache_dir = cache_dir_for(dataset_name, target_model=target_model)
+    model_dir = model_dir_for(target_model=target_model)
+
+    status = check_model_status(target_model=target_model, custom_dir=model_dir)
+    if not status.is_ready:
+        raise ModelPrerequisitesMissingError(
+            f"Cannot start training: Base model '{target_model}' prerequisites are missing. {status.message}"
+        )
+
     return _launch_train(
         conn,
         dataset_run_id=dataset_run_id,
@@ -477,6 +572,7 @@ def launch_train(
         cache_dir=cache_dir,
         trigger_word=trigger_word,
         config=config,
+        target_model=target_model,
     )
 
 
@@ -604,6 +700,7 @@ def resume_training(
         )
 
     config = dict(resume_point.config)
+    target_model: ModelArch = "ltx23" if ("lora_key_prefix" in config or "max_text_tokens" in config) else "krea2"
     _run_precache_blocking(
         conn,
         dataset_run_id=dataset_run_id,
@@ -611,13 +708,17 @@ def resume_training(
         dataset_path=Path(config["dataset_path"]),
         cache_dir=Path(config["cache_dir"]),
         trigger_word=config.get("trigger_word", ""),
+        target_model=target_model,
     )
 
-    settings = TrainSettings(**{**config, "total_steps": total_steps}).model_dump()
+    if target_model == "ltx23":
+        settings = LTX23TrainSettings(**{**config, "total_steps": total_steps}).model_dump()
+    else:
+        settings = TrainSettings(**{**config, "total_steps": total_steps}).model_dump()
     run_dir = training_runtime_dir() / "runs" / f"train-{uuid.uuid4()}"
 
     pid, log_path = training_runner.launch(
-        TRAIN_SCRIPT,
+        train_script_for(target_model),
         settings,
         run_dir,
         TRAIN_SETTINGS_ENV,
@@ -856,24 +957,37 @@ def _launch_train(
     dataset_path: Path,
     cache_dir: Path,
     trigger_word: str,
-    config: TrainingConfig,
+    config: TrainingConfig | LTX23TrainingConfig,
+    target_model: ModelArch = "krea2",
 ) -> str:
     training_run_id_hint = str(uuid.uuid4())
     run_dir = training_runtime_dir() / "runs" / f"train-{training_run_id_hint}"
     output_dir = run_dir / "checkpoints"
+    script = train_script_for(target_model)
 
-    settings = TrainSettings(
-        model_id=str(model_dir),
-        dataset_path=str(dataset_path),
-        cache_dir=str(cache_dir),
-        output_dir=str(output_dir),
-        trigger_word=trigger_word,
-        checkpoint_prefix=config.checkpoint_name or dataset_name,
-        **config.model_dump(exclude={"checkpoint_name"}),
-    ).model_dump()
+    if isinstance(config, LTX23TrainingConfig) or target_model == "ltx23":
+        settings = LTX23TrainSettings(
+            model_id=str(model_dir),
+            dataset_path=str(dataset_path),
+            cache_dir=str(cache_dir),
+            output_dir=str(output_dir),
+            trigger_word=trigger_word,
+            project_name=config.checkpoint_name or dataset_name,
+            **config.model_dump(exclude={"checkpoint_name"}),
+        ).model_dump()
+    else:
+        settings = TrainSettings(
+            model_id=str(model_dir),
+            dataset_path=str(dataset_path),
+            cache_dir=str(cache_dir),
+            output_dir=str(output_dir),
+            trigger_word=trigger_word,
+            checkpoint_prefix=config.checkpoint_name or dataset_name,
+            **config.model_dump(exclude={"checkpoint_name"}),
+        ).model_dump()
 
     pid, log_path = training_runner.launch(
-        TRAIN_SCRIPT,
+        script,
         settings,
         run_dir,
         TRAIN_SETTINGS_ENV,

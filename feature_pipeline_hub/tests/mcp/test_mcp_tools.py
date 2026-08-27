@@ -38,6 +38,11 @@ def fake_model_dir(tmp_path, monkeypatch):
     model = runtime / "model"
     for part in ("transformer", "text_encoder", "vae"):
         (model / part).mkdir(parents=True)
+    (model / "model_index.json").write_text("{}", encoding="utf-8")
+    ltx = runtime / "LTX23-NF4"
+    ltx.mkdir(parents=True)
+    (ltx / "model_index.json").write_text("{}", encoding="utf-8")
+    (ltx / "index.json").write_text("{}", encoding="utf-8")
     (runtime / "venv" / "bin").mkdir(parents=True)
     (runtime / "venv" / "bin" / "python").symlink_to(sys.executable)
     monkeypatch.setenv("FTI_TRAINING_RUNTIME_DIR", str(runtime))
@@ -252,3 +257,37 @@ def test_stop_training_marks_the_run_stopped(tmp_path, fake_model_dir, monkeypat
 def test_get_training_status_raises_for_unknown_run():
     with pytest.raises(ValueError, match="No such training run"):
         server.get_training_status("does-not-exist")
+
+
+def test_start_and_continue_lora_training_ltx23(tmp_path, fake_model_dir, monkeypatch):
+    monkeypatch.setattr(training_service, "PRECACHE_SCRIPT_LTX23", _write_stub(tmp_path, SUCCESSFUL_PRECACHE))
+    monkeypatch.setattr(training_service, "TRAIN_SCRIPT_LTX23", _write_stub(tmp_path, STUB_TRAIN))
+    folder = _make_dataset_folder(tmp_path)
+    imported = server.import_dataset(str(folder), "video_concept", "sks_concept")
+    started = server.start_lora_training(imported["run_id"], target_model="ltx23", total_steps=25)
+
+    conn = get_connection(str(tmp_path / "test.db"))
+    try:
+        while training_service.precache_status(conn, started["training_run_id"]) == "running":
+            time.sleep(0.05)
+    finally:
+        conn.close()
+
+    result = server.continue_lora_training(
+        imported["run_id"], started["training_run_id"], target_model="ltx23", total_steps=25
+    )
+
+    assert result["phase"] == "train"
+    assert result["status"] == "running"
+
+    conn = get_connection(str(tmp_path / "test.db"))
+    try:
+        train_run = training_repo.get_training_run(conn, result["training_run_id"])
+        assert train_run.config["total_steps"] == 25
+        assert train_run.config["lora_key_prefix"] == "diffusion_model."
+        from feature_pipeline.infrastructure import training_runner
+
+        training_runner.stop_process(train_run.pid, grace_period_seconds=1)
+    finally:
+        conn.close()
+

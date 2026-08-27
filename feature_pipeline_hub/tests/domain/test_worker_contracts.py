@@ -7,6 +7,8 @@ from pydantic import ValidationError
 from feature_pipeline.domain.worker_contracts import (
     CaptionEvent,
     FailedEvent,
+    LTX23PrecacheSettings,
+    LTX23TrainSettings,
     PrecacheSettings,
     TrainSettings,
     WorkerLifecycleEvent,
@@ -120,3 +122,40 @@ def test_worker_lifecycle_events_parse():
 def test_worker_lifecycle_event_rejects_an_unknown_kind():
     with pytest.raises(ValidationError):
         worker_lifecycle_event_adapter.validate_python({"event": "worker_paused"})
+
+
+def test_ltx23_precache_settings_validation():
+    valid = {
+        "model_id": "/models/ltx23",
+        "dataset_path": "/data",
+        "cache_dir": "/cache",
+        "multiple": 32,
+        "precache_offload": "sequential",
+    }
+    settings = LTX23PrecacheSettings(**valid)
+    assert settings.multiple == 32
+    assert settings.precache_offload == "sequential"
+
+    with pytest.raises(ValidationError):
+        LTX23PrecacheSettings(**valid | {"extra_field": "invalid"})
+
+
+def test_ltx23_train_settings_validation():
+    valid = {
+        "model_id": "/models/ltx23",
+        "dataset_path": "/data",
+        "cache_dir": "/cache",
+        "output_dir": "/out",
+        "total_steps": 500,
+        "lr": 1e-4,
+        "lora_rank": 32,
+        "lora_alpha": 32,
+    }
+    settings = LTX23TrainSettings(**valid)
+    assert settings.total_steps == 500
+    assert settings.lora_rank == 32
+    assert settings.lora_key_prefix == "diffusion_model."
+
+    with pytest.raises(ValidationError):
+        LTX23TrainSettings(**valid | {"total_steps": 0})
+

@@ -16,17 +16,15 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 # --- worker settings (hub -> worker, written as settings.json) ----------------
 
+ModelArch = Literal["krea2", "ltx23"]
+
 
 class _StrictSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
 class PrecacheSettings(_StrictSettings):
-    """Keys this project sets for workers/precache_worker.py.
-
-    Everything omitted falls through to that worker's own DEFAULTS, which is the
-    intended way to drive the ported LoRAlab scripts.
-    """
+    """Keys this project sets for workers/precache_worker.py (Krea 2)."""
 
     model_id: str
     dataset_path: str
@@ -34,8 +32,25 @@ class PrecacheSettings(_StrictSettings):
     trigger_word: str = ""
 
 
+class LTX23PrecacheSettings(_StrictSettings):
+    """Keys this project sets for workers/precache_ltx23_worker.py."""
+
+    model_id: str
+    dataset_path: str
+    cache_dir: str
+    trigger_word: str = ""
+    target_area: int = 512 * 512
+    multiple: int = 32
+    max_seq_len: int = 1024
+    frame_rate: float = 24.0
+    num_frames: int = 1
+    precache_offload: Literal["none", "model", "sequential", "cpu"] = "sequential"
+    text_encoder_4bit: bool = True
+    preview_custom_prompt: str = ""
+
+
 class TrainSettings(_StrictSettings):
-    """Keys this project sets for workers/train_worker.py."""
+    """Keys this project sets for workers/train_worker.py (Krea 2)."""
 
     model_id: str
     dataset_path: str
@@ -57,6 +72,43 @@ class TrainSettings(_StrictSettings):
     timestep_weighting: Literal["none", "bell", "half_bell"] = "none"
     noise_offset: float = Field(default=0.0, ge=0.0)
     caption_dropout_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+
+
+class LTX23TrainSettings(_StrictSettings):
+    """Keys this project sets for workers/train_ltx23_worker.py."""
+
+    model_id: str
+    dataset_path: str
+    cache_dir: str
+    output_dir: str
+    trigger_word: str = ""
+    project_name: str = ""
+    total_steps: int = Field(gt=0)
+    lr: float = Field(gt=0)
+    lora_rank: int = Field(gt=0)
+    lora_alpha: int = Field(gt=0)
+    batch_size: int = Field(default=1, gt=0)
+    grad_accum_steps: int = Field(default=4, gt=0)
+    save_every: int = Field(default=100, gt=0)
+    seed: int = Field(default=314159, ge=0)
+    warmup_steps: int = Field(default=100, ge=0)
+    min_lr_ratio: float = Field(default=0.1, ge=0.0, le=1.0)
+    weight_decay: float = Field(default=0.0, ge=0.0)
+    max_grad_norm: float = Field(default=1.0, gt=0.0)
+    frame_rate: float = 24.0
+    max_text_tokens: int = 256
+    lora_only_attn: bool = True
+    cast_frozen_bf16: bool = True
+    use_audio_loss: bool = False
+    low_vram_12gb: bool = True
+    activation_offload: bool = True
+    loss_chunk_elements: int = 2000000
+    lora_key_prefix: str = "diffusion_model."
+    preview_every: int = 0
+    preview_steps: int = 30
+    preview_cfg: float = 3.0
+    preview_mode: Literal["gen", "recon", "onestep"] = "gen"
+    preview_vae_fp32: bool = True
 
 
 # --- worker events (worker -> hub, one JSON object per stdout line) -----------
