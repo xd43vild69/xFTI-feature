@@ -89,11 +89,11 @@ class LTX23TrainSettings(_StrictSettings):
     lora_alpha: int = Field(gt=0)
     batch_size: int = Field(default=1, gt=0)
     grad_accum_steps: int = Field(default=4, gt=0)
-    save_every: int = Field(default=100, gt=0)
+    save_every: int = Field(default=200, gt=0)
     seed: int = Field(default=314159, ge=0)
     warmup_steps: int = Field(default=100, ge=0)
     min_lr_ratio: float = Field(default=0.1, ge=0.0, le=1.0)
-    weight_decay: float = Field(default=0.0, ge=0.0)
+    weight_decay: float = Field(default=0.0001, ge=0.0)
     max_grad_norm: float = Field(default=1.0, gt=0.0)
     frame_rate: float = 24.0
     max_text_tokens: int = 256
@@ -110,7 +110,7 @@ class LTX23TrainSettings(_StrictSettings):
     preview_mode: Literal["gen", "recon", "onestep"] = "gen"
     preview_vae_fp32: bool = True
     timestep_sampling: Literal["logit_normal", "uniform"] = "logit_normal"
-    caption_dropout_prob: float = Field(default=0.10, ge=0.0, le=1.0)
+    caption_dropout_prob: float = Field(default=0.15, ge=0.0, le=1.0)
     use_ema: bool = True
     use_dora: bool = False
 

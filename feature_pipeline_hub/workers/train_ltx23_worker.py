@@ -322,4 +322,25 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    _started = time.time()
+    if _telemetry is not None:
+        _telemetry.emit_lifecycle("worker_started", "train_ltx23")
+    try:
+        main()
+        if _telemetry is not None:
+            _telemetry.emit_lifecycle(
+                "worker_finished",
+                "train_ltx23",
+                duration_seconds=round(time.time() - _started, 1),
+                gpu_seconds=round(time.time() - _started, 1),
+            )
+    except Exception as _exc:
+        if _telemetry is not None:
+            _telemetry.emit_lifecycle(
+                "worker_failed",
+                "train_ltx23",
+                duration_seconds=round(time.time() - _started, 1),
+                gpu_seconds=round(time.time() - _started, 1),
+                error=f"{type(_exc).__name__}: {_exc}",
+            )
+        raise

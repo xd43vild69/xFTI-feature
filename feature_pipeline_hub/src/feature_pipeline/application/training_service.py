@@ -104,13 +104,13 @@ class LTX23TrainingConfig(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     checkpoint_name: str = ""
-    total_steps: int = Field(default=800, gt=0)
-    lr: float = Field(default=1.5e-4, gt=0)
+    total_steps: int = Field(default=1600, gt=0)
+    lr: float = Field(default=2.5e-4, gt=0)
     lora_rank: int = Field(default=32, gt=0)
-    lora_alpha: int = Field(default=32, gt=0)
+    lora_alpha: int = Field(default=64, gt=0)
     batch_size: int = Field(default=1, gt=0)
     grad_accum_steps: int = Field(default=4, gt=0)
-    save_every: int = Field(default=100, gt=0)
+    save_every: int = Field(default=200, gt=0)
     seed: int = Field(default=314159, ge=0)
     warmup_steps: int = Field(default=100, ge=0)
     min_lr_ratio: float = Field(default=0.1, ge=0.0, le=1.0)
@@ -129,7 +129,7 @@ class LTX23TrainingConfig(BaseModel):
     preview_steps: int = 30
     preview_cfg: float = 3.0
     timestep_sampling: Literal["logit_normal", "uniform"] = "logit_normal"
-    caption_dropout_prob: float = Field(default=0.10, ge=0.0, le=1.0)
+    caption_dropout_prob: float = Field(default=0.15, ge=0.0, le=1.0)
     use_ema: bool = True
     use_dora: bool = False
     preview_mode: Literal["gen", "recon", "onestep"] = "gen"
