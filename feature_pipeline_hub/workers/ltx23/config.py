@@ -59,11 +59,16 @@ DEFAULTS: dict[str, Any] = {
     "low_vram_12gb": True,
     "activation_offload": True,
     "loss_chunk_elements": 2000000,
+    "timestep_sampling": "logit_normal",
+    "caption_dropout_prob": 0.10,
+    "use_ema": True,
+    "use_dora": False,
 }
 
 CHOICES: dict[str, tuple[tuple[str, ...], str]] = {
     "preview_mode": (("gen", "recon", "onestep"), "gen"),
     "preview_caption_mode": (("first", "random", "custom"), "first"),
+    "timestep_sampling": (("logit_normal", "uniform"), "logit_normal"),
 }
 
 Logger = Callable[[str], None]
@@ -119,6 +124,10 @@ class LTX23TrainConfig:
     low_vram_12gb: bool
     activation_offload: bool
     loss_chunk_elements: int
+    timestep_sampling: str
+    caption_dropout_prob: float
+    use_ema: bool
+    use_dora: bool
     preset_name: str | None = None
 
 
@@ -256,4 +265,8 @@ def load_config(
         low_vram_12gb=_cfg_bool(sources, "low_vram_12gb", DEFAULTS["low_vram_12gb"]),
         activation_offload=_cfg_bool(sources, "activation_offload", DEFAULTS["activation_offload"]),
         loss_chunk_elements=int(_cfg_get(sources, "loss_chunk_elements", DEFAULTS["loss_chunk_elements"])),
+        timestep_sampling=_cfg_choice(sources, "timestep_sampling", log),
+        caption_dropout_prob=float(_cfg_get(sources, "caption_dropout_prob", DEFAULTS["caption_dropout_prob"])),
+        use_ema=_cfg_bool(sources, "use_ema", DEFAULTS["use_ema"]),
+        use_dora=_cfg_bool(sources, "use_dora", DEFAULTS["use_dora"]),
     )

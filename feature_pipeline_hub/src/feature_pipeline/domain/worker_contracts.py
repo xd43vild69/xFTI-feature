@@ -109,6 +109,10 @@ class LTX23TrainSettings(_StrictSettings):
     preview_cfg: float = 3.0
     preview_mode: Literal["gen", "recon", "onestep"] = "gen"
     preview_vae_fp32: bool = True
+    timestep_sampling: Literal["logit_normal", "uniform"] = "logit_normal"
+    caption_dropout_prob: float = Field(default=0.10, ge=0.0, le=1.0)
+    use_ema: bool = True
+    use_dora: bool = False
 
 
 # --- worker events (worker -> hub, one JSON object per stdout line) -----------

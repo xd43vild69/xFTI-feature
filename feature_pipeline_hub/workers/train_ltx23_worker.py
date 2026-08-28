@@ -191,8 +191,13 @@ def main() -> None:
             if audio_clean.ndim == 2:
                 audio_clean = audio_clean.unsqueeze(0)
 
-            video_text = entry["video_text"].to("cuda", dtype=torch.bfloat16, non_blocking=True)
-            audio_text = entry["audio_text"].to("cuda", dtype=torch.bfloat16, non_blocking=True)
+            if cfg.caption_dropout_prob > 0.0 and random.random() < cfg.caption_dropout_prob and dataset.neg_conditioning is not None:
+                video_text, audio_text = dataset.neg_conditioning
+                video_text = video_text.to("cuda", dtype=torch.bfloat16, non_blocking=True)
+                audio_text = audio_text.to("cuda", dtype=torch.bfloat16, non_blocking=True)
+            else:
+                video_text = entry["video_text"].to("cuda", dtype=torch.bfloat16, non_blocking=True)
+                audio_text = entry["audio_text"].to("cuda", dtype=torch.bfloat16, non_blocking=True)
 
             if video_text.ndim == 2:
                 video_text = video_text.unsqueeze(0)
@@ -210,7 +215,7 @@ def main() -> None:
             width = video_clean.shape[4]
             audio_num_frames = audio_clean.shape[-1]
 
-            sigma = sample_continuous_sigma(B, device="cuda")
+            sigma = sample_continuous_sigma(B, device="cuda", mode=cfg.timestep_sampling)
             noise_video = torch.randn_like(video_tokens)
             noise_audio = torch.randn_like(audio_tokens)
 

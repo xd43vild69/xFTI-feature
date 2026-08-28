@@ -640,6 +640,36 @@ def _render_new_run_form(run: IngestionRun, *, busy: bool) -> None:
                     help="Convierte pesos congelados a bfloat16 para optimizar VRAM.",
                 )
 
+            st.markdown("##### Identity & Stability")
+            with st.container(horizontal=True):
+                _ts_options = ["logit_normal", "uniform"]
+                _curr_ts = config.get("timestep_sampling", "logit_normal")
+                _ts_idx = _ts_options.index(_curr_ts) if _curr_ts in _ts_options else 0
+                st.selectbox(
+                    "Timestep Sampling", options=_ts_options,
+                    index=_ts_idx, key=_field_key(run.run_id, "timestep_sampling", target_model),
+                    on_change=_sync_fields_to_json, args=(run.run_id, target_model),
+                    help="Logit-Normal es recomendado para aprender rostros/identidad en niveles de difusión medios.",
+                )
+                st.number_input(
+                    "Caption Dropout", min_value=0.0, max_value=1.0, step=0.05, format="%.2f",
+                    value=config.get("caption_dropout_prob", 0.10), key=_field_key(run.run_id, "caption_dropout_prob", target_model),
+                    on_change=_sync_fields_to_json, args=(run.run_id, target_model),
+                    help="Probabilidad de usar el prompt vacío para forzar la dependencia en el trigger word.",
+                )
+                st.checkbox(
+                    "EMA Smoothing",
+                    value=config.get("use_ema", True), key=_field_key(run.run_id, "use_ema", target_model),
+                    on_change=_sync_fields_to_json, args=(run.run_id, target_model),
+                    help="Mantiene una media móvil exponencial para estabilizar el modelo en video.",
+                )
+                st.checkbox(
+                    "DoRA",
+                    value=config.get("use_dora", False), key=_field_key(run.run_id, "use_dora", target_model),
+                    on_change=_sync_fields_to_json, args=(run.run_id, target_model),
+                    help="Weight-Decomposed LoRA (DoRA).",
+                )
+
     with json_tab:
         st.text_area(
             "Hyperparameter blueprint (JSON)",

@@ -69,17 +69,35 @@ def inject_lora(transformer: torch.nn.Module, cfg: LTX23TrainConfig) -> torch.nn
     """Inject PEFT LoRA adapters into visual Linear4bit layers."""
     targets = discover_lora_targets(transformer, only_attn=cfg.lora_only_attn)
 
-    lora_config = LoraConfig(
-        r=cfg.lora_rank,
-        lora_alpha=cfg.lora_alpha,
-        lora_dropout=0.0,
-        target_modules=targets,
-        bias="none",
-        task_type=None,
-        init_lora_weights=True,
-    )
-
-    model = get_peft_model(transformer, lora_config)
+    dora_val = getattr(cfg, "use_dora", False)
+    try:
+        lora_config = LoraConfig(
+            r=cfg.lora_rank,
+            lora_alpha=cfg.lora_alpha,
+            lora_dropout=0.0,
+            target_modules=targets,
+            bias="none",
+            task_type=None,
+            init_lora_weights=True,
+            use_dora=dora_val,
+        )
+        model = get_peft_model(transformer, lora_config)
+    except Exception as exc:
+        if dora_val:
+            print(f"[!] DoRA error ({exc}); revirtiendo a LoRA estándar.")
+            lora_config = LoraConfig(
+                r=cfg.lora_rank,
+                lora_alpha=cfg.lora_alpha,
+                lora_dropout=0.0,
+                target_modules=targets,
+                bias="none",
+                task_type=None,
+                init_lora_weights=True,
+                use_dora=False,
+            )
+            model = get_peft_model(transformer, lora_config)
+        else:
+            raise exc
 
     for module in model.modules():
         if hasattr(module, "lora_A"):

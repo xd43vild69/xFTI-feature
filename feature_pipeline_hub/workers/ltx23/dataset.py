@@ -104,8 +104,13 @@ def run_text_connectors(prompt_result: Any, connectors: torch.nn.Module, max_tex
 class LTX23Dataset:
     """Manages cached multimodal sample tensors in host memory."""
 
-    def __init__(self, entries: list[dict[str, Any]]) -> None:
+    def __init__(
+        self,
+        entries: list[dict[str, Any]],
+        neg_conditioning: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> None:
         self.entries = entries
+        self.neg_conditioning = neg_conditioning
 
     def __len__(self) -> int:
         return len(self.entries)
@@ -143,6 +148,34 @@ class LTX23Dataset:
                 torch.save(a_text.detach().to("cpu", dtype=torch.bfloat16).contiguous(), entry.audio_text_path)
             connectors.to("cpu")
 
+        # Negative prompt conditioning for caption dropout
+        neg_cond = None
+        neg_v_path = os.path.join(cache_dir, "_neg_video_text.pt")
+        neg_a_path = os.path.join(cache_dir, "_neg_audio_text.pt")
+        if os.path.exists(neg_v_path) and os.path.exists(neg_a_path):
+            try:
+                neg_cond = (
+                    pin_cpu_tensor(torch.load(neg_v_path, map_location="cpu", weights_only=True).to(torch.bfloat16)),
+                    pin_cpu_tensor(torch.load(neg_a_path, map_location="cpu", weights_only=True).to(torch.bfloat16)),
+                )
+            except Exception:
+                pass
+        elif connectors is not None:
+            neg_prompt = load_prompt_structure(cache_dir, "_neg")
+            if neg_prompt is not None:
+                try:
+                    connectors.to("cuda").eval().requires_grad_(False)
+                    v_text, a_text = run_text_connectors(neg_prompt, connectors, max_text_tokens=max_text_tokens)
+                    neg_cond = (
+                        pin_cpu_tensor(v_text.detach().to("cpu", dtype=torch.bfloat16).contiguous()),
+                        pin_cpu_tensor(a_text.detach().to("cpu", dtype=torch.bfloat16).contiguous()),
+                    )
+                    torch.save(neg_cond[0], neg_v_path)
+                    torch.save(neg_cond[1], neg_a_path)
+                    connectors.to("cpu")
+                except Exception:
+                    pass
+
         loaded: list[dict[str, Any]] = []
         for entry in raw_entries:
             if not (os.path.exists(entry.video_text_path) and os.path.exists(entry.audio_text_path)):
@@ -179,4 +212,4 @@ class LTX23Dataset:
         if not loaded:
             raise RuntimeError("No se pudieron cargar tensores de entrenamiento completos.")
 
-        return cls(loaded)
+        return cls(loaded, neg_conditioning=neg_cond)

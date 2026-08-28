@@ -129,6 +129,16 @@ def mse_loss_chunked(
     return loss_sum / float(n)
 
 
-def sample_continuous_sigma(batch_size: int, device: str | torch.device = "cuda") -> torch.Tensor:
-    """Sample uniform continuous sigma clamped away from boundaries [1e-4, 1 - 1e-4]."""
+def sample_continuous_sigma(
+    batch_size: int,
+    device: str | torch.device = "cuda",
+    mode: str = "logit_normal",
+    mean: float = 0.0,
+    std: float = 1.0,
+) -> torch.Tensor:
+    """Sample continuous sigma with logit-normal or uniform distribution."""
+    mode = str(mode or "logit_normal").strip().lower()
+    if mode == "logit_normal":
+        u = torch.randn(batch_size, device=device, dtype=torch.float32) * float(std) + float(mean)
+        return torch.sigmoid(u).clamp(1e-4, 1.0 - 1e-4)
     return torch.rand(batch_size, device=device, dtype=torch.float32).clamp(1e-4, 1.0 - 1e-4)
