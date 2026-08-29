@@ -432,17 +432,34 @@ def _render_new_run_form(run: IngestionRun, *, busy: bool) -> None:
 
     config = _launch_config_state(run.run_id, target_model)
 
-    st.text_input(
-        "Checkpoint name",
-        value=config["checkpoint_name"] or run.concept.concept_name,
-        key=_field_key(run.run_id, "checkpoint_name", target_model),
-        on_change=_sync_fields_to_json, args=(run.run_id, target_model),
-        help=(
-            "Nombre base de los archivos .safetensors generados: "
-            "{nombre}_step_N.safetensors y {nombre}_FINAL.safetensors. "
-            "Obligatorio — se sanea automáticamente a minúsculas y guiones bajos."
-        ),
-    )
+    ckpt_col, trg_col = st.columns([3, 2], vertical_alignment="bottom")
+    with ckpt_col:
+        st.text_input(
+            "Checkpoint name",
+            value=config["checkpoint_name"] or run.concept.concept_name,
+            key=_field_key(run.run_id, "checkpoint_name", target_model),
+            on_change=_sync_fields_to_json, args=(run.run_id, target_model),
+            help=(
+                "Nombre base de los archivos .safetensors generados: "
+                "{nombre}_step_N.safetensors y {nombre}_FINAL.safetensors. "
+                "Obligatorio — se sanea automáticamente a minúsculas y guiones bajos."
+            ),
+        )
+    with trg_col:
+        trigger_text = run.concept.trigger_word or run.concept.concept_name
+        st.markdown(
+            f"""
+            <div style="background: rgba(168, 85, 247, 0.12); border: 1px solid rgba(168, 85, 247, 0.4); border-radius: 8px; padding: 6px 12px; margin-bottom: 2px;">
+                <div style="font-size: 0.70rem; color: #cbd5e1; text-transform: uppercase; font-weight: 600; letter-spacing: 0.5px; display: flex; align-items: center; gap: 4px;">
+                    🏷️ <span>Trigger Word / Palabra Clave</span>
+                </div>
+                <div style="font-size: 1.05rem; font-weight: 700; color: #c084fc; font-family: monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
+                    {trigger_text}
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
     form_tab, json_tab = st.tabs(["Form", "JSON"])
 
@@ -754,14 +771,31 @@ def _render_resume_form(
         )
         return
 
-    point = st.selectbox(
-        "Checkpoint",
-        resume_points,
-        format_func=lambda p: (
-            f"{_fork_lineage_label(p)} · step {p.step} of {p.total_steps} · "
-            f"{p.status} · {p.started_at:%Y-%m-%d %H:%M}"
-        ),
-    )
+    ckpt_col, trg_col = st.columns([3, 2], vertical_alignment="bottom")
+    with ckpt_col:
+        point = st.selectbox(
+            "Checkpoint",
+            resume_points,
+            format_func=lambda p: (
+                f"{_fork_lineage_label(p)} · step {p.step} of {p.total_steps} · "
+                f"{p.status} · {p.started_at:%Y-%m-%d %H:%M}"
+            ),
+        )
+    with trg_col:
+        trigger_text = run.concept.trigger_word or run.concept.concept_name
+        st.markdown(
+            f"""
+            <div style="background: rgba(168, 85, 247, 0.12); border: 1px solid rgba(168, 85, 247, 0.4); border-radius: 8px; padding: 6px 12px; margin-bottom: 2px;">
+                <div style="font-size: 0.70rem; color: #cbd5e1; text-transform: uppercase; font-weight: 600; letter-spacing: 0.5px; display: flex; align-items: center; gap: 4px;">
+                    🏷️ <span>Trigger Word / Palabra Clave</span>
+                </div>
+                <div style="font-size: 1.05rem; font-weight: 700; color: #c084fc; font-family: monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
+                    {trigger_text}
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
     if point is None:
         return
 
@@ -1028,10 +1062,27 @@ def _render_fork_form(
     )
 
     form_state = _fork_form_state(run.run_id)
-    label = st.text_input(
-        "Branch label", value=form_state["label"], key="fork_branch_label",
-        help="Used for the exported dataset folder and the checkpoint filename prefix.",
-    )
+    lbl_col, trg_col = st.columns([3, 2], vertical_alignment="bottom")
+    with lbl_col:
+        label = st.text_input(
+            "Branch label", value=form_state["label"], key="fork_branch_label",
+            help="Used for the exported dataset folder and the checkpoint filename prefix.",
+        )
+    with trg_col:
+        trigger_text = run.concept.trigger_word or run.concept.concept_name
+        st.markdown(
+            f"""
+            <div style="background: rgba(168, 85, 247, 0.12); border: 1px solid rgba(168, 85, 247, 0.4); border-radius: 8px; padding: 6px 12px; margin-bottom: 2px;">
+                <div style="font-size: 0.70rem; color: #cbd5e1; text-transform: uppercase; font-weight: 600; letter-spacing: 0.5px; display: flex; align-items: center; gap: 4px;">
+                    🏷️ <span>Trigger Word / Palabra Clave</span>
+                </div>
+                <div style="font-size: 1.05rem; font-weight: 700; color: #c084fc; font-family: monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
+                    {trigger_text}
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
     form_state["label"] = label
 
     with st.container(horizontal=True):
@@ -1263,6 +1314,125 @@ def _render_live_run(training_run_id: str) -> None:
     _render_run_body(run)
 
 
+def _render_likeness_health_card(run: training_repo.TrainingRun, df: pd.DataFrame) -> None:
+    """Render a dynamic character likeness health & maturity card with traffic light phases."""
+    if df.empty or "step" not in df.columns or "loss" not in df.columns:
+        return
+
+    current_step = int(df["step"].iloc[-1])
+    total_steps = int(run.config.get("total_steps") or 1600)
+    save_every = int(run.config.get("save_every") or 100)
+    progress = min(1.0, max(0.0, current_step / max(1, total_steps)))
+
+    active_dataset = state.require_active_run()
+    num_images = len(active_dataset.concept.samples) if (active_dataset and active_dataset.concept and active_dataset.concept.samples) else 26
+    num_images = max(1, num_images)
+    effective_epochs = current_step / num_images
+
+    loss_col = "loss_avg" if "loss_avg" in df.columns else "loss"
+    recent_loss = float(df[loss_col].iloc[-1])
+    if len(df) >= 15:
+        window_size = min(max(4, len(df) // 4), 30)
+        old_loss = float(df[loss_col].iloc[-window_size * 2:-window_size].mean())
+        new_loss = float(df[loss_col].iloc[-window_size:].mean())
+        delta = new_loss - old_loss
+        if delta < -0.015:
+            trend_text = "Descendiendo (Convergencia rápida)"
+            trend_icon = "📉"
+            trend_color = "#10b981"
+        elif delta < -0.003:
+            trend_text = "Descenso suave y constante"
+            trend_icon = "📉"
+            trend_color = "#38bdf8"
+        elif abs(delta) <= 0.003:
+            trend_text = "Estable / Meseta óptima"
+            trend_icon = "📊"
+            trend_color = "#94a3b8"
+        else:
+            trend_text = "Ligera variación / Estabilización"
+            trend_icon = "📈"
+            trend_color = "#fbbf24"
+    else:
+        trend_text = "Calculando primeros pasos..."
+        trend_icon = "⏳"
+        trend_color = "#94a3b8"
+
+    if progress < 0.25 and effective_epochs < 18:
+        phase_color = "#ef4444"
+        phase_bg = "rgba(239, 68, 68, 0.12)"
+        phase_border = "rgba(239, 68, 68, 0.45)"
+        phase_icon = "🔴"
+        phase_title = "Fase 1: Inicial / Aprendiendo Estructura Base"
+        phase_desc = "El modelo está adaptando las capas a la composición e iluminación general. Los rasgos fisionómicos aún no están consolidados."
+        target_eval = f"Espera al menos hasta el paso {int(total_steps * 0.40):,} para las primeras pruebas."
+    elif progress < 0.60 and effective_epochs < 40:
+        phase_color = "#f97316"
+        phase_bg = "rgba(249, 115, 22, 0.12)"
+        phase_border = "rgba(249, 115, 22, 0.45)"
+        phase_icon = "🟠"
+        phase_title = "Fase 2: En Progreso / Consolidando Rasgos"
+        phase_desc = "La fisionomía, ojos y peinado comienzan a fijarse claramente. Buena respuesta preliminar al trigger word."
+        start_step = max(save_every, int((total_steps * 0.35) // save_every * save_every))
+        end_step = int((total_steps * 0.60) // save_every * save_every)
+        target_eval = f"Primeros checkpoints para evaluar: <b>step {start_step}</b> a <b>step {end_step}</b>."
+    elif progress < 0.85 and effective_epochs <= 65:
+        phase_color = "#10b981"
+        phase_bg = "rgba(16, 185, 129, 0.14)"
+        phase_border = "rgba(16, 185, 129, 0.50)"
+        phase_icon = "🟢"
+        phase_title = "Fase 3: Zona Óptima / Alta Fidelidad (Sweet Spot)"
+        phase_desc = "Punto ideal de transferencia de identidad. Rasgos nítidos, alta similitud con el personaje y máxima flexibilidad para animación en video."
+        start_step = int((total_steps * 0.60) // save_every * save_every)
+        end_step = int((total_steps * 0.85) // save_every * save_every)
+        target_eval = f"⭐ <b>Checkpoints clave recomendados:</b> step {start_step} a step {end_step}."
+    else:
+        phase_color = "#c084fc"
+        phase_bg = "rgba(168, 85, 247, 0.14)"
+        phase_border = "rgba(168, 85, 247, 0.50)"
+        phase_icon = "🟣"
+        phase_title = "Fase 4: Zona Crítica / Riesgo de Sobreajuste (Overfitting)"
+        phase_desc = "Los rasgos están muy fijados, pero existe riesgo de rigidez en expresiones o copia de fondos. Compara siempre con los checkpoints de la zona verde."
+        opt_step = int((total_steps * 0.70) // save_every * save_every)
+        target_eval = f"Si notas rigidez o artefactos, vuelve a los checkpoints de la zona verde (<b>step {opt_step}</b>)."
+
+    card_html = f"""
+    <div style="background: {phase_bg}; border: 1px solid {phase_border}; border-radius: 10px; padding: 12px 16px; margin-bottom: 14px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid rgba(255,255,255,0.08); padding-bottom: 8px; margin-bottom: 10px;">
+            <div style="display: flex; align-items: center; gap: 8px;">
+                <span style="font-size: 1.25rem;">{phase_icon}</span>
+                <span style="font-size: 0.95rem; font-weight: 700; color: {phase_color}; letter-spacing: 0.3px;">
+                    {phase_title}
+                </span>
+            </div>
+            <div style="font-size: 0.80rem; font-weight: 600; color: #cbd5e1; background: rgba(0,0,0,0.3); padding: 3px 10px; border-radius: 6px;">
+                Paso {current_step:,} / {total_steps:,} ({progress * 100:.1f}%)
+            </div>
+        </div>
+        <div style="font-size: 0.83rem; color: #e2e8f0; margin-bottom: 10px; line-height: 1.4;">
+            {phase_desc}
+        </div>
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 8px; margin-bottom: 10px;">
+            <div style="background: rgba(0,0,0,0.25); padding: 6px 10px; border-radius: 6px;">
+                <span style="font-size: 0.70rem; color: #94a3b8; display: block; text-transform: uppercase; font-weight: 600;">🔄 Épocas Efectivas</span>
+                <span style="font-size: 0.90rem; font-weight: 700; color: #f8fafc;">{effective_epochs:.1f} pasadas / img <span style="font-size:0.75rem; color:#94a3b8;">({num_images} imgs)</span></span>
+            </div>
+            <div style="background: rgba(0,0,0,0.25); padding: 6px 10px; border-radius: 6px;">
+                <span style="font-size: 0.70rem; color: #94a3b8; display: block; text-transform: uppercase; font-weight: 600;">📉 Tendencia de Pérdida</span>
+                <span style="font-size: 0.85rem; font-weight: 600; color: {trend_color};">{trend_icon} {trend_text}</span>
+            </div>
+            <div style="background: rgba(0,0,0,0.25); padding: 6px 10px; border-radius: 6px;">
+                <span style="font-size: 0.70rem; color: #94a3b8; display: block; text-transform: uppercase; font-weight: 600;">⚡ Loss Actual</span>
+                <span style="font-size: 0.90rem; font-weight: 700; color: #38bdf8;">{recent_loss:.4f}</span>
+            </div>
+        </div>
+        <div style="font-size: 0.78rem; color: #cbd5e1; background: rgba(0,0,0,0.2); padding: 6px 10px; border-radius: 6px; border-left: 3px solid {phase_color};">
+            💡 <b>Recomendación:</b> {target_eval}
+        </div>
+    </div>
+    """
+    st.markdown(card_html, unsafe_allow_html=True)
+
+
 def _render_run_body(run: training_repo.TrainingRun) -> None:
     status_line = f"Training · {run.status} · started {run.started_at}"
     if run.duration_seconds:
@@ -1277,7 +1447,8 @@ def _render_run_body(run: training_repo.TrainingRun) -> None:
     if csv_path.is_file():
         try:
             df = pd.read_csv(csv_path)
-            if "step" in df.columns and "loss" in df.columns:
+            if "step" in df.columns and "loss" in df.columns and not df.empty:
+                _render_likeness_health_card(run, df)
                 st.line_chart(df.set_index("step")["loss"])
         except pd.errors.EmptyDataError:
             pass

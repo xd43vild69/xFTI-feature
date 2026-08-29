@@ -257,18 +257,46 @@ def render() -> None:
     components.html(
         """
         <script>
-        const doc = window.parent.document;
-        if (!doc._f2ListenerAdded) {
-            doc._f2ListenerAdded = true;
-            doc.addEventListener('keydown', function(e) {
-                if (e.key === 'F2') {
-                    e.preventDefault();
-                    const buttons = Array.from(doc.querySelectorAll('button'));
-                    const btn = buttons.find(b => b.innerText && b.innerText.includes('Captions (F2)'));
-                    if (btn) btn.click();
+        (function() {
+            try {
+                const parentWin = window.parent;
+                const parentDoc = parentWin.document;
+
+                if (parentWin._f2Handler) {
+                    parentDoc.removeEventListener('keydown', parentWin._f2Handler, true);
+                    parentWin.removeEventListener('keydown', parentWin._f2Handler, true);
                 }
-            });
-        }
+
+                parentWin._f2Handler = function(e) {
+                    if (e.key === 'F2' || e.code === 'F2' || e.keyCode === 113) {
+                        // 1. Selector directo por clase Streamlit del botón
+                        let btn = parentDoc.querySelector('[class*="st-key-btn_rename_"] button');
+
+                        // 2. Fallback: Búsqueda exhaustiva en todos los botones
+                        if (!btn) {
+                            const buttons = Array.from(parentDoc.querySelectorAll('button'));
+                            btn = buttons.find(b => {
+                                const txt = (b.innerText || b.textContent || '').toLowerCase();
+                                const aria = (b.getAttribute('aria-label') || '').toLowerCase();
+                                return txt.includes('captions') || txt.includes('f2') || aria.includes('captions') || aria.includes('f2');
+                            });
+                        }
+
+                        if (btn) {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            btn.click();
+                            btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: parentWin }));
+                        }
+                    }
+                };
+
+                parentDoc.addEventListener('keydown', parentWin._f2Handler, true);
+                parentWin.addEventListener('keydown', parentWin._f2Handler, true);
+            } catch (err) {
+                console.error('Error attaching F2 shortcut listener:', err);
+            }
+        })();
         </script>
         """,
         height=0,
