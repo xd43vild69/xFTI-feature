@@ -91,7 +91,7 @@ class LTX23TrainSettings(_StrictSettings):
     grad_accum_steps: int = Field(default=4, gt=0)
     save_every: int = Field(default=200, gt=0)
     seed: int = Field(default=314159, ge=0)
-    warmup_steps: int = Field(default=100, ge=0)
+    warmup_steps: int = Field(default=150, ge=0)
     min_lr_ratio: float = Field(default=0.05, ge=0.0, le=1.0)
     weight_decay: float = Field(default=0.001, ge=0.0)
     max_grad_norm: float = Field(default=1.0, gt=0.0)
@@ -113,7 +113,7 @@ class LTX23TrainSettings(_StrictSettings):
     timestep_shift: float = Field(default=1.0, gt=0.0)
     use_loss_weighting: bool = False
     caption_dropout_prob: float = Field(default=0.05, ge=0.0, le=1.0)
-    conditioning_mode: Literal["t2v", "i2v"] = "t2v"
+    conditioning_mode: Literal["t2v", "i2v"] = "i2v"
     lr_schedule: Literal["constant_with_warmup", "cosine"] = "constant_with_warmup"
     cond_noise_prob: float = Field(default=0.15, ge=0.0, le=1.0)
     cond_noise_scale: float = Field(default=0.03, ge=0.0)

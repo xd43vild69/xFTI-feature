@@ -679,14 +679,14 @@ def _render_new_run_form(run: IngestionRun, *, busy: bool) -> None:
                     help="Logit-Normal es recomendado para aprender rostros/identidad en niveles de difusión medios.",
                 )
                 _cond_options = ["t2v", "i2v"]
-                _curr_cond = config.get("conditioning_mode", "t2v")
-                _cond_idx = _cond_options.index(_curr_cond) if _curr_cond in _cond_options else 0
+                _curr_cond = config.get("conditioning_mode", "i2v")
+                _cond_idx = _cond_options.index(_curr_cond) if _curr_cond in _cond_options else 1
                 st.selectbox(
                     "Conditioning Mode", options=_cond_options,
                     index=_cond_idx, key=_field_key(run.run_id, "conditioning_mode", target_model),
-                    format_func=lambda x: "T2V (Text-to-Video)" if x == "t2v" else "I2V (Image-to-Video First Frame)",
+                    format_func=lambda x: "I2V (Image-to-Video First Frame)" if x == "i2v" else "T2V (Text-to-Video)",
                     on_change=_sync_fields_to_json, args=(run.run_id, target_model),
-                    help="T2V entrena generación desde texto puro; I2V condiciona en el primer fotograma con máscara de pérdida.",
+                    help="I2V condiciona en el primer fotograma con máscara de pérdida; T2V entrena generación desde texto puro.",
                 )
                 st.number_input(
                     "Timestep Shift", min_value=1.0, max_value=10.0, step=0.5, format="%.1f",

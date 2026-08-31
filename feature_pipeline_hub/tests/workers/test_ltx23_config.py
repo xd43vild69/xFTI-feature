@@ -17,10 +17,11 @@ def test_default_config_resolution(tmp_path: Path) -> None:
     assert isinstance(cfg, LTX23TrainConfig)
     assert cfg.lora_rank == DEFAULTS["lora_rank"]
     assert cfg.lr == DEFAULTS["lr"]
-    assert cfg.lora_key_prefix == "diffusion_model."
+    assert cfg.total_steps == 3200
+    assert cfg.save_every == 200
     assert cfg.timestep_shift == 1.0
     assert cfg.use_loss_weighting is False
-    assert cfg.conditioning_mode == "t2v"
+    assert cfg.conditioning_mode == "i2v"
     assert cfg.lr_schedule == "constant_with_warmup"
     assert cfg.cond_noise_prob == 0.15
 

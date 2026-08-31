@@ -157,7 +157,7 @@ def test_ltx23_train_settings_validation():
     assert settings.lora_key_prefix == "diffusion_model."
     assert settings.timestep_shift == 1.0
     assert settings.use_loss_weighting is False
-    assert settings.conditioning_mode == "t2v"
+    assert settings.conditioning_mode == "i2v"
     assert settings.lr_schedule == "constant_with_warmup"
     assert settings.cond_noise_prob == 0.15
 

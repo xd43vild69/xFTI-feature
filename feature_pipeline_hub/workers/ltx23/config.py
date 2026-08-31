@@ -18,17 +18,17 @@ DEFAULTS: dict[str, Any] = {
     "model_id": "./LTX23-NF4",
     "cache_dir": "./cached_data_ltx23",
     "output_dir": "./ltx23_lora_output",
-    "total_steps": 1400,
+    "total_steps": 3200,
     "batch_size": 1,
     "grad_accum_steps": 4,
     "lr": 1.5e-4,
     "min_lr_ratio": 0.05,
-    "warmup_steps": 100,
+    "warmup_steps": 150,
     "lora_rank": 32,
     "lora_alpha": 32,
     "weight_decay": 0.001,
     "max_grad_norm": 1.0,
-    "save_every": 150,
+    "save_every": 200,
     "seed": 314159,
     "frame_rate": 24.0,
     "project_name": "",
@@ -63,7 +63,7 @@ DEFAULTS: dict[str, Any] = {
     "timestep_shift": 1.0,
     "use_loss_weighting": False,
     "caption_dropout_prob": 0.05,
-    "conditioning_mode": "t2v",  # t2v | i2v
+    "conditioning_mode": "i2v",  # t2v | i2v
     "lr_schedule": "constant_with_warmup",  # constant_with_warmup | cosine
     "cond_noise_prob": 0.15,
     "cond_noise_scale": 0.03,
@@ -75,7 +75,7 @@ CHOICES: dict[str, tuple[tuple[str, ...], str]] = {
     "preview_mode": (("gen", "recon", "onestep"), "gen"),
     "preview_caption_mode": (("first", "random", "custom"), "first"),
     "timestep_sampling": (("logit_normal", "uniform"), "logit_normal"),
-    "conditioning_mode": (("t2v", "i2v"), "t2v"),
+    "conditioning_mode": (("t2v", "i2v"), "i2v"),
     "lr_schedule": (("constant_with_warmup", "cosine"), "constant_with_warmup"),
 }
 
