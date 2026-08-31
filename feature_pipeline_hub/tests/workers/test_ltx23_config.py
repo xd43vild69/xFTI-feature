@@ -18,7 +18,11 @@ def test_default_config_resolution(tmp_path: Path) -> None:
     assert cfg.lora_rank == DEFAULTS["lora_rank"]
     assert cfg.lr == DEFAULTS["lr"]
     assert cfg.lora_key_prefix == "diffusion_model."
-    assert cfg.cast_frozen_bf16 is True
+    assert cfg.timestep_shift == 1.0
+    assert cfg.use_loss_weighting is False
+    assert cfg.conditioning_mode == "t2v"
+    assert cfg.lr_schedule == "constant_with_warmup"
+    assert cfg.cond_noise_prob == 0.15
 
 
 def test_config_overrides(tmp_path: Path) -> None:

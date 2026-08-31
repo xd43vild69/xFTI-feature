@@ -102,22 +102,44 @@ def run_text_connectors(prompt_result: Any, connectors: torch.nn.Module, max_tex
 
 
 class LTX23Dataset:
-    """Manages cached multimodal sample tensors in host memory."""
+    """Manages cached multimodal sample tensors in host memory with epoch-based shuffling."""
 
     def __init__(
         self,
         entries: list[dict[str, Any]],
         neg_conditioning: tuple[torch.Tensor, torch.Tensor] | None = None,
+        seed: int = 42,
     ) -> None:
         self.entries = entries
         self.neg_conditioning = neg_conditioning
+        self._rng = random.Random(seed)
+        self._epoch = 0
+        self._queue: list[int] = []
 
     def __len__(self) -> int:
         return len(self.entries)
 
+    @property
+    def current_epoch(self) -> int:
+        return self._epoch
+
+    def set_seed(self, seed: int) -> None:
+        self._rng = random.Random(seed)
+        self._queue.clear()
+        self._epoch = 0
+
     def sample(self) -> dict[str, Any]:
-        """Draw one random sample."""
-        return random.choice(self.entries)
+        """Draw one sample using EpochSampler (true shuffle without replacement per epoch)."""
+        if not self.entries:
+            raise RuntimeError("Dataset vacío.")
+
+        if not self._queue:
+            self._queue = list(range(len(self.entries)))
+            self._rng.shuffle(self._queue)
+            self._epoch += 1
+
+        idx = self._queue.pop()
+        return self.entries[idx]
 
     @classmethod
     def from_cache(
@@ -126,6 +148,7 @@ class LTX23Dataset:
         audio_channels: int = 128,
         max_text_tokens: int = 0,
         connectors: torch.nn.Module | None = None,
+        seed: int = 42,
     ) -> LTX23Dataset:
         raw_entries = scan_cache_directory(cache_dir, max_text_tokens=max_text_tokens)
         if not raw_entries:
@@ -212,4 +235,4 @@ class LTX23Dataset:
         if not loaded:
             raise RuntimeError("No se pudieron cargar tensores de entrenamiento completos.")
 
-        return cls(loaded, neg_conditioning=neg_cond)
+        return cls(loaded, neg_conditioning=neg_cond, seed=seed)

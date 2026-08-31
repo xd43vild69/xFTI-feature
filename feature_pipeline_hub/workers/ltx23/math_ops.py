@@ -94,7 +94,6 @@ def make_video_timestep(
     dtype: torch.dtype = torch.bfloat16,
     multiplier: float = 1000.0,
 ) -> torch.Tensor:
-    """Expand sigma into per-token positional timestep tensor."""
     return (
         sigma.view(-1, 1).expand(-1, seq_len) * float(multiplier)
     ).to(device=device, dtype=dtype)
@@ -103,15 +102,27 @@ def make_video_timestep(
 def mse_loss_chunked(
     pred: torch.Tensor,
     target: torch.Tensor,
+    loss_mask: torch.Tensor | None = None,
     chunk_elements: int = 2000000,
 ) -> torch.Tensor:
-    """Compute MSE loss in fixed-size chunks to avoid CUDA allocation spikes on large tensors."""
+    """Compute MSE loss in fixed-size chunks, with optional element-wise mask."""
     chunk_elements = max(64, int(chunk_elements))
 
     if pred.numel() == 0:
         return pred.new_zeros((), dtype=torch.float32)
 
+    if loss_mask is not None:
+        pred = pred * loss_mask
+        target = target * loss_mask
+        denom = float(loss_mask.float().sum().item())
+        if denom <= 0.0:
+            denom = 1.0
+    else:
+        denom = float(pred.numel())
+
     if pred.numel() <= chunk_elements:
+        if loss_mask is not None:
+            return F.mse_loss(pred.float(), target.float(), reduction="sum") / denom
         return F.mse_loss(pred.float(), target.float())
 
     pred_flat = pred.reshape(-1)
@@ -126,7 +137,25 @@ def mse_loss_chunked(
         loss_sum = loss_sum + F.mse_loss(p, t, reduction="sum")
         del p, t
 
-    return loss_sum / float(n)
+    return loss_sum / denom
+
+
+def flow_matching_loss_chunked(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    sigma: torch.Tensor | None = None,
+    use_weighting: bool = False,
+    loss_mask: torch.Tensor | None = None,
+    chunk_elements: int = 2000000,
+) -> torch.Tensor:
+    """Compute chunked MSE loss with optional mask and adaptive Min-SNR / Flow loss weighting."""
+    raw_loss = mse_loss_chunked(pred, target, loss_mask=loss_mask, chunk_elements=chunk_elements)
+    if use_weighting and sigma is not None:
+        s = sigma.float().mean()
+        weight = 1.0 / (s ** 2 + 0.1)
+        weight = weight.clamp(0.2, 5.0)
+        return raw_loss * weight
+    return raw_loss
 
 
 def sample_continuous_sigma(
@@ -135,10 +164,19 @@ def sample_continuous_sigma(
     mode: str = "logit_normal",
     mean: float = 0.0,
     std: float = 1.0,
+    shift: float = 1.0,
 ) -> torch.Tensor:
-    """Sample continuous sigma with logit-normal or uniform distribution."""
+    """Sample continuous sigma with logit-normal or uniform distribution and optional flow shift."""
     mode = str(mode or "logit_normal").strip().lower()
     if mode == "logit_normal":
         u = torch.randn(batch_size, device=device, dtype=torch.float32) * float(std) + float(mean)
-        return torch.sigmoid(u).clamp(1e-4, 1.0 - 1e-4)
-    return torch.rand(batch_size, device=device, dtype=torch.float32).clamp(1e-4, 1.0 - 1e-4)
+        sigma = torch.sigmoid(u)
+    else:
+        sigma = torch.rand(batch_size, device=device, dtype=torch.float32)
+
+    if shift > 0.0 and shift != 1.0:
+        # Flow Matching Timestep Shifting (Lightricks LTX-Video schedule)
+        sigma = (float(shift) * sigma) / (1.0 + (float(shift) - 1.0) * sigma)
+
+    return sigma.clamp(1e-4, 1.0 - 1e-4)
+

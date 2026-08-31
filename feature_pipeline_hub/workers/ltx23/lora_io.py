@@ -18,7 +18,7 @@ Logger = Callable[[str], None]
 
 
 def discover_lora_targets(transformer: torch.nn.Module, only_attn: bool = True) -> list[str]:
-    """Find Linear4bit target layers in transformer_blocks, excluding audio modules."""
+    """Find Linear4bit target layers in transformer_blocks, excluding audio and normalization modules."""
     targets: list[str] = []
 
     excluded_parts = {
@@ -27,14 +27,18 @@ def discover_lora_targets(transformer: torch.nn.Module, only_attn: bool = True) 
         "audio_ff",
         "audio_to_video_attn",
         "video_to_audio_attn",
+        "scale_shift_table",
+        "norm1",
+        "norm2",
+        "norm_out",
     }
 
+    # Precise Attention target projections (finetrainers & eisneim standard)
     attn_markers = (
-        "attn1",
-        "attn2",
         "to_q",
         "to_k",
         "to_v",
+        "to_out.0",
         "to_out",
         "add_q_proj",
         "add_k_proj",
@@ -53,8 +57,12 @@ def discover_lora_targets(transformer: torch.nn.Module, only_attn: bool = True) 
         if "transformer_blocks" not in parts:
             continue
 
-        if only_attn and not any(marker in name for marker in attn_markers):
-            continue
+        if only_attn:
+            # Must be inside attn1 (self-attention) or attn2 (cross-attention)
+            if not ("attn1" in parts or "attn2" in parts):
+                continue
+            if not any(marker in name for marker in attn_markers):
+                continue
 
         targets.append(name)
 

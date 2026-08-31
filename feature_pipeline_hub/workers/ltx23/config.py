@@ -18,17 +18,17 @@ DEFAULTS: dict[str, Any] = {
     "model_id": "./LTX23-NF4",
     "cache_dir": "./cached_data_ltx23",
     "output_dir": "./ltx23_lora_output",
-    "total_steps": 1600,
+    "total_steps": 1400,
     "batch_size": 1,
     "grad_accum_steps": 4,
-    "lr": 2.5e-4,
-    "min_lr_ratio": 0.1,
+    "lr": 1.5e-4,
+    "min_lr_ratio": 0.05,
     "warmup_steps": 100,
     "lora_rank": 32,
-    "lora_alpha": 64,
-    "weight_decay": 0.0001,
+    "lora_alpha": 32,
+    "weight_decay": 0.001,
     "max_grad_norm": 1.0,
-    "save_every": 200,
+    "save_every": 150,
     "seed": 314159,
     "frame_rate": 24.0,
     "project_name": "",
@@ -60,7 +60,13 @@ DEFAULTS: dict[str, Any] = {
     "activation_offload": True,
     "loss_chunk_elements": 2000000,
     "timestep_sampling": "logit_normal",
-    "caption_dropout_prob": 0.15,
+    "timestep_shift": 1.0,
+    "use_loss_weighting": False,
+    "caption_dropout_prob": 0.05,
+    "conditioning_mode": "t2v",  # t2v | i2v
+    "lr_schedule": "constant_with_warmup",  # constant_with_warmup | cosine
+    "cond_noise_prob": 0.15,
+    "cond_noise_scale": 0.03,
     "use_ema": True,
     "use_dora": False,
 }
@@ -69,6 +75,8 @@ CHOICES: dict[str, tuple[tuple[str, ...], str]] = {
     "preview_mode": (("gen", "recon", "onestep"), "gen"),
     "preview_caption_mode": (("first", "random", "custom"), "first"),
     "timestep_sampling": (("logit_normal", "uniform"), "logit_normal"),
+    "conditioning_mode": (("t2v", "i2v"), "t2v"),
+    "lr_schedule": (("constant_with_warmup", "cosine"), "constant_with_warmup"),
 }
 
 Logger = Callable[[str], None]
@@ -125,7 +133,13 @@ class LTX23TrainConfig:
     activation_offload: bool
     loss_chunk_elements: int
     timestep_sampling: str
+    timestep_shift: float
+    use_loss_weighting: bool
     caption_dropout_prob: float
+    conditioning_mode: str
+    lr_schedule: str
+    cond_noise_prob: float
+    cond_noise_scale: float
     use_ema: bool
     use_dora: bool
     preset_name: str | None = None
@@ -266,7 +280,13 @@ def load_config(
         activation_offload=_cfg_bool(sources, "activation_offload", DEFAULTS["activation_offload"]),
         loss_chunk_elements=int(_cfg_get(sources, "loss_chunk_elements", DEFAULTS["loss_chunk_elements"])),
         timestep_sampling=_cfg_choice(sources, "timestep_sampling", log),
+        timestep_shift=float(_cfg_get(sources, "timestep_shift", DEFAULTS["timestep_shift"])),
+        use_loss_weighting=_cfg_bool(sources, "use_loss_weighting", DEFAULTS["use_loss_weighting"]),
         caption_dropout_prob=float(_cfg_get(sources, "caption_dropout_prob", DEFAULTS["caption_dropout_prob"])),
+        conditioning_mode=_cfg_choice(sources, "conditioning_mode", log),
+        lr_schedule=_cfg_choice(sources, "lr_schedule", log),
+        cond_noise_prob=float(_cfg_get(sources, "cond_noise_prob", DEFAULTS["cond_noise_prob"])),
+        cond_noise_scale=float(_cfg_get(sources, "cond_noise_scale", DEFAULTS["cond_noise_scale"])),
         use_ema=_cfg_bool(sources, "use_ema", DEFAULTS["use_ema"]),
         use_dora=_cfg_bool(sources, "use_dora", DEFAULTS["use_dora"]),
     )

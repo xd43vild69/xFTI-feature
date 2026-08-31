@@ -38,6 +38,7 @@ from ltx23.dataset import LTX23Dataset
 from ltx23.lora_io import inject_lora
 from ltx23.math_ops import (
     align_video_latent_to_patch,
+    flow_matching_loss_chunked,
     make_video_timestep,
     mse_loss_chunked,
     patch_audio_latent,
@@ -105,6 +106,7 @@ def main() -> None:
         audio_channels=audio_channels,
         max_text_tokens=cfg.max_text_tokens,
         connectors=connectors,
+        seed=cfg.seed if cfg.seed > 0 else 42,
     )
     print(f"✓ Dataset cargado: {len(dataset)} muestras.")
 
@@ -150,10 +152,13 @@ def main() -> None:
 
     register_signal_handlers(on_signal)
 
-    # LR schedule function
+    # LR schedule function (constant_with_warmup or cosine)
     def lr_at(step: int) -> float:
         if step < cfg.warmup_steps:
             return cfg.lr * step / max(1, cfg.warmup_steps)
+        schedule = getattr(cfg, "lr_schedule", "constant_with_warmup")
+        if schedule == "constant_with_warmup" or schedule == "constant":
+            return cfg.lr
         progress = (step - cfg.warmup_steps) / max(1, cfg.total_steps - cfg.warmup_steps)
         return cfg.lr * (cfg.min_lr_ratio + (1.0 - cfg.min_lr_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress)))
 
@@ -215,7 +220,12 @@ def main() -> None:
             width = video_clean.shape[4]
             audio_num_frames = audio_clean.shape[-1]
 
-            sigma = sample_continuous_sigma(B, device="cuda", mode=cfg.timestep_sampling)
+            sigma = sample_continuous_sigma(
+                B,
+                device="cuda",
+                mode=cfg.timestep_sampling,
+                shift=getattr(cfg, "timestep_shift", 3.0),
+            )
             noise_video = torch.randn_like(video_tokens)
             noise_audio = torch.randn_like(audio_tokens)
 
@@ -224,6 +234,23 @@ def main() -> None:
 
             noisy_video = (1.0 - t_video) * video_tokens + t_video * noise_video
             noisy_audio = (1.0 - t_audio) * audio_tokens + t_audio * noise_audio
+
+            loss_mask = None
+            if getattr(cfg, "conditioning_mode", "t2v") == "i2v" and num_frames > 1:
+                # I2V First-Frame Conditioning (eisneim & ostris AI-Toolkit standard)
+                Hp = max(1, height // patch_size)
+                Wp = max(1, width // patch_size)
+                s_frame = Hp * Wp
+                if s_frame < video_seq_len:
+                    cond_frame = video_tokens[:, :s_frame, :].clone()
+                    cond_noise_prob = float(getattr(cfg, "cond_noise_prob", 0.15))
+                    cond_noise_scale = float(getattr(cfg, "cond_noise_scale", 0.03))
+                    if cond_noise_prob > 0.0 and random.random() < cond_noise_prob:
+                        noise_jitter = torch.randn_like(cond_frame) * cond_noise_scale
+                        cond_frame = cond_frame + noise_jitter
+                    noisy_video[:, :s_frame, :] = cond_frame
+                    loss_mask = torch.ones_like(video_tokens)
+                    loss_mask[:, :s_frame, :] = 0.0
 
             target_video = noise_video - video_tokens
             target_audio = (noise_audio - audio_tokens) if cfg.use_audio_loss else None
@@ -261,12 +288,33 @@ def main() -> None:
             if pred_video is None:
                 raise RuntimeError("LTX-2.3 forward pass no devolvió predicción de video.")
 
+            use_weighting = getattr(cfg, "use_loss_weighting", False)
             if cfg.use_audio_loss and pred_audio is not None and target_audio is not None:
-                loss_v = mse_loss_chunked(pred_video, target_video, chunk_elements=cfg.loss_chunk_elements)
-                loss_a = mse_loss_chunked(pred_audio, target_audio, chunk_elements=cfg.loss_chunk_elements)
+                loss_v = flow_matching_loss_chunked(
+                    pred_video,
+                    target_video,
+                    sigma=sigma,
+                    use_weighting=use_weighting,
+                    loss_mask=loss_mask,
+                    chunk_elements=cfg.loss_chunk_elements,
+                )
+                loss_a = flow_matching_loss_chunked(
+                    pred_audio,
+                    target_audio,
+                    sigma=sigma,
+                    use_weighting=use_weighting,
+                    chunk_elements=cfg.loss_chunk_elements,
+                )
                 loss = (loss_v + loss_a) * 0.5
             else:
-                loss = mse_loss_chunked(pred_video, target_video, chunk_elements=cfg.loss_chunk_elements)
+                loss = flow_matching_loss_chunked(
+                    pred_video,
+                    target_video,
+                    sigma=sigma,
+                    use_weighting=use_weighting,
+                    loss_mask=loss_mask,
+                    chunk_elements=cfg.loss_chunk_elements,
+                )
 
             scaled_loss = loss / cfg.grad_accum_steps
             scaled_loss.backward()

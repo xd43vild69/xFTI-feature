@@ -612,6 +612,16 @@ def _render_new_run_form(run: IngestionRun, *, busy: bool) -> None:
                     on_change=_sync_fields_to_json, args=(run.run_id, target_model),
                     help="Pasos iniciales de calentamiento del LR.",
                 )
+                _sched_options = ["constant_with_warmup", "cosine"]
+                _curr_sched = config.get("lr_schedule", "constant_with_warmup")
+                _sched_idx = _sched_options.index(_curr_sched) if _curr_sched in _sched_options else 0
+                st.selectbox(
+                    "LR Schedule", options=_sched_options,
+                    index=_sched_idx, key=_field_key(run.run_id, "lr_schedule", target_model),
+                    format_func=lambda x: "Constant with Warmup (Ostris/DiT standard)" if x == "constant_with_warmup" else "Cosine Decay",
+                    on_change=_sync_fields_to_json, args=(run.run_id, target_model),
+                    help="Constant with Warmup mantiene el LR activo para no frenar el aprendizaje de identidad.",
+                )
                 st.number_input(
                     "Min LR ratio", min_value=0.0, max_value=1.0, step=0.05, format="%.2f",
                     value=config["min_lr_ratio"], key=_field_key(run.run_id, "min_lr_ratio", target_model),
@@ -668,11 +678,33 @@ def _render_new_run_form(run: IngestionRun, *, busy: bool) -> None:
                     on_change=_sync_fields_to_json, args=(run.run_id, target_model),
                     help="Logit-Normal es recomendado para aprender rostros/identidad en niveles de difusión medios.",
                 )
+                _cond_options = ["t2v", "i2v"]
+                _curr_cond = config.get("conditioning_mode", "t2v")
+                _cond_idx = _cond_options.index(_curr_cond) if _curr_cond in _cond_options else 0
+                st.selectbox(
+                    "Conditioning Mode", options=_cond_options,
+                    index=_cond_idx, key=_field_key(run.run_id, "conditioning_mode", target_model),
+                    format_func=lambda x: "T2V (Text-to-Video)" if x == "t2v" else "I2V (Image-to-Video First Frame)",
+                    on_change=_sync_fields_to_json, args=(run.run_id, target_model),
+                    help="T2V entrena generación desde texto puro; I2V condiciona en el primer fotograma con máscara de pérdida.",
+                )
+                st.number_input(
+                    "Timestep Shift", min_value=1.0, max_value=10.0, step=0.5, format="%.1f",
+                    value=float(config.get("timestep_shift", 1.0)), key=_field_key(run.run_id, "timestep_shift", target_model),
+                    on_change=_sync_fields_to_json, args=(run.run_id, target_model),
+                    help="Desplaza la distribución de ruido hacia niveles intermedios (1.0 = neutral/estándar).",
+                )
                 st.number_input(
                     "Caption Dropout", min_value=0.0, max_value=1.0, step=0.05, format="%.2f",
-                    value=config.get("caption_dropout_prob", 0.10), key=_field_key(run.run_id, "caption_dropout_prob", target_model),
+                    value=config.get("caption_dropout_prob", 0.05), key=_field_key(run.run_id, "caption_dropout_prob", target_model),
                     on_change=_sync_fields_to_json, args=(run.run_id, target_model),
                     help="Probabilidad de usar el prompt vacío para forzar la dependencia en el trigger word.",
+                )
+                st.checkbox(
+                    "Min-SNR Weighting",
+                    value=config.get("use_loss_weighting", False), key=_field_key(run.run_id, "use_loss_weighting", target_model),
+                    on_change=_sync_fields_to_json, args=(run.run_id, target_model),
+                    help="Ponderación adaptativa de pérdida (desactivada por defecto para preservar campo de velocidad lineal en Flow Matching).",
                 )
                 st.checkbox(
                     "EMA Smoothing",
