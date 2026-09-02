@@ -80,6 +80,30 @@ def save_run(run: IngestionRun) -> None:
         repo.save_ingestion_run(conn, run)
 
 
+def update_concept_trigger_word(run_id: str, trigger_word: str) -> None:
+    with _db() as conn:
+        repo.update_run_trigger_word(conn, run_id, trigger_word)
+
+
+def rename_dataset_base(run_id: str, new_name: str) -> None:
+    new_name = new_name.strip()
+    with _db() as conn:
+        old_name, new_name = repo.rename_concept_and_run(conn, run_id, new_name)
+    if old_name and old_name != new_name:
+        dataset_old = training_service.dataset_dir_for(old_name)
+        dataset_new = training_service.dataset_dir_for(new_name)
+        if dataset_old.is_dir() and not dataset_new.exists():
+            dataset_old.rename(dataset_new)
+        cache_ltx_old = training_service.cache_dir_for(old_name, "ltx23")
+        cache_ltx_new = training_service.cache_dir_for(new_name, "ltx23")
+        if cache_ltx_old.is_dir() and not cache_ltx_new.exists():
+            cache_ltx_old.rename(cache_ltx_new)
+        cache_krea_old = training_service.cache_dir_for(old_name, "krea2")
+        cache_krea_new = training_service.cache_dir_for(new_name, "krea2")
+        if cache_krea_old.is_dir() and not cache_krea_new.exists():
+            cache_krea_old.rename(cache_krea_new)
+
+
 def append_images(run: IngestionRun, uploaded_files: list) -> list[DatasetSample]:
     """Add uploaded images to an existing dataset, keeping its curation intact.
 
@@ -676,6 +700,7 @@ CURATE_STEP = "steps/curate_step.py"
 QUALITY_STEP = "steps/quality_step.py"
 EXPORT_STEP = "steps/export_step.py"
 TRAIN_STEP = "steps/train_step.py"
+SETTINGS_STEP = "steps/settings_step.py"
 
 
 def require_active_run() -> IngestionRun | None:
@@ -704,4 +729,11 @@ _RUN_ICONS = {"upload": "📤", "clone": "📋", "folder": "📁"}
 def format_run_label(summary: IngestionRunSummary) -> str:
     icon = _RUN_ICONS.get(summary.source_kind, "📁")
     when = summary.created_at.astimezone().strftime("%d %b %H:%M")
+    active_trigger = (summary.trigger_word or "").strip()
+    if not active_trigger:
+        dataset_dir = training_service.dataset_dir_for(summary.concept_name)
+        active_trigger = training_service.detect_dominant_trigger_word_in_dataset(dataset_dir) or ""
+
+    if active_trigger and active_trigger != summary.concept_name:
+        return f"{icon} {summary.concept_name} [{active_trigger}] · {summary.sample_count} imgs · {when}"
     return f"{icon} {summary.concept_name} · {summary.sample_count} imgs · {when}"

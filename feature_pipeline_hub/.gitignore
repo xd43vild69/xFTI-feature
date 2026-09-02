@@ -23,3 +23,9 @@ HF_token.json
 .hf_token
 .env
 .env.*
+
+# Local application settings (contain private paths and tokens)
+data/hub_config.json
+hub_config.json
+!data/hub_config.example.json
+!hub_config.example.json

@@ -271,12 +271,11 @@ def training_runtime_dir() -> Path:
     """Root for the self-contained training environment (model, venv, datasets).
 
     Lives inside the project by default, gitignored — overridable via
-    FTI_TRAINING_RUNTIME_DIR for machines that keep it on another disk.
+    app settings or FTI_TRAINING_RUNTIME_DIR for machines that keep it on another disk.
     """
-    override = os.environ.get("FTI_TRAINING_RUNTIME_DIR")
-    base = Path(override) if override else Path(__file__).resolve().parents[3] / "training_runtime"
-    base.mkdir(parents=True, exist_ok=True)
-    return base
+    from feature_pipeline.infrastructure.app_settings import resolve_training_runtime_dir
+
+    return resolve_training_runtime_dir()
 
 
 def training_dataset_dir(name: str) -> Path:

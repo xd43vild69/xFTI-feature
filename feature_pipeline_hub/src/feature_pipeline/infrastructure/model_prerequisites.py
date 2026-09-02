@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
+from feature_pipeline.infrastructure.app_settings import resolve_model_dir
 from feature_pipeline.infrastructure.storage import training_runtime_dir
 
 ModelArch = Literal["krea2", "ltx23"]
@@ -96,13 +97,8 @@ def save_hf_token(token: str, project_root: Path | None = None) -> Path:
 
 
 def default_model_dir(target_model: ModelArch = "krea2") -> Path:
-    """Self-contained local destination for model weights under training_runtime/."""
-    if target_model == "ltx23":
-        env_root = os.environ.get("FTI_LTX23_ROOT")
-        if env_root and Path(env_root).is_dir():
-            return Path(env_root)
-        return training_runtime_dir() / "LTX23-NF4"
-    return training_runtime_dir() / "model"
+    """Self-contained local destination for model weights (consulting settings, env vars, or training_runtime)."""
+    return resolve_model_dir(target_model, fallback_runtime_dir=training_runtime_dir())
 
 
 def _directory_size_bytes(directory: Path) -> int:

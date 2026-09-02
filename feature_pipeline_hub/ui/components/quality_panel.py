@@ -38,8 +38,8 @@ def render() -> None:
     _render_orphans(run)
     _render_statistics(run.concept.samples)
 
-    if st.button("Continue to export", icon=":material/arrow_forward:"):
-        st.switch_page(state.EXPORT_STEP)
+    if st.button("Continue to train", icon=":material/arrow_forward:"):
+        st.switch_page(state.TRAIN_STEP)
 
 
 def _render_duplicates(run: IngestionRun) -> None:

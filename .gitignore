@@ -121,6 +121,10 @@ htmlcov/
 *.pem
 *.key
 secrets.toml
+*hub_config.json
+!*hub_config.example.json
+*token*.json
+!*token*.example.json
 
 # --- Tooling & editors ------------------------------------------------------
 .claude/

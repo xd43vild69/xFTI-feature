@@ -1,0 +1,9 @@
+{
+  "_comment": "Plantilla de configuración para Feature Pipeline Hub. Copia este archivo a data/hub_config.json para personalizar tus rutas.",
+  "krea2_model_dir": "/path/to/models/Krea-2-NF4",
+  "ltx23_model_dir": "/path/to/models/LTX23-NF4",
+  "training_runtime_dir": "/path/to/custom/training_runtime",
+  "training_python_path": "/path/to/custom/venv/bin/python",
+  "hf_token": "hf_your_hugging_face_token_here",
+  "custom_options": {}
+}

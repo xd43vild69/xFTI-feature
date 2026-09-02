@@ -19,6 +19,10 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from feature_pipeline.infrastructure.app_settings import (
+    resolve_model_dir,
+    resolve_training_python_path,
+)
 from feature_pipeline.infrastructure.storage import training_runtime_dir
 
 PYTHON_ENV = "FTI_TRAINING_PYTHON"
@@ -43,25 +47,22 @@ class TrainingUnavailable(RuntimeError):
 def resolve_environment(target_model: str = "krea2") -> TrainingEnvironment:
     """Locate the training runtime's own interpreter and model copy, or explain what's missing."""
     runtime_dir = training_runtime_dir()
+    python = resolve_training_python_path()
 
-    python_value = os.environ.get(PYTHON_ENV, "").strip()
-    python = (
-        Path(python_value).expanduser() if python_value else runtime_dir / "venv" / "bin" / "python"
-    )
     if not python.is_file():
         raise TrainingUnavailable(
             f"No training interpreter at {python}. Run scripts/setup_training_runtime.sh "
-            f"first, or set {PYTHON_ENV} if it lives elsewhere."
+            f"first, configure it in Settings, or set {PYTHON_ENV} if it lives elsewhere."
         )
 
+    model_dir = resolve_model_dir("krea2" if target_model == "krea2" else "ltx23", fallback_runtime_dir=runtime_dir)
     if target_model == "krea2":
-        model_dir = runtime_dir / "model"
         required = ["transformer", "text_encoder", "vae"]
         missing = [name for name in required if not (model_dir / name).is_dir()]
         if missing and not any((model_dir / f).is_file() for f in ["index.json", "model_index.json", "config.json"]):
             raise TrainingUnavailable(
                 f"Incomplete model copy at {model_dir} (missing {', '.join(missing)}). "
-                "Run scripts/setup_training_runtime.sh first."
+                "Run scripts/setup_training_runtime.sh or configure the model path in Settings."
             )
 
     return TrainingEnvironment(runtime_dir=runtime_dir, python=python)

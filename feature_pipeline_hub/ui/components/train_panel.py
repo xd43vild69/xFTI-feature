@@ -295,13 +295,17 @@ def _render_launch_blocker(run: IngestionRun) -> bool:
         st.caption(f":material/info: {exc}")
         return True
 
+    active_count = sum(1 for s in run.concept.samples if not s.is_excluded)
+    if active_count == 0:
+        st.warning(":material/warning: No hay imágenes activas en este dataset. Revisa el paso Curate para incluir al menos una imagen.")
+        return True
+
     dataset_dir = training_service.dataset_dir_for(run.concept.concept_name)
     if not dataset_dir.is_dir() or not any(dataset_dir.iterdir()):
-        st.caption(
-            f":material/info: No exported dataset at training_runtime/datasets/"
-            f"{run.concept.concept_name}/. Export it in Step 4 first."
-        )
-        return True
+        # Auto-materialize active curated dataset on the fly
+        export_service.export_active_samples(run, run.concept.concept_name)
+        if run.concept.trigger_word:
+            training_service.sync_dataset_captions_with_trigger_word(dataset_dir, run.concept.trigger_word)
 
     conflict = training_service.detect_dataset_version_conflict(run.concept.concept_name)
     dismissed_key = f"version_conflict_dismissed_{run.run_id}"
@@ -385,18 +389,19 @@ def _render_new_run_form(run: IngestionRun, *, busy: bool) -> None:
     is_ltx = "LTX 2.3" in model_choice
     target_model: training_service.ModelArch = "ltx23" if is_ltx else "krea2"
 
-    # Status check of local model weights in training_runtime
+    # Status check of local model weights in training_runtime or custom path
     model_status = check_model_status(target_model)
     if model_status.is_ready:
         st.success(
-            f":material/check_circle: Modelo {target_model.upper()} listo en local "
-            f"({model_status.disk_size_gb:.1f} GB) — `{model_status.model_dir.name}`"
+            f":material/check_circle: Modelo **{target_model.upper()}** listo en: `{model_status.model_dir}` "
+            f"({model_status.disk_size_gb:.1f} GB)"
         )
     else:
         st.warning(
-            f":material/warning: El modelo base {target_model.upper()} no está descargado en `training_runtime`. "
+            f":material/warning: El modelo base **{target_model.upper()}** no se encontró en `{model_status.model_dir}`. "
             f"Faltan componentes: {', '.join(model_status.missing_items)}"
         )
+        st.caption("💡 *Si ya tienes el modelo en otra ubicación (como un disco de backup), puedes configurar la ruta en **⚙️ Settings**.*")
         saved_token = get_saved_hf_token() or ""
 
         def _on_token_change() -> None:
@@ -432,34 +437,107 @@ def _render_new_run_form(run: IngestionRun, *, busy: bool) -> None:
 
     config = _launch_config_state(run.run_id, target_model)
 
-    ckpt_col, trg_col = st.columns([3, 2], vertical_alignment="bottom")
-    with ckpt_col:
+    dataset_dir = training_service.dataset_dir_for(run.concept.concept_name)
+    detected_trigger = training_service.detect_dominant_trigger_word_in_dataset(dataset_dir)
+    current_concept_trigger = run.concept.trigger_word or run.concept.concept_name
+    initial_trigger = detected_trigger or current_concept_trigger
+
+    trg_widget_key = _field_key(run.run_id, "trigger_word_input", target_model)
+    ckpt_widget_key = _field_key(run.run_id, "checkpoint_name", target_model)
+
+    if trg_widget_key not in st.session_state:
+        st.session_state[trg_widget_key] = initial_trigger
+
+    # Default checkpoint_name to trigger_word if not set or empty
+    if not config.get("checkpoint_name"):
+        config["checkpoint_name"] = initial_trigger
+    if ckpt_widget_key not in st.session_state:
+        st.session_state[ckpt_widget_key] = config["checkpoint_name"]
+
+    def _on_trigger_change():
+        new_trg = st.session_state.get(trg_widget_key, "").strip()
+        if new_trg:
+            # 1. Update captions on disk
+            training_service.sync_dataset_captions_with_trigger_word(
+                dataset_dir, new_trg, old_trigger_word=current_concept_trigger
+            )
+            # 2. Update SQLite database
+            state.update_concept_trigger_word(run.run_id, new_trg)
+            # 3. Automatically update checkpoint_name to match the new trigger word
+            st.session_state[ckpt_widget_key] = new_trg
+            config["checkpoint_name"] = new_trg
+            _sync_fields_to_json(run.run_id, target_model)
+
+    trg_col, ckpt_col = st.columns([1, 1], vertical_alignment="bottom")
+
+    with trg_col:
         st.text_input(
-            "Checkpoint name",
-            value=config["checkpoint_name"] or run.concept.concept_name,
-            key=_field_key(run.run_id, "checkpoint_name", target_model),
-            on_change=_sync_fields_to_json, args=(run.run_id, target_model),
+            "🏷️ Trigger Word (Palabra Clave)",
+            value=st.session_state.get(trg_widget_key, initial_trigger),
+            key=trg_widget_key,
+            on_change=_on_trigger_change,
             help=(
-                "Nombre base de los archivos .safetensors generados: "
-                "{nombre}_step_N.safetensors y {nombre}_FINAL.safetensors. "
-                "Obligatorio — se sanea automáticamente a minúsculas y guiones bajos."
+                "Palabra clave única que identifica al personaje. Se asigna automáticamente "
+                "como '{trigger_word},' al inicio de cada archivo .txt del dataset."
             ),
         )
-    with trg_col:
-        trigger_text = run.concept.trigger_word or run.concept.concept_name
-        st.markdown(
-            f"""
-            <div style="background: rgba(168, 85, 247, 0.12); border: 1px solid rgba(168, 85, 247, 0.4); border-radius: 8px; padding: 6px 12px; margin-bottom: 2px;">
-                <div style="font-size: 0.70rem; color: #cbd5e1; text-transform: uppercase; font-weight: 600; letter-spacing: 0.5px; display: flex; align-items: center; gap: 4px;">
-                    🏷️ <span>Trigger Word / Palabra Clave</span>
-                </div>
-                <div style="font-size: 1.05rem; font-weight: 700; color: #c084fc; font-family: monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
-                    {trigger_text}
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
+
+    active_trigger = st.session_state.get(trg_widget_key, initial_trigger).strip() or initial_trigger
+
+    with ckpt_col:
+        st.text_input(
+            "💾 Checkpoint name",
+            value=st.session_state.get(ckpt_widget_key, config.get("checkpoint_name") or active_trigger),
+            key=ckpt_widget_key,
+            on_change=_sync_fields_to_json, args=(run.run_id, target_model),
+            help=(
+                "Nombre base para los archivos .safetensors generados (ej: {nombre}_step_N.safetensors). "
+                "Por defecto se iguala al Trigger Word para mantener orden y claridad."
+            ),
         )
+
+    active_count = sum(1 for s in run.concept.samples if not s.is_excluded)
+    excluded_count = len(run.concept.samples) - active_count
+
+    with st.container(horizontal=True):
+        st.caption(
+            f":material/check_circle: **{active_count} imágenes activas de Curate** listas para entrenar con prefijo: **`{active_trigger}, ...`**"
+            + (f" ({excluded_count} excluidas en Curate)" if excluded_count else "")
+            + f" · Checkpoint: **`{st.session_state.get(ckpt_widget_key, active_trigger)}_step_N.safetensors`**"
+        )
+        if st.button("⚡ Reescribir .txt del dataset con este Trigger Word", icon=":material/sync:", key=f"force_sync_txt_{run.run_id}"):
+            updated = training_service.sync_dataset_captions_with_trigger_word(
+                dataset_dir, active_trigger, old_trigger_word=current_concept_trigger
+            )
+            state.update_concept_trigger_word(run.run_id, active_trigger)
+            st.success(f"✓ {updated} archivo(s) .txt actualizados con '{active_trigger}, ' al inicio.")
+            st.rerun()
+
+    with _db() as conn:
+        val_res = training_service.validate_trigger_word_uniqueness(
+            conn, run.run_id, run.concept.concept_name, active_trigger
+        )
+
+    if not val_res.is_valid:
+        col_err, col_fix = st.columns([3, 2], vertical_alignment="center")
+        with col_err:
+            st.error(f":material/block: **Conflicto en Trigger Word:** {val_res.conflict_reason}")
+        with col_fix:
+            if val_res.suggested_unique:
+                if st.button(
+                    f"✨ Cambiar a '{val_res.suggested_unique}' (Único)",
+                    icon=":material/auto_fix_high:",
+                    key=f"use_sugg_trg_{run.run_id}",
+                ):
+                    new_trg = val_res.suggested_unique
+                    training_service.sync_dataset_captions_with_trigger_word(
+                        dataset_dir, new_trg, old_trigger_word=current_concept_trigger
+                    )
+                    state.update_concept_trigger_word(run.run_id, new_trg)
+                    config["checkpoint_name"] = new_trg
+                    _bump(f"train_launch_field_version_{run.run_id}_{target_model}")
+                    _bump(f"train_launch_json_version_{run.run_id}_{target_model}")
+                    st.rerun()
 
     form_tab, json_tab = st.tabs(["Form", "JSON"])
 
@@ -734,10 +812,12 @@ def _render_new_run_form(run: IngestionRun, *, busy: bool) -> None:
             else:
                 st.error(error)
 
-    start_disabled = busy or not model_status.is_ready
+    start_disabled = busy or not model_status.is_ready or not val_res.is_valid
     start_help = (
         _BUSY_HELP if busy else (
-            "Descarga el modelo base antes de iniciar el entrenamiento." if not model_status.is_ready else None
+            "Descarga el modelo base antes de iniciar el entrenamiento." if not model_status.is_ready else (
+                f"No se puede iniciar: {val_res.conflict_reason}" if not val_res.is_valid else None
+            )
         )
     )
 
@@ -769,7 +849,7 @@ def _render_new_run_form(run: IngestionRun, *, busy: bool) -> None:
                         conn,
                         dataset_run_id=run.run_id,
                         dataset_name=run.concept.concept_name,
-                        trigger_word=run.concept.trigger_word,
+                        trigger_word=active_trigger,
                         config=validated_config,
                         target_model=target_model,
                     )
@@ -814,7 +894,13 @@ def _render_resume_form(
             ),
         )
     with trg_col:
-        trigger_text = run.concept.trigger_word or run.concept.concept_name
+        dataset_dir = training_service.dataset_dir_for(run.concept.concept_name)
+        trigger_text = (
+            (point.config.get("trigger_word") if point else None)
+            or training_service.detect_dominant_trigger_word_in_dataset(dataset_dir)
+            or run.concept.trigger_word
+            or run.concept.concept_name
+        )
         st.markdown(
             f"""
             <div style="background: rgba(168, 85, 247, 0.12); border: 1px solid rgba(168, 85, 247, 0.4); border-radius: 8px; padding: 6px 12px; margin-bottom: 2px;">
@@ -1101,7 +1187,12 @@ def _render_fork_form(
             help="Used for the exported dataset folder and the checkpoint filename prefix.",
         )
     with trg_col:
-        trigger_text = run.concept.trigger_word or run.concept.concept_name
+        dataset_dir = training_service.dataset_dir_for(run.concept.concept_name)
+        trigger_text = (
+            training_service.detect_dominant_trigger_word_in_dataset(dataset_dir)
+            or run.concept.trigger_word
+            or run.concept.concept_name
+        )
         st.markdown(
             f"""
             <div style="background: rgba(168, 85, 247, 0.12); border: 1px solid rgba(168, 85, 247, 0.4); border-radius: 8px; padding: 6px 12px; margin-bottom: 2px;">

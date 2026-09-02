@@ -22,6 +22,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from feature_pipeline.application import export_service
 from feature_pipeline.domain import checkpoint_log, cost, train_log
 from feature_pipeline.domain.naming import slugify
 from feature_pipeline.domain.worker_contracts import (
@@ -32,6 +33,7 @@ from feature_pipeline.domain.worker_contracts import (
     TrainSettings,
 )
 from feature_pipeline.infrastructure import checkpoint_files
+from feature_pipeline.infrastructure import ingestion_repository as ingestion_repo
 from feature_pipeline.infrastructure import training_repository as repo
 from feature_pipeline.infrastructure import training_runner
 from feature_pipeline.infrastructure.model_prerequisites import (
@@ -233,6 +235,117 @@ def _caption_files_containing_word(dataset_dir: Path, word: str) -> list[Path]:
     ]
 
 
+def detect_dominant_trigger_word_in_dataset(dataset_dir: Path) -> str | None:
+    """Read the leading token/word of .txt caption files in dataset_dir to detect the dominant trigger word."""
+    if not dataset_dir.is_dir():
+        return None
+    counts: dict[str, int] = {}
+    for txt_file in dataset_dir.glob("*.txt"):
+        try:
+            content = txt_file.read_text(encoding="utf-8").strip()
+            if not content:
+                continue
+            first_part = content.split(",")[0].strip()
+            if first_part and len(first_part.split()) <= 2:
+                counts[first_part] = counts.get(first_part, 0) + 1
+        except Exception:
+            continue
+    if not counts:
+        return None
+    return max(counts, key=counts.get)
+
+
+@dataclass(frozen=True)
+class TriggerWordValidationResult:
+    """Outcome of validating a trigger word before launching or saving."""
+
+    is_valid: bool
+    conflict_reason: str | None = None
+    suggested_unique: str | None = None
+    collision_with: str | None = None
+
+
+def suggest_next_unique_trigger_word(
+    conn: sqlite3.Connection, trigger_word: str, current_run_id: str = ""
+) -> str:
+    """Find the next available versioned trigger word that does not collide in SQLite or on disk."""
+    base = trigger_word.strip()
+    match = re.match(r"^(.+)_v(\d+)$", base)
+    if match:
+        prefix, ver_str = match.groups()
+        ver = int(ver_str)
+    else:
+        prefix = base
+        ver = 1
+
+    candidate_ver = ver + 1
+    datasets_root = training_runtime_dir() / "datasets"
+    while candidate_ver < 1000:
+        candidate = f"{prefix}_v{candidate_ver}"
+        collision = ingestion_repo.find_trigger_word_collision(conn, current_run_id, candidate)
+        folder = datasets_root / candidate if datasets_root.is_dir() else None
+        if not collision and (folder is None or not folder.is_dir()):
+            return candidate
+        candidate_ver += 1
+    return f"{prefix}_v{ver + 1}"
+
+
+def validate_trigger_word_uniqueness(
+    conn: sqlite3.Connection,
+    current_run_id: str,
+    current_concept_name: str,
+    trigger_word: str,
+) -> TriggerWordValidationResult:
+    """Verify that `trigger_word` is non-empty, contains valid characters,
+    and is not already claimed by another concept in SQLite or dataset folder on disk.
+    """
+    cleaned = trigger_word.strip()
+    if not cleaned:
+        suggested = f"{slugify(current_concept_name)}_v1" if current_concept_name else "concept_v1"
+        return TriggerWordValidationResult(
+            is_valid=False,
+            conflict_reason="El trigger word no puede estar vacío.",
+            suggested_unique=suggested,
+        )
+
+    # Must be valid identifier characters (letters, numbers, underscore, hyphen)
+    if not re.match(r"^[A-Za-z0-9_-]+$", cleaned):
+        sanitized = slugify(cleaned) or f"{slugify(current_concept_name)}_v1"
+        return TriggerWordValidationResult(
+            is_valid=False,
+            conflict_reason="El trigger word contiene caracteres inválidos. Solo se permiten letras, números y guiones bajos (sin espacios ni comas).",
+            suggested_unique=sanitized,
+        )
+
+    # Check collision in SQLite database across all other runs/concepts
+    colliding_name = ingestion_repo.find_trigger_word_collision(conn, current_run_id, cleaned)
+    if colliding_name:
+        suggested = suggest_next_unique_trigger_word(conn, cleaned, current_run_id)
+        return TriggerWordValidationResult(
+            is_valid=False,
+            conflict_reason=f"El trigger word '{cleaned}' ya está en uso por el dataset/concepto '{colliding_name}'. Cada concepto debe tener un trigger word único.",
+            suggested_unique=suggested,
+            collision_with=colliding_name,
+        )
+
+    # Check collision against existing dataset folders on disk (other than current concept)
+    datasets_root = training_runtime_dir() / "datasets"
+    if datasets_root.is_dir():
+        for folder in datasets_root.iterdir():
+            if folder.is_dir() and folder.name != current_concept_name:
+                dominant = detect_dominant_trigger_word_in_dataset(folder)
+                if dominant and dominant.lower() == cleaned.lower():
+                    suggested = suggest_next_unique_trigger_word(conn, cleaned, current_run_id)
+                    return TriggerWordValidationResult(
+                        is_valid=False,
+                        conflict_reason=f"El trigger word '{cleaned}' ya es utilizado por los captions del dataset en disco '{folder.name}'.",
+                        suggested_unique=suggested,
+                        collision_with=folder.name,
+                    )
+
+    return TriggerWordValidationResult(is_valid=True)
+
+
 def _next_available_version(taken_versions: set[int], start_from: int) -> int:
     """First version number >= start_from not already claimed by a sibling dataset.
 
@@ -318,6 +431,52 @@ def update_captions_in_dataset_dir(dataset_dir: Path, old_word: str, new_word: s
     return updated
 
 
+def sync_dataset_captions_with_trigger_word(
+    dataset_dir: Path, trigger_word: str, old_trigger_word: str | None = None
+) -> int:
+    """Ensure every .txt file in dataset_dir starts with `{trigger_word}, `.
+    If old_trigger_word is present or if there's a leading trigger tag, replaces it;
+    otherwise prepends `{trigger_word}, `. Returns how many files actually changed.
+    """
+    trigger_word = trigger_word.strip()
+    if not trigger_word or not dataset_dir.is_dir():
+        return 0
+
+    updated = 0
+    for txt_path in sorted(dataset_dir.glob("*.txt")):
+        try:
+            text = txt_path.read_text(encoding="utf-8").strip()
+            if not text:
+                new_text = f"{trigger_word},"
+            else:
+                parts = [p.strip() for p in text.split(",") if p.strip()]
+                if not parts:
+                    new_text = f"{trigger_word},"
+                else:
+                    first_token = parts[0]
+                    if first_token == trigger_word:
+                        new_text = text
+                    elif old_trigger_word and (first_token == old_trigger_word or old_trigger_word in first_token):
+                        parts[0] = trigger_word
+                        new_text = ", ".join(parts)
+                    elif len(first_token.split()) <= 2 and ("_" in first_token or first_token.isalnum()):
+                        parts[0] = trigger_word
+                        new_text = ", ".join(parts)
+                    else:
+                        new_text = f"{trigger_word}, {text}"
+
+                if old_trigger_word and old_trigger_word != trigger_word:
+                    pattern = re.compile(r"\b" + re.escape(old_trigger_word) + r"\b")
+                    new_text = pattern.sub(trigger_word, new_text)
+
+            if new_text != text:
+                write_caption_sidecar(str(txt_path), new_text)
+                updated += 1
+        except Exception:
+            continue
+    return updated
+
+
 def start_training(
     conn: sqlite3.Connection,
     *,
@@ -331,6 +490,25 @@ def start_training(
     dataset_path = dataset_dir_for(dataset_name)
     cache_dir = cache_dir_for(dataset_name, target_model=target_model)
     model_dir = model_dir_for(target_model=target_model)
+
+    # 0. Validate trigger word uniqueness
+    val_res = validate_trigger_word_uniqueness(conn, dataset_run_id, dataset_name, trigger_word)
+    if not val_res.is_valid:
+        raise ValueError(f"Trigger word inválido o duplicado: {val_res.conflict_reason}")
+
+    # 1. Auto-export curated active (non-excluded) samples to dataset directory on disk
+    ingestion_run = ingestion_repo.load_ingestion_run(conn, dataset_run_id)
+    if ingestion_run is not None:
+        export_service.export_active_samples(ingestion_run, dataset_name)
+
+    # 2. Guarantee all dataset captions on disk start with the active trigger_word
+    sync_dataset_captions_with_trigger_word(dataset_path, trigger_word)
+
+    # 3. Synchronize SQLite database metadata
+    try:
+        ingestion_repo.update_run_trigger_word(conn, dataset_run_id, trigger_word)
+    except Exception:
+        pass
 
     status = check_model_status(target_model=target_model, custom_dir=model_dir)
     if not status.is_ready:

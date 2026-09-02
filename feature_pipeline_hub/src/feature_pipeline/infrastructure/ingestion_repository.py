@@ -354,3 +354,81 @@ def update_run_cost_estimate(conn: sqlite3.Connection, run_id: str, cost: float 
     """Update the aggregated cost estimate for a run (training cost summed with import/etc)."""
     with conn:
         conn.execute("UPDATE ingestion_runs SET cost_estimate = ? WHERE run_id = ?", (cost, run_id))
+
+
+def update_run_trigger_word(conn: sqlite3.Connection, run_id: str, trigger_word: str) -> None:
+    """Update trigger_word across ingestion_runs and concepts for the given run."""
+    trigger_word = trigger_word.strip()
+    with conn:
+        conn.execute("UPDATE ingestion_runs SET trigger_word = ? WHERE run_id = ?", (trigger_word, run_id))
+        conn.execute(
+            """
+            UPDATE concepts SET trigger_word = ?
+            WHERE concept_id = (SELECT concept_id FROM ingestion_runs WHERE run_id = ?)
+            """,
+            (trigger_word, run_id),
+        )
+
+
+def find_trigger_word_collision(
+    conn: sqlite3.Connection, current_run_id: str, trigger_word: str
+) -> str | None:
+    """Check if trigger_word is already used by another run or concept in SQLite.
+    Returns the colliding concept_name if found, else None.
+    """
+    trigger_word = trigger_word.strip().lower()
+    if not trigger_word:
+        return None
+
+    row = conn.execute(
+        """
+        SELECT concept_name FROM ingestion_runs
+        WHERE LOWER(trigger_word) = ? AND run_id != ?
+        LIMIT 1
+        """,
+        (trigger_word, current_run_id),
+    ).fetchone()
+    if row:
+        return str(row["concept_name"])
+
+    row = conn.execute(
+        """
+        SELECT c.concept_name FROM concepts c
+        WHERE LOWER(c.trigger_word) = ?
+          AND c.concept_id != (
+              SELECT COALESCE(concept_id, '') FROM ingestion_runs WHERE run_id = ?
+          )
+        LIMIT 1
+        """,
+        (trigger_word, current_run_id),
+    ).fetchone()
+    if row:
+        return str(row["concept_name"])
+
+    return None
+
+
+def rename_concept_and_run(
+    conn: sqlite3.Connection, run_id: str, new_concept_name: str
+) -> tuple[str, str]:
+    """Update concept_name across ingestion_runs and concepts for the given run.
+    Returns (old_concept_name, new_concept_name).
+    """
+    new_concept_name = new_concept_name.strip()
+    with conn:
+        row = conn.execute(
+            "SELECT concept_name FROM ingestion_runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        old_name = str(row["concept_name"]) if row else ""
+        conn.execute(
+            "UPDATE ingestion_runs SET concept_name = ? WHERE run_id = ?",
+            (new_concept_name, run_id),
+        )
+        conn.execute(
+            """
+            UPDATE concepts SET concept_name = ?
+            WHERE concept_id = (SELECT concept_id FROM ingestion_runs WHERE run_id = ?)
+            """,
+            (new_concept_name, run_id),
+        )
+    return old_name, new_concept_name

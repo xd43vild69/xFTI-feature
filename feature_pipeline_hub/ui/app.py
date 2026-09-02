@@ -35,8 +35,8 @@ st.navigation(
         st.Page(state.IMPORT_STEP, title="1 · Import", default=True),
         st.Page(state.CURATE_STEP, title="2 · Curate"),
         st.Page(state.QUALITY_STEP, title="3 · Quality"),
-        st.Page(state.EXPORT_STEP, title="4 · Export"),
-        st.Page(state.TRAIN_STEP, title="5 · Train"),
+        st.Page(state.TRAIN_STEP, title="4 · Train"),
+        st.Page(state.SETTINGS_STEP, title="⚙️ Settings"),
     ],
     position="top",
 ).run()

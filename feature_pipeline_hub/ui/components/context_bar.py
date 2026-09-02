@@ -10,6 +10,7 @@ import streamlit as st
 
 import state
 from feature_pipeline.application import quality_service as quality
+from feature_pipeline.domain import naming
 from feature_pipeline.domain.models import IngestionRun
 
 
@@ -36,7 +37,7 @@ def render() -> None:
             index=run_ids.index(active_id),
             format_func=lambda run_id: labels[run_id],
             label_visibility="collapsed",
-            width=320,
+            width=450,
         )
         if selected != active_id:
             state.set_active_run(selected)
@@ -44,6 +45,14 @@ def render() -> None:
 
         run = state.active_run()
         if run is not None:
+            if st.button(
+                "Rename",
+                icon=":material/edit:",
+                type="tertiary",
+                help="Renombrar el nombre base de este dataset",
+            ):
+                _rename_dataset_dialog(run)
+
             _render_counters(run)
             _render_details(run)
 
@@ -100,6 +109,38 @@ def _render_details(run: IngestionRun) -> None:
         st.code(run.source_path, language=None)
         st.caption("Run id")
         st.code(run.run_id, language=None)
+
+
+@st.dialog("Renombrar dataset base")
+def _rename_dataset_dialog(run: IngestionRun) -> None:
+    st.write(f"🏷️ Renombrar dataset base: **{run.concept.concept_name}**")
+    st.caption(
+        "Esto actualizará el identificador base del dataset en la base de datos y renombrará "
+        "las carpetas asociadas en disco manteniendo intactas todas las imágenes, captions y versiones."
+    )
+    new_name = st.text_input(
+        "Nuevo nombre base",
+        value=run.concept.concept_name,
+        help="Solo letras, números y guiones bajos (ej: ds_vu_bd).",
+    )
+    sanitized = naming.slugify(new_name or "")
+
+    with st.container(horizontal=True):
+        if st.button("Guardar y Renombrar", icon=":material/save:", type="primary"):
+            if not sanitized:
+                st.error("El nombre no puede estar vacío.")
+                return
+            if sanitized != run.concept.concept_name:
+                try:
+                    state.rename_dataset_base(run.run_id, sanitized)
+                    st.toast(f"Dataset renombrado a '{sanitized}'.", icon=":material/check:")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Error al renombrar: {exc}")
+            else:
+                st.rerun()
+        if st.button("Cancelar"):
+            st.rerun()
 
 
 @st.dialog("Delete dataset")
