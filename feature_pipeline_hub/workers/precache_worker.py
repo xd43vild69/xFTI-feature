@@ -61,7 +61,7 @@ DEFAULTS = {
 
     # ── D1: manifiesto e invalidación de caché ───────────────────────────────
     "cache_key": "mtime",        # "mtime" | "sha1"
-    "prune_orphans": "warn",     # "warn" | "delete" | "off"
+    "prune_orphans": "delete",   # "warn" | "delete" | "off"
     "force_recache": False,
     # ── D2: aumento por espejado ─────────────────────────────────────────────
     "flip_x": False,

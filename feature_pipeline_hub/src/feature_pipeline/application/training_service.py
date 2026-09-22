@@ -84,20 +84,31 @@ class TrainingConfig(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     checkpoint_name: str = ""
-    total_steps: int = Field(default=3000, gt=0)
+    total_steps: int = Field(default=1500, gt=0)
     lr: float = Field(default=1.5e-4, gt=0)
     lora_rank: int = Field(default=32, gt=0)
     lora_alpha: int = Field(default=16, gt=0)
     batch_size: int = Field(default=1, gt=0)
     grad_accum_steps: int = Field(default=4, gt=0)
-    save_every: int = Field(default=300, gt=0)
+    save_every: int = Field(default=250, gt=0)
     seed: int = Field(default=42, ge=0)
     warmup_steps: int = Field(default=100, ge=0)
+    warmup_units: Literal["updates", "micro_steps", "ratio"] = "updates"
     lr_scheduler: Literal["cosine", "constant", "linear", "cosine_with_restarts", "step"] = "cosine"
     lr_num_cycles: int = Field(default=3, gt=0)
+    min_lr_ratio: float = Field(default=0.1, ge=0.0, le=1.0)
+    sampler: Literal["epoch", "legacy"] = "epoch"
+    lora_dtype: Literal["bf16", "fp32"] = "bf16"
+    high_precision_targets: bool = False
+    lora_target: Literal["all", "attn", "attn+ff"] = "all"
+    optimizer_betas: list[float] = Field(default_factory=lambda: [0.9, 0.999])
+    optimizer_eps: float = Field(default=1e-8, gt=0.0)
     timestep_weighting: Literal["none", "bell", "half_bell"] = "none"
+    content_or_style: Literal["balanced", "content", "style"] = "balanced"
     noise_offset: float = Field(default=0.0, ge=0.0)
     caption_dropout_rate: float = Field(default=0.05, ge=0.0, le=1.0)
+    use_ema: bool = False
+    ema_decay: float = Field(default=0.99, gt=0.0, lt=1.0)
 
 
 class LTX23TrainingConfig(BaseModel):
@@ -252,7 +263,7 @@ def detect_dominant_trigger_word_in_dataset(dataset_dir: Path) -> str | None:
             continue
     if not counts:
         return None
-    return max(counts, key=counts.get)
+    return max(counts, key=lambda k: counts[k])
 
 
 @dataclass(frozen=True)
@@ -937,9 +948,12 @@ class ForkUnavailable(RuntimeError):
 # samples. Only total_steps (unavoidable — it's what "further training" means) and
 # save_every (only changes save cadence, not learning) are accepted overrides.
 _FORK_PINNED_KEYS = (
-    "model_id", "lr", "lr_scheduler", "lr_num_cycles", "warmup_steps",
-    "lora_rank", "lora_alpha", "seed", "batch_size", "grad_accum_steps",
-    "timestep_weighting", "noise_offset", "caption_dropout_rate",
+    "model_id", "lr", "lr_scheduler", "lr_num_cycles", "min_lr_ratio",
+    "warmup_steps", "warmup_units", "lora_rank", "lora_alpha", "lora_target",
+    "lora_dtype", "high_precision_targets", "sampler", "seed",
+    "batch_size", "grad_accum_steps", "optimizer_betas", "optimizer_eps",
+    "timestep_weighting", "content_or_style", "noise_offset", "caption_dropout_rate",
+    "use_ema", "ema_decay",
 )
 
 

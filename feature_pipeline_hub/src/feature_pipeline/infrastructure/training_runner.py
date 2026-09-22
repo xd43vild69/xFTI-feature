@@ -34,9 +34,12 @@ class TrainingEnvironment:
 
     runtime_dir: Path
     python: Path
+    _model_dir: Path | None = None
 
     @property
     def model_dir(self) -> Path:
+        if self._model_dir is not None:
+            return self._model_dir
         return self.runtime_dir / "model"
 
 
@@ -65,7 +68,7 @@ def resolve_environment(target_model: str = "krea2") -> TrainingEnvironment:
                 "Run scripts/setup_training_runtime.sh or configure the model path in Settings."
             )
 
-    return TrainingEnvironment(runtime_dir=runtime_dir, python=python)
+    return TrainingEnvironment(runtime_dir=runtime_dir, python=python, _model_dir=model_dir)
 
 
 def is_available() -> bool:

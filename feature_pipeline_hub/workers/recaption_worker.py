@@ -57,6 +57,23 @@ def main() -> int:
 
     started = time.time()
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    # Free VRAM if ComfyUI or similar service is holding memory on the same GPU
+    try:
+        import urllib.request
+        _req = urllib.request.Request(
+            "http://127.0.0.1:8188/free",
+            data=b'{"unload_models": true, "free_memory": true}',
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(_req, timeout=0.5):
+            pass
+    except Exception:
+        pass
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     try:
         model, processor = load_captioner(text_encoder_dir, device=device, dtype=torch.bfloat16)
     except torch.OutOfMemoryError:
@@ -75,14 +92,18 @@ def main() -> int:
     # bytes on disk are usually fine (checksum them before believing otherwise); a
     # bad read is what puts NaN in RAM. Cheap enough to check on every load, and it
     # turns a baffling symptom into a stated cause.
-    corrupt = [name for name, p in model.named_parameters() if not torch.isfinite(p).all()]
-    if corrupt:
-        raise RuntimeError(
-            f"Model weights loaded with non-finite values in {len(corrupt)} tensor(s), "
-            f"first: {corrupt[0]}. Generation would return garbage. Retry — this is "
-            "usually a bad read rather than a bad file. If it keeps happening, verify "
-            "the checkpoint against its source and test system RAM (memtest86+)."
-        )
+    try:
+        with torch.no_grad():
+            corrupt = [name for name, p in model.named_parameters() if not torch.isfinite(p).all().item()]
+            if corrupt:
+                raise RuntimeError(
+                    f"Model weights loaded with non-finite values in {len(corrupt)} tensor(s), "
+                    f"first: {corrupt[0]}. Generation would return garbage. Retry — this is "
+                    "usually a bad read rather than a bad file. If it keeps happening, verify "
+                    "the checkpoint against its source and test system RAM (memtest86+)."
+                )
+    except torch.OutOfMemoryError:
+        torch.cuda.empty_cache()
 
     _emit(event="loaded", device=device, seconds=round(time.time() - started, 1))
 

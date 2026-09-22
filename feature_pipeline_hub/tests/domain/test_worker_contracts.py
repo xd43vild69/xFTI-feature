@@ -32,11 +32,22 @@ VALID_TRAIN = {
     "save_every": 25,
     "seed": 42,
     "warmup_steps": 100,
+    "warmup_units": "updates",
     "lr_scheduler": "cosine",
     "lr_num_cycles": 3,
+    "min_lr_ratio": 0.1,
+    "sampler": "epoch",
+    "lora_dtype": "bf16",
+    "high_precision_targets": False,
+    "lora_target": "all",
+    "optimizer_betas": [0.9, 0.999],
+    "optimizer_eps": 1e-8,
     "timestep_weighting": "none",
+    "content_or_style": "balanced",
     "noise_offset": 0.0,
-    "caption_dropout_rate": 0.0,
+    "caption_dropout_rate": 0.05,
+    "use_ema": False,
+    "ema_decay": 0.99,
 }
 
 

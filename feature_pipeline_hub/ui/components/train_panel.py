@@ -634,9 +634,18 @@ def _render_new_run_form(run: IngestionRun, *, busy: bool) -> None:
                     value=config["warmup_steps"], key=_field_key(run.run_id, "warmup_steps", target_model),
                     on_change=_sync_fields_to_json, args=(run.run_id, target_model),
                     help=(
-                        "Actualizaciones iniciales donde la tasa de aprendizaje sube "
+                        "Pasos iniciales donde la tasa de aprendizaje sube "
                         "gradualmente desde 0 hasta lr."
                     ),
+                )
+                _wu_opts = ["micro_steps", "updates", "ratio"]
+                _wu_val = config.get("warmup_units", "micro_steps")
+                st.selectbox(
+                    "Warmup units", _wu_opts,
+                    index=_wu_opts.index(_wu_val) if _wu_val in _wu_opts else 0,
+                    key=_field_key(run.run_id, "warmup_units", target_model),
+                    on_change=_sync_fields_to_json, args=(run.run_id, target_model),
+                    help="Unidades de warmup_steps ('micro_steps' evita que el warmup consuma 4x pasos con grad_accum=4).",
                 )
                 st.selectbox(
                     "LR scheduler", ["cosine", "constant", "linear", "cosine_with_restarts", "step"],
@@ -659,7 +668,45 @@ def _render_new_run_form(run: IngestionRun, *, busy: bool) -> None:
                     index=["none", "bell", "half_bell"].index(config["timestep_weighting"]),
                     key=_field_key(run.run_id, "timestep_weighting", target_model),
                     on_change=_sync_fields_to_json, args=(run.run_id, target_model),
-                    help="Ponderación de la pérdida según el nivel de ruido.",
+                    help="Ponderación de la pérdida según el nivel de ruido ('bell' evita artefactos en sigma extremos).",
+                )
+
+            with st.container(horizontal=True):
+                _smp_opts = ["epoch", "legacy"]
+                _smp_val = config.get("sampler", "epoch")
+                st.selectbox(
+                    "Dataset sampler", _smp_opts,
+                    index=_smp_opts.index(_smp_val) if _smp_val in _smp_opts else 0,
+                    key=_field_key(run.run_id, "sampler", target_model),
+                    on_change=_sync_fields_to_json, args=(run.run_id, target_model),
+                    help="'epoch' garantiza que cada imagen se entrene 1 vez por época sin sesgo por tamaño de bucket.",
+                )
+                _dt_opts = ["fp32", "bf16"]
+                _dt_val = config.get("lora_dtype", "fp32")
+                st.selectbox(
+                    "LoRA master dtype", _dt_opts,
+                    index=_dt_opts.index(_dt_val) if _dt_val in _dt_opts else 0,
+                    key=_field_key(run.run_id, "lora_dtype", target_model),
+                    on_change=_sync_fields_to_json, args=(run.run_id, target_model),
+                    help="'fp32' evita que las actualizaciones finas del final del entrenamiento se pierdan por redondeo en bf16.",
+                )
+                _tgt_opts = ["all", "attn+ff", "attn"]
+                _tgt_val = config.get("lora_target", "all")
+                st.selectbox(
+                    "LoRA target layers", _tgt_opts,
+                    index=_tgt_opts.index(_tgt_val) if _tgt_val in _tgt_opts else 0,
+                    key=_field_key(run.run_id, "lora_target", target_model),
+                    on_change=_sync_fields_to_json, args=(run.run_id, target_model),
+                    help="Capas objetivo del adaptador LoRA ('all' incluye text_fusion; 'attn+ff' solo bloques de imagen).",
+                )
+                _cos_opts = ["balanced", "content", "style"]
+                _cos_val = config.get("content_or_style", "balanced")
+                st.selectbox(
+                    "Content or style skew", _cos_opts,
+                    index=_cos_opts.index(_cos_val) if _cos_val in _cos_opts else 0,
+                    key=_field_key(run.run_id, "content_or_style", target_model),
+                    on_change=_sync_fields_to_json, args=(run.run_id, target_model),
+                    help="Sesgo de muestreo de sigma ('balanced' estándar, 'content' enfatiza detalle fino/identidad).",
                 )
 
             with st.container(horizontal=True):
@@ -675,6 +722,20 @@ def _render_new_run_form(run: IngestionRun, *, busy: bool) -> None:
                     key=_field_key(run.run_id, "caption_dropout_rate", target_model),
                     on_change=_sync_fields_to_json, args=(run.run_id, target_model),
                     help="Probabilidad de usar prompt vacío en vez del caption.",
+                )
+                st.checkbox(
+                    "High precision targets (FP32)",
+                    value=bool(config.get("high_precision_targets", True)),
+                    key=_field_key(run.run_id, "high_precision_targets", target_model),
+                    on_change=_sync_fields_to_json, args=(run.run_id, target_model),
+                    help="Calcula el target de velocidad (noise - base) en FP32 para evitar banding/artefactos.",
+                )
+                st.checkbox(
+                    "Use EMA",
+                    value=bool(config.get("use_ema", False)),
+                    key=_field_key(run.run_id, "use_ema", target_model),
+                    on_change=_sync_fields_to_json, args=(run.run_id, target_model),
+                    help="Media móvil exponencial de los pesos LoRA.",
                 )
 
             if config["noise_offset"] > 0:
@@ -1437,27 +1498,128 @@ def _render_live_run(training_run_id: str) -> None:
     _render_run_body(run)
 
 
+# Referencias históricas medidas de las corridas exitosas de Krea 2 en Agosto
+# (vu_bd_v1: head 0.1362 -> tail 0.0860..0.0959, delta -0.0402..-0.0501;
+#  an_bd_v1: head 0.1251 -> tail 0.0716, delta -0.0536;
+#  dh_bd_v1: head 0.1022 -> tail 0.0669, delta -0.0353)
+_AUG_REF_TAIL_TARGET = 0.0880       # Loss media final objetivo (vu_bd_v1 / an_bd_v1)
+_AUG_REF_TAIL_BAND_LOW = 0.0670     # Límite inferior saludable antes de sobre-entrenar
+_AUG_REF_TAIL_BAND_HIGH = 0.0960    # Umbral de entrada a zona de parecido (vu_bd_v1)
+_AUG_REF_DROP_TARGET = 0.0450       # Caída media de loss (head -> tail) en corridas exitosas
+_AUG_REF_GNORM_P50 = 0.0175         # Mediana histórica de grad_norm en Krea 2
+
+
 def _render_likeness_health_card(run: training_repo.TrainingRun, df: pd.DataFrame) -> None:
-    """Render a dynamic character likeness health & maturity card with traffic light phases."""
+    """Render a dynamic character likeness health & maturity card with August benchmark comparison."""
     if df.empty or "step" not in df.columns or "loss" not in df.columns:
         return
 
     current_step = int(df["step"].iloc[-1])
-    total_steps = int(run.config.get("total_steps") or 1600)
-    save_every = int(run.config.get("save_every") or 100)
+    total_steps = int(run.config.get("total_steps") or 1500)
+    save_every = int(run.config.get("save_every") or 250)
     progress = min(1.0, max(0.0, current_step / max(1, total_steps)))
 
     active_dataset = state.require_active_run()
-    num_images = len(active_dataset.concept.samples) if (active_dataset and active_dataset.concept and active_dataset.concept.samples) else 26
+    num_images = len(active_dataset.concept.samples) if (active_dataset and active_dataset.concept and active_dataset.concept.samples) else 34
     num_images = max(1, num_images)
     effective_epochs = current_step / num_images
 
     loss_col = "loss_avg" if "loss_avg" in df.columns else "loss"
     recent_loss = float(df[loss_col].iloc[-1])
+
+    # Cálculo de head_loss y tail_loss (ventana móvil de 50 updates, igual que domain/train_log.py)
+    raw_losses = df["loss"].astype(float)
+    if len(raw_losses) < 40:
+        # En los primeros pasos (<40 updates = paso <160), pocas muestras de sigma distorsionan
+        # la media corta; anclamos contra la referencia inicial de vu_bd_v1 (0.1362) y loss_avg
+        observed_head = float(max(raw_losses.mean(), recent_loss))
+        head_loss = 0.5 * observed_head + 0.5 * 0.1362
+        tail_loss = float(df[loss_col].iloc[-min(10, len(df)):].mean())
+        dynamic_target_tail = _AUG_REF_TAIL_TARGET  # 0.0880 (vu_bd_v1)
+    else:
+        win = min(50, max(15, len(raw_losses) // 3))
+        head_loss = float(raw_losses.iloc[:win].mean())
+        tail_loss = float(raw_losses.iloc[-win:].mean())
+        dynamic_target_tail = min(_AUG_REF_TAIL_BAND_HIGH, max(_AUG_REF_TAIL_BAND_LOW, head_loss - _AUG_REF_DROP_TARGET))
+
+    loss_drop = max(0.0, head_loss - tail_loss)
+    remaining_to_target = max(0.0, tail_loss - dynamic_target_tail)
+    remaining_to_band = max(0.0, tail_loss - _AUG_REF_TAIL_BAND_HIGH)
+
+    # Porcentaje de convergencia hacia los valores de Agosto (0% = en head_loss, 100% = alcanzó meta de Agosto)
+    pct_by_drop = (loss_drop / _AUG_REF_DROP_TARGET) * 100.0 if _AUG_REF_DROP_TARGET > 0 else 0.0
+    denom_level = max(0.015, head_loss - dynamic_target_tail)
+    pct_by_level = ((head_loss - tail_loss) / denom_level) * 100.0
+    raw_conv_pct = max(0.0, (0.55 * pct_by_drop + 0.45 * pct_by_level))
+    # Durante el warmup inicial (<160 pasos), ponderamos por el avance de ventana para no inflar por azar de sigma
+    warmup_gate = min(1.0, len(raw_losses) / 40.0)
+    convergence_pct = raw_conv_pct * warmup_gate
+    bar_fill_pct = min(100.0, max(2.0, convergence_pct))
+
+    # Estado del indicador de pérdida vs Agosto
+    if len(raw_losses) < 25:
+        bench_color = "#38bdf8"
+        bench_badge = "⏳ CALIBRANDO VENTANA INICIAL (Warmup de 50 updates)"
+        bench_msg = (
+            f"Estabilizando la distribución de <b>sigma</b> (llevas {len(raw_losses)}/50 updates de la ventana inicial). "
+            f"Meta objetivo de <b>vu_bd_v1</b>: <b>{dynamic_target_tail:.4f}</b> (faltan <b>-{remaining_to_target:.4f}</b>)."
+        )
+    elif convergence_pct < 45.0 or tail_loss > 0.115:
+        bench_color = "#ef4444"
+        bench_badge = "🔴 LEJOS DE LA META (Sub-entrenado)"
+        bench_msg = (
+            f"Te faltan <b>-{remaining_to_target:.4f}</b> puntos de caída en Loss para llegar al nivel de "
+            f"<b>vu_bd_v1</b> ({dynamic_target_tail:.4f}). "
+            f"Caída actual: <b>{-loss_drop:+.4f}</b> vs <b>-{_AUG_REF_DROP_TARGET:.4f}</b> en Agosto."
+        )
+    elif convergence_pct < 80.0 and tail_loss > _AUG_REF_TAIL_BAND_HIGH:
+        bench_color = "#f59e0b"
+        bench_badge = "🟠 ACERCÁNDOSE A VALORES DE AGOSTO"
+        bench_msg = (
+            f"Vas al <b>{convergence_pct:.0f}%</b> de la convergencia de Agosto. "
+            f"Faltan <b>-{remaining_to_band:.4f}</b> para entrar en la banda óptima de <b>vu_bd_v1</b> "
+            f"(≤ {_AUG_REF_TAIL_BAND_HIGH:.4f}) y <b>-{remaining_to_target:.4f}</b> para el punto dulce ({dynamic_target_tail:.4f})."
+        )
+    elif tail_loss >= _AUG_REF_TAIL_BAND_LOW and convergence_pct <= 130.0:
+        bench_color = "#10b981"
+        bench_badge = "🟢 EN ZONA DE ÉXITO DE AGOSTO (vu_bd_v1 / an_bd_v1)"
+        bench_msg = (
+            f"¡Objetivo alcanzado! Tu Loss media reciente (<b>{tail_loss:.4f}</b>) y caída acumulada "
+            f"(<b>{-loss_drop:+.4f}</b>) ya están dentro del rango exacto de las mejores corridas de Agosto "
+            f"(<b>{_AUG_REF_TAIL_BAND_LOW:.3f} – {_AUG_REF_TAIL_BAND_HIGH:.3f}</b>)."
+        )
+    else:
+        bench_color = "#c084fc"
+        bench_badge = "🟣 POR DEBAJO DEL PISO DE AGOSTO (Riesgo Overfitting)"
+        bench_msg = (
+            f"La Loss reciente (<b>{tail_loss:.4f}</b>) ya bajó más allá del piso histórico de Agosto "
+            f"(<b>{_AUG_REF_TAIL_BAND_LOW:.4f}</b>). Evalúa el último checkpoint guardado antes de seguir."
+        )
+
+    # Grad norm p50 check (usando los últimos 25 updates para reflejar el estado actual tras el warmup)
+    recent_gnorms = df["grad_norm"].astype(float).iloc[-min(25, len(df)):] if "grad_norm" in df.columns else pd.Series(dtype=float)
+    gnorm_p50 = float(recent_gnorms.median()) if not recent_gnorms.empty else 0.0
+    if gnorm_p50 > 0:
+        if current_step < 200 and gnorm_p50 < 0.012:
+            gnorm_status = f"⏳ Rampa Warmup ({gnorm_p50:.4f} -> {_AUG_REF_GNORM_P50:.4f})"
+            gnorm_color = "#38bdf8"
+        elif gnorm_p50 < 0.006:
+            gnorm_status = f"⚠️ Bajo ({gnorm_p50:.4f} vs {_AUG_REF_GNORM_P50:.4f})"
+            gnorm_color = "#f87171"
+        elif gnorm_p50 <= 0.030:
+            gnorm_status = f"✓ Óptimo ({gnorm_p50:.4f} ≈ Agosto {_AUG_REF_GNORM_P50:.4f})"
+            gnorm_color = "#10b981"
+        else:
+            gnorm_status = f"⚡ Alto ({gnorm_p50:.4f} vs {_AUG_REF_GNORM_P50:.4f})"
+            gnorm_color = "#fbbf24"
+    else:
+        gnorm_status = "N/A"
+        gnorm_color = "#94a3b8"
+
     if len(df) >= 15:
         window_size = min(max(4, len(df) // 4), 30)
-        old_loss = float(df[loss_col].iloc[-window_size * 2:-window_size].mean())
-        new_loss = float(df[loss_col].iloc[-window_size:].mean())
+        old_loss = float(raw_losses.iloc[-window_size * 2:-window_size].mean())
+        new_loss = float(raw_losses.iloc[-window_size:].mean())
         delta = new_loss - old_loss
         if delta < -0.015:
             trend_text = "Descendiendo (Convergencia rápida)"
@@ -1534,22 +1696,42 @@ def _render_likeness_health_card(run: training_repo.TrainingRun, df: pd.DataFram
         <div style="font-size: 0.83rem; color: #e2e8f0; margin-bottom: 10px; line-height: 1.4;">
             {phase_desc}
         </div>
-        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 8px; margin-bottom: 10px;">
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 8px; margin-bottom: 12px;">
             <div style="background: rgba(0,0,0,0.25); padding: 6px 10px; border-radius: 6px;">
                 <span style="font-size: 0.70rem; color: #94a3b8; display: block; text-transform: uppercase; font-weight: 600;">🔄 Épocas Efectivas</span>
                 <span style="font-size: 0.90rem; font-weight: 700; color: #f8fafc;">{effective_epochs:.1f} pasadas / img <span style="font-size:0.75rem; color:#94a3b8;">({num_images} imgs)</span></span>
             </div>
             <div style="background: rgba(0,0,0,0.25); padding: 6px 10px; border-radius: 6px;">
-                <span style="font-size: 0.70rem; color: #94a3b8; display: block; text-transform: uppercase; font-weight: 600;">📉 Tendencia de Pérdida</span>
-                <span style="font-size: 0.85rem; font-weight: 600; color: {trend_color};">{trend_icon} {trend_text}</span>
+                <span style="font-size: 0.70rem; color: #94a3b8; display: block; text-transform: uppercase; font-weight: 600;">⚡ Loss Reciente (Tail vs Inicio)</span>
+                <span style="font-size: 0.90rem; font-weight: 700; color: #38bdf8;">{tail_loss:.4f} <span style="font-size:0.75rem; color:#94a3b8;">(inicio {head_loss:.4f} · avg {recent_loss:.4f})</span></span>
             </div>
             <div style="background: rgba(0,0,0,0.25); padding: 6px 10px; border-radius: 6px;">
-                <span style="font-size: 0.70rem; color: #94a3b8; display: block; text-transform: uppercase; font-weight: 600;">⚡ Loss Actual</span>
-                <span style="font-size: 0.90rem; font-weight: 700; color: #38bdf8;">{recent_loss:.4f}</span>
+                <span style="font-size: 0.70rem; color: #94a3b8; display: block; text-transform: uppercase; font-weight: 600;">🎯 Meta Agosto (vu_bd_v1)</span>
+                <span style="font-size: 0.90rem; font-weight: 700; color: {bench_color};">{dynamic_target_tail:.4f} <span style="font-size:0.75rem; color:#cbd5e1;">(faltan -{remaining_to_target:.4f})</span></span>
+            </div>
+            <div style="background: rgba(0,0,0,0.25); padding: 6px 10px; border-radius: 6px;">
+                <span style="font-size: 0.70rem; color: #94a3b8; display: block; text-transform: uppercase; font-weight: 600;">📉 Caída Δ Loss / Grad Norm</span>
+                <span style="font-size: 0.84rem; font-weight: 700; color: {gnorm_color};">Δ {-loss_drop:+.4f} <span style="font-size:0.73rem; color:#cbd5e1;">(meta -0.045) · {gnorm_status}</span></span>
+            </div>
+        </div>
+        <div style="background: rgba(0,0,0,0.32); border: 1px solid rgba(255,255,255,0.10); border-radius: 8px; padding: 10px 12px; margin-bottom: 10px;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                <span style="font-size: 0.78rem; font-weight: 700; color: {bench_color}; letter-spacing: 0.2px;">
+                    {bench_badge}
+                </span>
+                <span style="font-size: 0.78rem; font-weight: 700; color: #f8fafc;">
+                    Progreso hacia Loss de Agosto: {convergence_pct:.1f}%
+                </span>
+            </div>
+            <div style="width: 100%; height: 10px; background: rgba(255,255,255,0.08); border-radius: 999px; overflow: hidden; margin-bottom: 6px;">
+                <div style="width: {bar_fill_pct:.1f}%; height: 100%; background: linear-gradient(90deg, #ef4444 0%, #f59e0b 55%, #10b981 85%, #38bdf8 100%); border-radius: 999px;"></div>
+            </div>
+            <div style="font-size: 0.78rem; color: #e2e8f0; line-height: 1.35;">
+                {bench_msg}
             </div>
         </div>
         <div style="font-size: 0.78rem; color: #cbd5e1; background: rgba(0,0,0,0.2); padding: 6px 10px; border-radius: 6px; border-left: 3px solid {phase_color};">
-            💡 <b>Recomendación:</b> {target_eval}
+            💡 <b>Recomendación:</b> {target_eval} · <span style="color:{trend_color};">{trend_icon} {trend_text}</span>
         </div>
     </div>
     """
@@ -1572,7 +1754,13 @@ def _render_run_body(run: training_repo.TrainingRun) -> None:
             df = pd.read_csv(csv_path)
             if "step" in df.columns and "loss" in df.columns and not df.empty:
                 _render_likeness_health_card(run, df)
-                st.line_chart(df.set_index("step")["loss"])
+                chart_df = pd.DataFrame(index=df["step"])
+                chart_df["loss_step"] = df["loss"].astype(float).values
+                chart_df["loss_tendencia_50"] = (
+                    df["loss"].astype(float).rolling(window=min(50, max(3, len(df) // 3)), min_periods=1).mean().values
+                )
+                chart_df["meta_agosto_vu_bd_v1 (0.088)"] = _AUG_REF_TAIL_TARGET
+                st.line_chart(chart_df)
         except pd.errors.EmptyDataError:
             pass
 

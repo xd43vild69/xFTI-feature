@@ -30,6 +30,7 @@ class PrecacheSettings(_StrictSettings):
     dataset_path: str
     cache_dir: str
     trigger_word: str = ""
+    prune_orphans: Literal["warn", "delete", "off"] = "delete"
 
 
 class LTX23PrecacheSettings(_StrictSettings):
@@ -67,11 +68,22 @@ class TrainSettings(_StrictSettings):
     save_every: int = Field(gt=0)
     seed: int = Field(ge=0)
     warmup_steps: int = Field(default=100, ge=0)
+    warmup_units: Literal["updates", "micro_steps", "ratio"] = "updates"
     lr_scheduler: Literal["cosine", "constant", "linear", "cosine_with_restarts", "step"] = "cosine"
     lr_num_cycles: int = Field(default=3, gt=0)
+    min_lr_ratio: float = Field(default=0.1, ge=0.0, le=1.0)
+    sampler: Literal["epoch", "legacy"] = "epoch"
+    lora_dtype: Literal["bf16", "fp32"] = "bf16"
+    high_precision_targets: bool = False
+    lora_target: Literal["all", "attn", "attn+ff"] = "all"
+    optimizer_betas: list[float] = Field(default_factory=lambda: [0.9, 0.999])
+    optimizer_eps: float = Field(default=1e-8, gt=0.0)
     timestep_weighting: Literal["none", "bell", "half_bell"] = "none"
+    content_or_style: Literal["balanced", "content", "style"] = "balanced"
     noise_offset: float = Field(default=0.0, ge=0.0)
-    caption_dropout_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    caption_dropout_rate: float = Field(default=0.05, ge=0.0, le=1.0)
+    use_ema: bool = False
+    ema_decay: float = Field(default=0.99, gt=0.0, lt=1.0)
 
 
 class LTX23TrainSettings(_StrictSettings):

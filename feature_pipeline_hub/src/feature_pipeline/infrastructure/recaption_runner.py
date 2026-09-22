@@ -27,9 +27,12 @@ class RecaptionEnvironment:
 
     runtime_dir: Path
     python: Path
+    _model_dir: Path | None = None
 
     @property
     def model_dir(self) -> Path:
+        if self._model_dir is not None:
+            return self._model_dir
         return self.runtime_dir / "model" / "text_encoder"
 
 
@@ -40,7 +43,7 @@ class RecaptionUnavailable(RuntimeError):
 def resolve_environment() -> RecaptionEnvironment:
     """Locate the training runtime's interpreter and text encoder, or explain what is missing."""
     try:
-        training_env = training_runner.resolve_environment()
+        training_env = training_runner.resolve_environment(target_model="krea2")
     except training_runner.TrainingUnavailable as exc:
         raise RecaptionUnavailable(
             f"AI recaptioning reuses the training runtime, which isn't set up yet: {exc}"
@@ -53,7 +56,11 @@ def resolve_environment() -> RecaptionEnvironment:
     if not WORKER.is_file():
         raise RecaptionUnavailable(f"Recaption worker script is missing at {WORKER}")
 
-    return RecaptionEnvironment(runtime_dir=training_env.runtime_dir, python=training_env.python)
+    return RecaptionEnvironment(
+        runtime_dir=training_env.runtime_dir,
+        python=training_env.python,
+        _model_dir=model_dir,
+    )
 
 
 def is_available() -> bool:

@@ -110,14 +110,19 @@ def load(
     dataset = CachedDataset()
     buckets: dict[Bucket, list[str]] = defaultdict(list)
 
-    for name in entry_names(cache_dir):
+    all_names = entry_names(cache_dir)
+    orphans = find_orphans(all_names, cache_dir)
+    if orphans:
+        orphan_set = set(orphans)
+        log(format_orphan_warning(orphans))
+        log(f"[!] Skipping {len(orphans)} orphan cache entries not in cache_manifest.json "
+            f"/ Omitiendo {len(orphans)} entradas huérfanas del entrenamiento.")
+        all_names = [n for n in all_names if n not in orphan_set]
+
+    for name in all_names:
         sample = load_sample(cache_dir, name, compact=compact, pin=pin)
         dataset.samples[name] = sample
         buckets[bucket_of(sample)].append(name)
-
-    orphans = find_orphans(list(dataset.samples), cache_dir)
-    if orphans:
-        log(format_orphan_warning(orphans))
 
     if val_cache_dir and os.path.isdir(val_cache_dir):
         for name in entry_names(val_cache_dir):
