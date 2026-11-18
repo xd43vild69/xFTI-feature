@@ -41,9 +41,21 @@ class EMA:
 
         The decay is warmed up over the first updates; without that the initialization
         dominates the shadow for hundreds of steps and the EMA starts biased toward it.
+        When the shadow and live parameters share the same device and dtype (e.g.
+        fp32 LoRA master weights with `ema_device="cuda"`), uses fused `_foreach`
+        kernels to avoid per-parameter Python loops and host-device transfers.
         """
         self.updates += 1
         decay = min(self.decay, (1 + self.updates) / (10 + self.updates))
+        if (
+            self.shadow
+            and self.params[0].device == self.device
+            and self.params[0].dtype == torch.float32
+        ):
+            live = [p.detach() for p in self.params]
+            torch._foreach_mul_(self.shadow, decay)
+            torch._foreach_add_(self.shadow, live, alpha=1.0 - decay)
+            return
         for shadow, param in zip(self.shadow, self.params):
             shadow.mul_(decay).add_(param.detach().to(self.device, torch.float32),
                                     alpha=1.0 - decay)

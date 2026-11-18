@@ -53,6 +53,8 @@ DEFAULTS: dict[str, Any] = {
     "compact_text": True,
     "init_lora_from": "",
     "gradient_checkpointing": True,
+    "gradient_checkpointing_interval": 1,  # 1 = every block, 2 = every 2nd block, etc.
+    "compile_transformer": False,
 
     # ── A1/A10: precision ────────────────────────────────────────────────────
     "lora_dtype": "bf16",              # "bf16" | "fp32" (fp32 = +235 MB VRAM)
@@ -142,9 +144,11 @@ PRESETS: dict[str, dict[str, Any]] = {
     "stable_v2": {
         "sampler": "epoch",
         "lora_dtype": "fp32",
+        "optimizer": "adamw8bit",
         "optimizer_eps": 1e-6,
         "optimizer_betas": [0.9, 0.99],
         "high_precision_targets": True,
+        "ema_device": "cuda",
         "loss_display": "window",
         "max_checkpoints_to_keep": 5,
         "nan_guard": True,
@@ -160,7 +164,7 @@ CHOICES: dict[str, tuple[tuple[str, ...], str]] = {
     "sampler": (("epoch", "legacy"), "legacy"),
     "resume_on_corrupt": (("abort", "restart"), "abort"),
     "warmup_units": (("updates", "micro_steps", "ratio"), "updates"),
-    "optimizer": (("adamw8bit_paged", "adamw8bit", "adamw"), "adamw8bit_paged"),
+    "optimizer": (("adamw8bit_paged", "adamw8bit", "adamw", "adamw_fused"), "adamw8bit_paged"),
     "timestep_weighting": (("none", "bell", "half_bell"), "none"),
     "content_or_style": (("balanced", "content", "style"), "balanced"),
     "ema_device": (("cpu", "cuda"), "cpu"),
@@ -210,6 +214,8 @@ class TrainConfig:
     compact_text: bool
     init_lora_from: str
     gradient_checkpointing: bool
+    gradient_checkpointing_interval: int
+    compile_transformer: bool
 
     lora_dtype: str
     high_precision_targets: bool
@@ -508,6 +514,8 @@ def load_config(
         compact_text=compact_text,
         init_lora_from=init_lora_from,
         gradient_checkpointing=bool(r.get("gradient_checkpointing")),
+        gradient_checkpointing_interval=max(1, int(r.get("gradient_checkpointing_interval"))),
+        compile_transformer=bool(r.get("compile_transformer")),
 
         lora_dtype=r.choice("lora_dtype"),
         high_precision_targets=bool(r.get("high_precision_targets")),

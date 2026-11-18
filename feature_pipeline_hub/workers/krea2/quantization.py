@@ -57,9 +57,15 @@ def _parent_of(root: torch.nn.Module, module_name: str) -> tuple[torch.nn.Module
     return parent, parts[-1]
 
 
-def _rebuild_layer(filepath: str, info: dict[str, Any]) -> Linear4bit:
-    """Reassemble one `Linear4bit` from its packed weight and serialized QuantState."""
-    with safe_open(filepath, framework="pt", device="cpu") as f:
+def _rebuild_layer(filepath: str, info: dict[str, Any],
+                   device: str | torch.device = "cpu") -> Linear4bit:
+    """Reassemble one `Linear4bit` from its packed weight and serialized QuantState.
+
+    When `device` is CUDA, streams tensors directly onto the GPU so we avoid
+    materializing the full 12B model in host RAM before `.to("cuda")`.
+    """
+    target_dev = str(device)
+    with safe_open(filepath, framework="pt", device=target_dev) as f:
         weight_data = f.get_tensor("weight")
         bias_data = f.get_tensor("bias") if info.get("bias", False) else None
 
@@ -74,7 +80,7 @@ def _rebuild_layer(filepath: str, info: dict[str, Any]) -> Linear4bit:
             "quant_map": qs_dict["quant_map"],
             "quant_state.bitsandbytes__nf4": qs_dict["quant_state.bitsandbytes__nf4"],
         }
-        quant_state = QuantState.from_dict(packed_qs, device="cpu")
+        quant_state = QuantState.from_dict(packed_qs, device=torch.device(target_dev))
 
     weight = Params4bit(weight_data, requires_grad=False, quant_type="nf4",
                         quant_storage=torch.uint8)
@@ -85,8 +91,87 @@ def _rebuild_layer(filepath: str, info: dict[str, Any]) -> Linear4bit:
                        quant_type="nf4", compute_dtype=torch.bfloat16)
     layer.weight = weight
     if bias_data is not None:
+        layer.bias = torch.nn.Parameter(
+            bias_data.to(device=target_dev, dtype=torch.bfloat16),
+            requires_grad=False,
+        )
+    return layer
+
+
+def _rebuild_unquantized_layer(filepath: str, info: dict[str, Any],
+                               device: str | torch.device = "cpu") -> torch.nn.Linear:
+    """Reassemble an unquantized `nn.Linear` (e.g. `img_in`, `time_embed`, `final_layer`) from disk."""
+    target_dev = str(device)
+    with safe_open(filepath, framework="pt", device=target_dev) as f:
+        weight_data = f.get_tensor("weight").to(dtype=torch.bfloat16)
+        bias_data = (
+            f.get_tensor("bias").to(dtype=torch.bfloat16)
+            if info.get("bias", False)
+            else None
+        )
+
+    layer = torch.nn.Linear(
+        int(info["in_features"]),
+        int(info["out_features"]),
+        bias=bool(info.get("bias", False)),
+        device="meta",
+        dtype=torch.bfloat16,
+    )
+    layer.weight = torch.nn.Parameter(weight_data, requires_grad=False)
+    if bias_data is not None:
         layer.bias = torch.nn.Parameter(bias_data, requires_grad=False)
     return layer
+
+
+def _populate_remaining_from_shards(
+    transformer: torch.nn.Module,
+    cache_dir: str,
+    already_loaded_prefixes: set[str],
+    device: str | torch.device = "cuda",
+) -> int:
+    """Load remaining non-Linear parameters/buffers (norms, scale_shift_table, projector) from shards.
+
+    When `transformer` is instantiated with `init_empty_weights()`, parameters outside
+    `index.json` are still on the `meta` device. Reading ONLY those ~170 tiny tensors
+    (a few MB total) via `safe_open` skips reading the 24 GB of bf16 linear weights that
+    `DiffusionPipeline.from_pretrained` would otherwise load and immediately discard.
+    """
+    shard_index_path = os.path.join(
+        cache_dir, "transformer", "diffusion_pytorch_model.safetensors.index.json"
+    )
+    if not os.path.exists(shard_index_path):
+        return 0
+
+    with open(shard_index_path, "r", encoding="utf-8") as f:
+        shard_index = json.load(f)
+
+    weight_map: dict[str, str] = shard_index.get("weight_map", {})
+    by_shard: dict[str, list[str]] = {}
+    for tensor_name, shard_file in weight_map.items():
+        # Skip any parameter belonging to a module already populated from index.json
+        module_prefix = tensor_name.rsplit(".", 1)[0]
+        if module_prefix in already_loaded_prefixes:
+            continue
+        by_shard.setdefault(shard_file, []).append(tensor_name)
+
+    target_dev = str(device)
+    loaded_count = 0
+    transformer_dir = os.path.join(cache_dir, "transformer")
+    for shard_file, tensor_names in by_shard.items():
+        shard_path = os.path.join(transformer_dir, shard_file)
+        if not os.path.exists(shard_path):
+            continue
+        with safe_open(shard_path, framework="pt", device=target_dev) as f:
+            for tensor_name in tensor_names:
+                tensor = f.get_tensor(tensor_name).to(dtype=torch.bfloat16)
+                parent, attr = _parent_of(transformer, tensor_name)
+                existing = getattr(parent, attr, None)
+                if isinstance(existing, torch.nn.Parameter):
+                    setattr(parent, attr, torch.nn.Parameter(tensor, requires_grad=False))
+                else:
+                    parent.register_buffer(attr, tensor)
+                loaded_count += 1
+    return loaded_count
 
 
 def has_nf4_cache(cache_dir: str) -> bool:
@@ -94,8 +179,46 @@ def has_nf4_cache(cache_dir: str) -> bool:
     return os.path.exists(os.path.join(cache_dir, "index.json"))
 
 
+def load_fast_nf4_transformer_and_scheduler(
+    model_id: str,
+    device: str | torch.device = "cuda",
+    log: Logger = print,
+) -> tuple[torch.nn.Module, Any]:
+    """Instantiate Krea2Transformer2DModel on `meta` and stream NF4 + norm weights straight to GPU.
+
+    Falls back to standard `DiffusionPipeline.from_pretrained` if `accelerate` or the
+    transformer config is unavailable.
+    """
+    from accelerate import init_empty_weights
+    from diffusers import FlowMatchEulerDiscreteScheduler
+    from diffusers.models.transformers.transformer_krea2 import Krea2Transformer2DModel
+
+    scheduler_dir = os.path.join(model_id, "scheduler")
+    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+        scheduler_dir if os.path.isdir(scheduler_dir) else model_id
+    )
+
+    transformer_dir = os.path.join(model_id, "transformer")
+    cfg_source = transformer_dir if os.path.isdir(transformer_dir) else model_id
+    config = Krea2Transformer2DModel.load_config(cfg_source)
+
+    with init_empty_weights():
+        transformer = Krea2Transformer2DModel.from_config(config)
+
+    transformer = load_nf4_cache(
+        transformer,
+        model_id,
+        device=device,
+        populate_unquantized=True,
+        log=log,
+    )
+    return transformer, scheduler
+
+
 def load_nf4_cache(transformer: torch.nn.Module, cache_dir: str,
-                   log: Logger = print) -> torch.nn.Module:
+                   log: Logger = print, *,
+                   device: str | torch.device = "cpu",
+                   populate_unquantized: bool = False) -> torch.nn.Module:
     """Rebuild NF4 layers from a pre-quantized on-disk cache instead of quantizing.
 
     `index.json` names every quantized layer and the safetensors file holding its packed
@@ -112,8 +235,10 @@ def load_nf4_cache(transformer: torch.nn.Module, cache_dir: str,
         index = json.load(f)
 
     quantized = index.get("quantized", {})
+    unquantized = index.get("unquantized", {})
     weights_dir = os.path.join(cache_dir, "weights")
     replaced = 0
+    loaded_prefixes: set[str] = set()
 
     for name, info in quantized.items():
         filepath = os.path.join(weights_dir, info["file"])
@@ -121,8 +246,26 @@ def load_nf4_cache(transformer: torch.nn.Module, cache_dir: str,
             raise FileNotFoundError(
                 f"NF4 weight file not found / No existe archivo NF4: {filepath}")
         parent, child_name = _parent_of(transformer, name)
-        setattr(parent, child_name, _rebuild_layer(filepath, info))
+        setattr(parent, child_name, _rebuild_layer(filepath, info, device=device))
+        loaded_prefixes.add(name)
         replaced += 1
+
+    if populate_unquantized:
+        for name, info in unquantized.items():
+            filepath = os.path.join(weights_dir, info["file"])
+            if not os.path.exists(filepath):
+                raise FileNotFoundError(
+                    f"Unquantized weight file not found / No existe archivo: {filepath}")
+            parent, child_name = _parent_of(transformer, name)
+            setattr(
+                parent,
+                child_name,
+                _rebuild_unquantized_layer(filepath, info, device=device),
+            )
+            loaded_prefixes.add(name)
+        _populate_remaining_from_shards(
+            transformer, cache_dir, loaded_prefixes, device=device
+        )
 
     log(f"Reconstructed NF4 layers / Capas NF4 reconstruidas: {replaced}")
 

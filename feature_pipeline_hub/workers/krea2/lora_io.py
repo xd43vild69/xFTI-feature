@@ -198,12 +198,15 @@ def build_optimizer(name: str, params: list[torch.nn.Parameter], lr: float,
     """Construct the optimizer named by `name`.
 
     The paged variant spills optimizer state to RAM under VRAM pressure instead of
-    dying with an OOM at the peaks of the high-resolution phases, which is why it is
-    the default.
+    dying with an OOM at the peaks of the high-resolution phases; `adamw8bit` keeps
+    8-bit state directly in VRAM without unified-memory paging overhead, and
+    `adamw_fused` runs a single fused CUDA kernel when fp32 optimizer state fits.
     """
     import bitsandbytes as bnb
 
-    kwargs = {"lr": lr, "betas": betas, "eps": eps, "weight_decay": weight_decay}
+    kwargs: dict[str, Any] = {"lr": lr, "betas": betas, "eps": eps, "weight_decay": weight_decay}
+    if name == "adamw_fused":
+        return torch.optim.AdamW(params, fused=torch.cuda.is_available(), **kwargs)
     if name == "adamw":
         return torch.optim.AdamW(params, **kwargs)
     if name == "adamw8bit":

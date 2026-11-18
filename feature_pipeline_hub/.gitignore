@@ -7,6 +7,54 @@ data/processed/**
 !data/raw/**/.gitkeep
 !data/processed/**/.gitkeep
 
+# Never upload images (png, jpg, jpeg, webp, etc.)
+*.png
+*.PNG
+*.jpg
+*.JPG
+*.jpeg
+*.JPEG
+*.jfif
+*.JFIF
+*.webp
+*.WEBP
+*.gif
+*.GIF
+*.bmp
+*.BMP
+*.tif
+*.TIF
+*.tiff
+*.TIFF
+*.heic
+*.HEIC
+*.heif
+*.HEIF
+*.avif
+*.AVIF
+*.psd
+*.PSD
+*.[pP][nN][gG]
+*.[jJ][pP][gG]
+*.[jJ][pP][eE][gG]
+*.[wW][eE][bB][pP]
+*.[gG][iI][fF]
+*.[bB][mM][pP]
+*.[tT][iI][fF]
+*.[tT][iI][fF][fF]
+*.[hH][eE][iI][cC]
+*.[hH][eE][iI][fF]
+*.[aA][vV][iI][fF]
+
+# Local output & virtual environments
+.venv/
+.venv*/
+venv/
+venv*/
+output_local/
+out_x/
+cache_x/
+
 # Local metadata DB produced during curation
 *.db
 *.sqlite3

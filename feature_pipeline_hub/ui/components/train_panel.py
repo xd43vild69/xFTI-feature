@@ -735,7 +735,32 @@ def _render_new_run_form(run: IngestionRun, *, busy: bool) -> None:
                     value=bool(config.get("use_ema", False)),
                     key=_field_key(run.run_id, "use_ema", target_model),
                     on_change=_sync_fields_to_json, args=(run.run_id, target_model),
-                    help="Media móvil exponencial de los pesos LoRA.",
+                    help="Media móvil exponencial de los pesos LoRA (ejecutada en GPU con kernels vectorizados).",
+                )
+
+            with st.container(horizontal=True):
+                _opt_opts = ["adamw8bit", "adamw8bit_paged", "adamw_fused", "adamw"]
+                _opt_val = config.get("optimizer", "adamw8bit")
+                st.selectbox(
+                    "Optimizer", _opt_opts,
+                    index=_opt_opts.index(_opt_val) if _opt_val in _opt_opts else 0,
+                    key=_field_key(run.run_id, "optimizer", target_model),
+                    on_change=_sync_fields_to_json, args=(run.run_id, target_model),
+                    help="'adamw8bit' evita la sobrecarga de paginación CUDA de 'adamw8bit_paged'; 'adamw_fused' usa un solo kernel FP32 si sobra VRAM.",
+                )
+                st.number_input(
+                    "Grad checkpointing interval", min_value=1, max_value=28, step=1,
+                    value=int(config.get("gradient_checkpointing_interval", 1)),
+                    key=_field_key(run.run_id, "gradient_checkpointing_interval", target_model),
+                    on_change=_sync_fields_to_json, args=(run.run_id, target_model),
+                    help="1 = todos los bloques (mínima VRAM). 2 = cada 2 bloques (~20% más rápido en resoluciones medias si sobran 2-3 GB de VRAM).",
+                )
+                st.checkbox(
+                    "Compile transformer (torch.compile)",
+                    value=bool(config.get("compile_transformer", False)),
+                    key=_field_key(run.run_id, "compile_transformer", target_model),
+                    on_change=_sync_fields_to_json, args=(run.run_id, target_model),
+                    help="Fusiona kernels de bloques y adaptadores LoRA con torch.compile(dynamic=True). Añade ~45s al primer paso pero acelera entrenamientos largos.",
                 )
 
             if config["noise_offset"] > 0:

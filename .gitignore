@@ -26,16 +26,41 @@ exports/
 snapshots/
 fti_upload_*/
 
-# Media files anywhere in the tree. If you ever need to commit a real asset
-# (a logo, a doc screenshot), add it explicitly with: git add -f <path>
+# Media & image files anywhere in the tree (never upload images/videos to Git).
+# If you ever need to commit a real asset (a logo, a doc screenshot), add it
+# explicitly with: git add -f <path>
 #
-# Written as character classes because gitignore matching is CASE-SENSITIVE on
-# Linux and macOS-with-a-case-sensitive-volume: a plain `*.jpg` does not match
-# `IMG_4021.JPG`, which is exactly what every phone and camera produces. There
-# are 39 such files in data/raw today, saved only by the directory rules in
-# feature_pipeline_hub/.gitignore — this is the second line of defence, so it
-# has to hold on its own. `.suffix.lower()` in storage.py/validators.py is why
-# the app happily ingests them in the first place.
+# Explicit lowercase and uppercase rules for common image formats, plus
+# character classes so mixed-case extensions (e.g. .Png, .Jpg) are also caught
+# on case-sensitive filesystems:
+*.png
+*.PNG
+*.jpg
+*.JPG
+*.jpeg
+*.JPEG
+*.jfif
+*.JFIF
+*.webp
+*.WEBP
+*.gif
+*.GIF
+*.bmp
+*.BMP
+*.tif
+*.TIF
+*.tiff
+*.TIFF
+*.heic
+*.HEIC
+*.heif
+*.HEIF
+*.avif
+*.AVIF
+*.psd
+*.PSD
+*.ico
+*.ICO
 *.[pP][nN][gG]
 *.[jJ][pP][gG]
 *.[jJ][pP][eE][gG]
@@ -49,6 +74,9 @@ fti_upload_*/
 *.[hH][eE][iI][fF]
 *.[aA][vV][iI][fF]
 *.[pP][sS][dD]
+*.[iI][cC][oO]
+!favicon.ico
+!**/favicon.ico
 # Not *.svg: no camera or dataset produces one, and docs/training-architecture.svg
 # is a tracked diagram — ignoring the extension would only get in the way.
 # Camera raw: not ingestible by the app, but an operator's source folder is full
@@ -101,13 +129,20 @@ __pycache__/
 build/
 dist/
 .venv/
+.venv*/
 venv/
+venv*/
 env/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
 .coverage
 htmlcov/
+.cache/
+.uv/
+output_local/
+out_x/
+cache_x/
 
 # --- Databases & local state ------------------------------------------------
 *.db
@@ -142,3 +177,4 @@ desktop.ini
 # AppleDouble sidecars: macOS writes these next to real files when copying to
 # non-HFS volumes, so they show up shadowing source files (e.g. ._gallery.py).
 ._*
+.smbdelete*

@@ -40,6 +40,7 @@ VALID_TRAIN = {
     "lora_dtype": "bf16",
     "high_precision_targets": False,
     "lora_target": "all",
+    "optimizer": "adamw8bit",
     "optimizer_betas": [0.9, 0.999],
     "optimizer_eps": 1e-8,
     "timestep_weighting": "none",
@@ -48,6 +49,10 @@ VALID_TRAIN = {
     "caption_dropout_rate": 0.05,
     "use_ema": False,
     "ema_decay": 0.99,
+    "ema_device": "cuda",
+    "gradient_checkpointing": True,
+    "gradient_checkpointing_interval": 1,
+    "compile_transformer": False,
 }
 
 

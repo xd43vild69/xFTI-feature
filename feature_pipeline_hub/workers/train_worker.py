@@ -21,6 +21,7 @@ train_advanced.json, an optional preset, and DEFAULTS — in that precedence.
 """
 import os
 import gc
+import math
 import time
 import random
 import sys
@@ -101,6 +102,8 @@ LORA_TARGET        = CFG.lora_target
 COMPACT_TEXT       = CFG.compact_text
 INIT_LORA_FROM     = CFG.init_lora_from
 GRAD_CHECKPOINTING = CFG.gradient_checkpointing
+GRAD_CKPT_INTERVAL = CFG.gradient_checkpointing_interval
+COMPILE_TRANSFORMER = CFG.compile_transformer
 RUN_ID             = CFG.run_id
 PHASE_INDEX        = CFG.phase_index
 PHASE_COUNT        = CFG.phase_count
@@ -209,7 +212,8 @@ def _print_effective_config():
         ("curation_weights",     CURATION_WEIGHTS),
         ("use_ema",              f"{USE_EMA} (decay {EMA_DECAY}, {EMA_DEVICE})" if USE_EMA else False),
         ("compact_text",         COMPACT_TEXT),
-        ("gradient_checkpointing", GRAD_CHECKPOINTING),
+        ("gradient_checkpointing", f"{GRAD_CHECKPOINTING} (interval {GRAD_CKPT_INTERVAL})" if GRAD_CHECKPOINTING else False),
+        ("compile_transformer",  COMPILE_TRANSFORMER),
         ("nan_guard",            f"{NAN_GUARD} (abort after {NAN_ABORT_AFTER})" if NAN_GUARD else False),
         ("oom_guard",            f"{OOM_GUARD} (abort after {OOM_ABORT_AFTER})" if OOM_GUARD else False),
         ("max_loss",             MAX_LOSS or "off"),
@@ -417,19 +421,51 @@ def train_krea2():
     )
 
     print("Loading Krea-2 Transformer... / Cargando Transformer de Krea-2...")
+    NF4_CACHE_DIR = MODEL_ID
 
-    pipe = DiffusionPipeline.from_pretrained(
-        MODEL_ID,
-        vae=None,
-        text_encoder=None,
-        torch_dtype=torch.bfloat16,
-    )
-
-    transformer = pipe.transformer
-    scheduler   = pipe.scheduler
-
-    del pipe
-    free_vram()
+    if _quant.has_nf4_cache(NF4_CACHE_DIR):
+        print("\n¡NF4 CACHE DETECTED! / ¡CACHÉ NF4 DETECTADA!")
+        print("Streaming NF4 weights directly to GPU (skipping bf16 base load)...")
+        t0 = time.time()
+        try:
+            transformer, scheduler = _quant.load_fast_nf4_transformer_and_scheduler(
+                NF4_CACHE_DIR, device="cuda"
+            )
+            free_vram()
+            print(f"[NF4] Fast-loaded in / Caché cargada en {time.time() - t0:.1f}s", flush=True)
+        except Exception as _fast_err:
+            print(f"[i] Fast NF4 load fell back to standard loader ({_fast_err})")
+            pipe = DiffusionPipeline.from_pretrained(
+                MODEL_ID,
+                vae=None,
+                text_encoder=None,
+                torch_dtype=torch.bfloat16,
+            )
+            transformer = pipe.transformer
+            scheduler = pipe.scheduler
+            del pipe
+            free_vram()
+            transformer = load_nf4_cache_(transformer, NF4_CACHE_DIR)
+            transformer.to("cuda")
+            free_vram()
+            print(f"[NF4] Cache loaded in / Caché cargada en {time.time() - t0:.1f}s", flush=True)
+        print(f"Transformer 12B pinned in VRAM. Usage / Uso: {torch.cuda.memory_allocated()/1e9:.1f} GB", flush=True)
+    else:
+        pipe = DiffusionPipeline.from_pretrained(
+            MODEL_ID,
+            vae=None,
+            text_encoder=None,
+            torch_dtype=torch.bfloat16,
+        )
+        transformer = pipe.transformer
+        scheduler   = pipe.scheduler
+        del pipe
+        free_vram()
+        print("\nNo NF4 cache found. Performing quantization... / No se encontró caché NF4. Ejecutando cuantización...")
+        quantize_to_nf4_(transformer)
+        transformer.to("cuda")
+        free_vram()
+        print(f"Transformer 12B pinned in VRAM. Usage / Uso: {torch.cuda.memory_allocated()/1e9:.1f} GB")
 
     shift_cfg = (
         scheduler.config.get("base_image_seq_len", 256),
@@ -438,26 +474,20 @@ def train_krea2():
         scheduler.config.get("max_shift", 1.15),
     )
 
-    NF4_CACHE_DIR = MODEL_ID
-
-    if _quant.has_nf4_cache(NF4_CACHE_DIR):
-        print("\n¡NF4 CACHE DETECTED! / ¡CACHÉ NF4 DETECTADA!")
-        print("Skipping NF4 quantization... / No se ejecutará cuantización NF4.")
-        t0 = time.time()
-        transformer = load_nf4_cache_(transformer, NF4_CACHE_DIR)
-        print(f"[NF4] Cache loaded in / Caché cargada en {time.time() - t0:.1f}s", flush=True)
-        transformer.to("cuda")
-        free_vram()
-        print(f"Transformer 12B pinned in VRAM. Usage / Uso: {torch.cuda.memory_allocated()/1e9:.1f} GB", flush=True)
-    else:
-        print("\nNo NF4 cache found. Performing quantization... / No se encontró caché NF4. Ejecutando cuantización...")
-        quantize_to_nf4_(transformer)
-        transformer.to("cuda")
-        free_vram()
-        print(f"Transformer 12B pinned in VRAM. Usage / Uso: {torch.cuda.memory_allocated()/1e9:.1f} GB")
-
     if GRAD_CHECKPOINTING:
         transformer.enable_gradient_checkpointing()
+        if GRAD_CKPT_INTERVAL > 1 and hasattr(transformer, "transformer_blocks"):
+            blocks = transformer.transformer_blocks
+            active_ckpt = 0
+            for idx, blk in enumerate(blocks):
+                keep = (idx % GRAD_CKPT_INTERVAL == 0)
+                if hasattr(blk, "gradient_checkpointing"):
+                    blk.gradient_checkpointing = keep
+                elif not keep:
+                    blk._gradient_checkpointing_off = True
+                if keep:
+                    active_ckpt += 1
+            print(f"Selective gradient checkpointing: {active_ckpt}/{len(blocks)} blocks (interval={GRAD_CKPT_INTERVAL})")
     else:
         # Sin recompute: más rápido pero más VRAM de activaciones. Sólo apto en las
         # fases de baja resolución donde la VRAM sobra (lo decide el orquestador).
@@ -488,6 +518,17 @@ def train_krea2():
         output.requires_grad_(True)
 
     transformer.img_in.register_forward_hook(_make_inputs_require_grad)
+
+    if COMPILE_TRANSFORMER and hasattr(torch, "compile"):
+        try:
+            if hasattr(transformer, "transformer_blocks"):
+                for idx, blk in enumerate(transformer.transformer_blocks):
+                    transformer.transformer_blocks[idx] = torch.compile(
+                        blk, mode="default", dynamic=True
+                    )
+                print("[OK] Transformer blocks compiled with torch.compile(dynamic=True)")
+        except Exception as _comp_err:
+            print(f"[!] torch.compile skipped ({_comp_err})")
 
     trainable = [p for p in model.parameters() if p.requires_grad]
     optimizer = _lora_io.build_optimizer(OPTIMIZER_NAME, trainable, LR, OPTIMIZER_BETAS,
@@ -660,6 +701,7 @@ def train_krea2():
     loss_hist = collections.deque(maxlen=max(1, LOSS_WINDOW))
     nan_count = oom_streak = skipped_outlier = 0
     accum_count = 0
+    window_losses_gpu: list[torch.Tensor] = []
 
     def on_oom(step, size):
         """Discard the accumulation window, free VRAM, and decide whether to give up.
@@ -670,6 +712,7 @@ def train_krea2():
         nonlocal oom_streak, accum_count
         oom_streak += 1
         accum_count = 0
+        window_losses_gpu.clear()
         optimizer.zero_grad(set_to_none=True)
         free_vram()
         try:
@@ -770,27 +813,31 @@ def train_krea2():
                 continue
 
             # ── A3: guardas sobre la loss ────────────────────────────────────
-            if MAX_LOSS > 0 and torch.isfinite(loss_value) and loss_value.item() > MAX_LOSS:
-                skipped_outlier += 1
-                optimizer.zero_grad(set_to_none=True)
-                accum_count = 0
-                print(f"\n[!] Loss {loss_value.item():.3f} > max_loss {MAX_LOSS} at step {step} "
-                      f"— window discarded ({skipped_outlier} total)")
-                continue
-            if NAN_GUARD and not torch.isfinite(loss_value):
-                nan_count += 1
-                # Descartar la ventana entera: un solo inf haría que clip_grad_norm_
-                # calculase una norma NaN y escalase TODOS los gradientes a NaN,
-                # y AdamW escribiría NaN en exp_avg de forma permanente.
-                optimizer.zero_grad(set_to_none=True)
-                accum_count = 0
-                print(f"\n[!] Non-finite loss at step {step} — batch skipped "
-                      f"({nan_count}/{NAN_ABORT_AFTER})")
-                if nan_count >= NAN_ABORT_AFTER:
-                    print("[!] Too many non-finite losses; saving and aborting / abortando.")
-                    save_checkpoint_now(last_step_executed, reason="interrupt")
-                    return
-                continue
+            # When MAX_LOSS is active we must inspect per-micro-step loss before backward;
+            # otherwise we defer the GPU->CPU scalar sync (.item()) until the accumulation
+            # window completes so forward+backward queue asynchronously on the CUDA stream.
+            if MAX_LOSS > 0:
+                micro_loss = loss_value.item()
+                if math.isfinite(micro_loss) and micro_loss > MAX_LOSS:
+                    skipped_outlier += 1
+                    optimizer.zero_grad(set_to_none=True)
+                    accum_count = 0
+                    window_losses_gpu.clear()
+                    print(f"\n[!] Loss {micro_loss:.3f} > max_loss {MAX_LOSS} at step {step} "
+                          f"— window discarded ({skipped_outlier} total)")
+                    continue
+                if NAN_GUARD and not math.isfinite(micro_loss):
+                    nan_count += 1
+                    optimizer.zero_grad(set_to_none=True)
+                    accum_count = 0
+                    window_losses_gpu.clear()
+                    print(f"\n[!] Non-finite loss at step {step} — batch skipped "
+                          f"({nan_count}/{NAN_ABORT_AFTER})")
+                    if nan_count >= NAN_ABORT_AFTER:
+                        print("[!] Too many non-finite losses; saving and aborting / abortando.")
+                        save_checkpoint_now(last_step_executed, reason="interrupt")
+                        return
+                    continue
 
             try:
                 # El backward es el pico real de memoria, así que necesita la
@@ -801,15 +848,35 @@ def train_krea2():
                     raise
                 continue
 
-            step_loss = loss_value.item()
-            running_loss += step_loss
-            loss_hist.append(step_loss)
+            window_losses_gpu.append(loss_value)
             accum_count += 1
             oom_streak = 0
 
             grad_norm = 0.0
             did_update = False
+            step_loss = 0.0
             if accum_count >= GRAD_ACCUM_STEPS:
+                # Single GPU->CPU transfer for all micro-steps in the accumulation window
+                window_vals = torch.stack(window_losses_gpu).tolist()
+                window_losses_gpu.clear()
+
+                if NAN_GUARD and not all(math.isfinite(v) for v in window_vals):
+                    nan_count += 1
+                    optimizer.zero_grad(set_to_none=True)
+                    accum_count = 0
+                    print(f"\n[!] Non-finite loss in window at step {step} — update skipped "
+                          f"({nan_count}/{NAN_ABORT_AFTER})")
+                    if nan_count >= NAN_ABORT_AFTER:
+                        print("[!] Too many non-finite losses; saving and aborting / abortando.")
+                        save_checkpoint_now(last_step_executed, reason="interrupt")
+                        return
+                    continue
+
+                for v in window_vals:
+                    running_loss += v
+                    loss_hist.append(v)
+                step_loss = window_vals[-1]
+
                 gnorm = torch.nn.utils.clip_grad_norm_(trainable, MAX_GRAD_NORM)
                 if NAN_GUARD and not torch.isfinite(gnorm):
                     nan_count += 1
@@ -905,6 +972,12 @@ def train_krea2():
     # A5: la ventana final de acumulación se descartaba si total_steps no era
     # múltiplo de grad_accum_steps.
     if accum_count > 0:
+        if window_losses_gpu:
+            for v in torch.stack(window_losses_gpu).tolist():
+                if math.isfinite(v):
+                    running_loss += v
+                    loss_hist.append(v)
+            window_losses_gpu.clear()
         gnorm = torch.nn.utils.clip_grad_norm_(trainable, MAX_GRAD_NORM)
         if torch.isfinite(gnorm):
             for gparam in optimizer.param_groups:

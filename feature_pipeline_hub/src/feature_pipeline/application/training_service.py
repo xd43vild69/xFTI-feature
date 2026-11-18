@@ -98,17 +98,22 @@ class TrainingConfig(BaseModel):
     lr_num_cycles: int = Field(default=3, gt=0)
     min_lr_ratio: float = Field(default=0.1, ge=0.0, le=1.0)
     sampler: Literal["epoch", "legacy"] = "epoch"
-    lora_dtype: Literal["bf16", "fp32"] = "bf16"
-    high_precision_targets: bool = False
+    lora_dtype: Literal["bf16", "fp32"] = "fp32"
+    high_precision_targets: bool = True
     lora_target: Literal["all", "attn", "attn+ff"] = "all"
-    optimizer_betas: list[float] = Field(default_factory=lambda: [0.9, 0.999])
-    optimizer_eps: float = Field(default=1e-8, gt=0.0)
+    optimizer: Literal["adamw8bit_paged", "adamw8bit", "adamw", "adamw_fused"] = "adamw8bit"
+    optimizer_betas: list[float] = Field(default_factory=lambda: [0.9, 0.99])
+    optimizer_eps: float = Field(default=1e-6, gt=0.0)
     timestep_weighting: Literal["none", "bell", "half_bell"] = "none"
     content_or_style: Literal["balanced", "content", "style"] = "balanced"
     noise_offset: float = Field(default=0.0, ge=0.0)
     caption_dropout_rate: float = Field(default=0.05, ge=0.0, le=1.0)
     use_ema: bool = False
     ema_decay: float = Field(default=0.99, gt=0.0, lt=1.0)
+    ema_device: Literal["cpu", "cuda"] = "cuda"
+    gradient_checkpointing: bool = True
+    gradient_checkpointing_interval: int = Field(default=1, ge=1, le=28)
+    compile_transformer: bool = False
 
 
 class LTX23TrainingConfig(BaseModel):
@@ -951,9 +956,10 @@ _FORK_PINNED_KEYS = (
     "model_id", "lr", "lr_scheduler", "lr_num_cycles", "min_lr_ratio",
     "warmup_steps", "warmup_units", "lora_rank", "lora_alpha", "lora_target",
     "lora_dtype", "high_precision_targets", "sampler", "seed",
-    "batch_size", "grad_accum_steps", "optimizer_betas", "optimizer_eps",
+    "batch_size", "grad_accum_steps", "optimizer", "optimizer_betas", "optimizer_eps",
     "timestep_weighting", "content_or_style", "noise_offset", "caption_dropout_rate",
-    "use_ema", "ema_decay",
+    "use_ema", "ema_decay", "ema_device",
+    "gradient_checkpointing", "gradient_checkpointing_interval", "compile_transformer",
 )
 
 
