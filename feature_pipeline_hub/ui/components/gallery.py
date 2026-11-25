@@ -205,55 +205,100 @@ def _render_normalize_dialog(run: IngestionRun, visible: list[DatasetSample]) ->
         st.rerun()
 
 
+_DROPZONE_CSS = """
+<style>
+[class*="st-key-curate_dropzone_"] [data-testid="stFileUploaderDropzone"] {
+    padding: 0.45rem 0.9rem !important;
+    min-height: 2.6rem !important;
+    border: 1.5px dashed rgba(128, 128, 128, 0.45) !important;
+    border-radius: 0.55rem !important;
+    transition: border-color 0.15s ease, background-color 0.15s ease !important;
+}
+[class*="st-key-curate_dropzone_"] [data-testid="stFileUploaderDropzone"]:hover {
+    border-color: #4b9eff !important;
+    background-color: rgba(75, 158, 255, 0.06) !important;
+}
+/* Hide uploaded file pills because files are ingested immediately on drop */
+[class*="st-key-curate_dropzone_"] [data-testid="stFileUploaderFile"] {
+    display: none !important;
+}
+</style>
+"""
+
+
+def _dropzone_version_key(run_id: str) -> str:
+    return f"curate_drop_version_{run_id}"
+
+
+def _ingest_dropped_files(run: IngestionRun, uploaded_files: list) -> None:
+    """Immediately integrate dropped/selected files into `run` just like Import, then rerun."""
+    st.session_state[_dropzone_version_key(run.run_id)] = (
+        st.session_state.get(_dropzone_version_key(run.run_id), 0) + 1
+    )
+
+    with st.spinner("Integrando imagen(es) al paquete del dataset…"):
+        added = state.append_images(run, uploaded_files)
+
+    if not added:
+        st.session_state["append_warning"] = (
+            "No se añadió ninguna imagen nueva (formato no soportado o archivo sin imagen asociada)."
+        )
+        st.rerun()
+
+    duplicates = sum(1 for s in added if s.is_duplicate)
+    invalid = sum(1 for s in added if not s.is_valid)
+    sample_names = [Path(s.image_path).name for s in added[:3]]
+    preview_names = ", ".join(sample_names) + ("…" if len(added) > 3 else "")
+
+    notes = [f"{len(added)} imagen(es) integrada(s) ({preview_names})"]
+    if duplicates:
+        notes.append(f"{duplicates} marcada(s) como duplicada(s)")
+    if invalid:
+        notes.append(f"{invalid} con errores de validación")
+
+    st.session_state["append_message"] = " · ".join(notes) + "."
+    st.rerun()
+
+
 @st.dialog("Añadir imágenes")
 def _render_append_dialog(run: IngestionRun) -> None:
     st.write(
-        "Añade imágenes que falten a este dataset. La curación ya hecha "
-        "(exclusiones, captions editados) se conserva."
+        "Suelta o selecciona imágenes para integrarlas inmediatamente a este dataset. "
+        "La curación ya hecha (exclusiones, captions editados) se conserva."
     )
 
+    dialog_v = st.session_state.get(f"append_dialog_v_{run.run_id}", 0)
     uploaded_files = st.file_uploader(
         "Imágenes (PNG, JPG, WebP) y captions .txt opcionales",
         type=["png", "jpg", "jpeg", "webp", "txt"],
         accept_multiple_files=True,
-        key=f"append_files_{run.run_id}",
+        key=f"append_files_{run.run_id}_v{dialog_v}",
         label_visibility="collapsed",
     )
 
-    if st.button(
-        "Añadir al dataset",
-        type="primary",
-        disabled=not uploaded_files,
-        use_container_width=True,
-    ):
-        added = state.append_images(run, uploaded_files)
-        if not added:
-            st.warning("No se añadió ninguna imagen nueva.")
-            return
-
-        duplicates = sum(1 for s in added if s.is_duplicate)
-        invalid = sum(1 for s in added if not s.is_valid)
-        notes = [f"{len(added)} imagen(es) añadida(s)"]
-        if duplicates:
-            notes.append(f"{duplicates} marcada(s) como duplicada(s)")
-        if invalid:
-            notes.append(f"{invalid} con errores de validación")
-
-        st.session_state["append_message"] = " · ".join(notes) + "."
-        st.rerun()
+    if uploaded_files:
+        st.session_state[f"append_dialog_v_{run.run_id}"] = dialog_v + 1
+        _ingest_dropped_files(run, uploaded_files)
 
 
 def render() -> None:
-    run = state.require_active_run()
+    run = state.active_run()
     if run is None:
+        st.info("No dataset selected yet.")
+        if st.button("Go to import", icon=":material/arrow_forward:"):
+            st.switch_page(state.IMPORT_STEP)
         return
 
     if message := st.session_state.pop("append_message", None):
+        st.toast(message, icon=":material/check_circle:")
         st.success(message)
+    if warning_msg := st.session_state.pop("append_warning", None):
+        st.warning(warning_msg)
 
+    st.html(_DROPZONE_CSS)
     image_zoom.inject_styles()
 
-    # Keyboard shortcut listener for F2
+    # Keyboard shortcut listener (F2) + Full-page drag-and-drop forwarding into Curate dropzone
     components.html(
         """
         <script>
@@ -269,10 +314,7 @@ def render() -> None:
 
                 parentWin._f2Handler = function(e) {
                     if (e.key === 'F2' || e.code === 'F2' || e.keyCode === 113) {
-                        // 1. Selector directo por clase Streamlit del botón
                         let btn = parentDoc.querySelector('[class*="st-key-btn_rename_"] button');
-
-                        // 2. Fallback: Búsqueda exhaustiva en todos los botones
                         if (!btn) {
                             const buttons = Array.from(parentDoc.querySelectorAll('button'));
                             btn = buttons.find(b => {
@@ -281,7 +323,6 @@ def render() -> None:
                                 return txt.includes('captions') || txt.includes('f2') || aria.includes('captions') || aria.includes('f2');
                             });
                         }
-
                         if (btn) {
                             e.preventDefault();
                             e.stopPropagation();
@@ -293,8 +334,142 @@ def render() -> None:
 
                 parentDoc.addEventListener('keydown', parentWin._f2Handler, true);
                 parentWin.addEventListener('keydown', parentWin._f2Handler, true);
+
+                // Clean up previous full-page drag-and-drop listeners if present
+                if (parentWin._curateCleanupDnD) {
+                    parentWin._curateCleanupDnD();
+                }
+
+                let dragDepth = 0;
+
+                function getCurateDropzone() {
+                    return parentDoc.querySelector('[class*="st-key-curate_dropzone_"] [data-testid="stFileUploaderDropzone"]');
+                }
+
+                function hasFiles(e) {
+                    if (!e.dataTransfer || !e.dataTransfer.types) return false;
+                    return Array.from(e.dataTransfer.types).includes('Files');
+                }
+
+                function ensureOverlay() {
+                    let el = parentDoc.getElementById('fti-curate-drop-overlay');
+                    if (!el) {
+                        el = parentDoc.createElement('div');
+                        el.id = 'fti-curate-drop-overlay';
+                        el.style.cssText = [
+                            'position: fixed',
+                            'inset: 12px',
+                            'z-index: 999999',
+                            'display: none',
+                            'align-items: center',
+                            'justify-content: center',
+                            'background: rgba(15, 23, 42, 0.58)',
+                            'backdrop-filter: blur(3px)',
+                            'border: 3px dashed #4b9eff',
+                            'border-radius: 16px',
+                            'pointer-events: none',
+                            'color: #ffffff',
+                            'font-family: system-ui, -apple-system, sans-serif',
+                            'font-size: 1.25rem',
+                            'font-weight: 600',
+                            'box-shadow: 0 12px 40px rgba(0,0,0,0.35)'
+                        ].join(';');
+                        el.innerHTML = '<div style="padding: 1.2rem 2rem; background: rgba(30,41,59,0.92); border-radius: 12px; border: 1px solid rgba(75,158,255,0.5);">📥 Suelta tus imágenes aquí para integrarlas al dataset</div>';
+                        parentDoc.body.appendChild(el);
+                    }
+                    return el;
+                }
+
+                function hideOverlay() {
+                    dragDepth = 0;
+                    const el = parentDoc.getElementById('fti-curate-drop-overlay');
+                    if (el) el.style.display = 'none';
+                }
+
+                function onDragEnter(e) {
+                    const dz = getCurateDropzone();
+                    if (!dz || !hasFiles(e)) return;
+                    dragDepth++;
+                    if (!dz.contains(e.target)) {
+                        ensureOverlay().style.display = 'flex';
+                    }
+                }
+
+                function onDragOver(e) {
+                    const dz = getCurateDropzone();
+                    if (!dz || !hasFiles(e)) return;
+                    if (!dz.contains(e.target)) {
+                        e.preventDefault();
+                        e.dataTransfer.dropEffect = 'copy';
+                        ensureOverlay().style.display = 'flex';
+                    } else {
+                        hideOverlay();
+                    }
+                }
+
+                function onDragLeave(e) {
+                    if (!getCurateDropzone()) {
+                        hideOverlay();
+                        return;
+                    }
+                    dragDepth = Math.max(0, dragDepth - 1);
+                    if (dragDepth === 0 || e.clientX <= 0 || e.clientY <= 0 ||
+                        e.clientX >= parentWin.innerWidth || e.clientY >= parentWin.innerHeight) {
+                        hideOverlay();
+                    }
+                }
+
+                function onDrop(e) {
+                    const dz = getCurateDropzone();
+                    if (!dz || !hasFiles(e)) return;
+                    hideOverlay();
+                    // Let native Streamlit dropzone handle direct drops on itself
+                    if (dz.contains(e.target)) return;
+
+                    const files = e.dataTransfer.files;
+                    if (!files || files.length === 0) return;
+
+                    e.preventDefault();
+                    e.stopPropagation();
+
+                    const dt = new DataTransfer();
+                    for (let i = 0; i < files.length; i++) {
+                        dt.items.add(files[i]);
+                    }
+
+                    // Primary path: react-dropzone onDrop handler on Streamlit's dropzone
+                    const dropEvt = new DragEvent('drop', {
+                        bubbles: true,
+                        cancelable: true,
+                        dataTransfer: dt
+                    });
+                    dz.dispatchEvent(dropEvt);
+
+                    // Fallback: assign to underlying file input if drop event was ignored
+                    const input = dz.querySelector('input[type="file"]') ||
+                                  parentDoc.querySelector('[class*="st-key-curate_dropzone_"] input[type="file"]');
+                    if (input && (!input.files || input.files.length === 0)) {
+                        try {
+                            input.files = dt.files;
+                            input.dispatchEvent(new Event('change', { bubbles: true }));
+                        } catch (_) {}
+                    }
+                }
+
+                parentDoc.addEventListener('dragenter', onDragEnter, true);
+                parentDoc.addEventListener('dragover', onDragOver, true);
+                parentDoc.addEventListener('dragleave', onDragLeave, true);
+                parentDoc.addEventListener('drop', onDrop, true);
+
+                parentWin._curateCleanupDnD = function() {
+                    parentDoc.removeEventListener('dragenter', onDragEnter, true);
+                    parentDoc.removeEventListener('dragover', onDragOver, true);
+                    parentDoc.removeEventListener('dragleave', onDragLeave, true);
+                    parentDoc.removeEventListener('drop', onDrop, true);
+                    hideOverlay();
+                };
             } catch (err) {
-                console.error('Error attaching F2 shortcut listener:', err);
+                console.error('Error attaching Curate listeners:', err);
             }
         })();
         </script>
@@ -354,10 +529,24 @@ def render() -> None:
         ):
             _render_normalize_dialog(run, samples)
 
+    drop_v = st.session_state.get(_dropzone_version_key(run.run_id), 0)
+    dropped_files = st.file_uploader(
+        "Arrastra y suelta imágenes en cualquier parte de Curate para integrarlas al paquete",
+        type=["png", "jpg", "jpeg", "webp", "txt"],
+        accept_multiple_files=True,
+        key=f"curate_dropzone_{run.run_id}_v{drop_v}",
+        label_visibility="collapsed",
+    )
+    if dropped_files:
+        _ingest_dropped_files(run, dropped_files)
+
     # After the toolbar, not before it: a filter matching nothing is exactly when
     # adding images is most likely to be what the user wants.
     if not samples:
-        st.caption(f"No images match '{chosen_filter}'.")
+        if not run.concept.samples:
+            st.info("Este dataset aún no tiene imágenes. Suelta tus imágenes arriba o en cualquier parte de esta pantalla para importarlas.")
+        else:
+            st.caption(f"No images match '{chosen_filter}'.")
         return
 
     thumbnail_size = state.thumbnail_size_for_columns(columns_per_row)

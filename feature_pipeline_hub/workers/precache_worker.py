@@ -19,6 +19,8 @@ import math
 import json
 import re
 import hashlib
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 import torch
 import torchvision.transforms.functional as F_vision
 from PIL import Image
@@ -51,10 +53,10 @@ DEFAULTS = {
     "model_id": "Krea-2-NF4",
     "dataset_path": "./dataset",
     "cache_dir": f"{CACHE_ROOT}/default",
-    "target_area": 512 * 512,
+    "target_area": 1024 * 1024,
     "max_side": 1280,
     "multiple": 16,
-    "max_seq_len": 128,
+    "max_seq_len": 256,
     "project_name": "",
     "trigger_word": "",
     "resolutions": [],
@@ -244,6 +246,7 @@ def bucket_size(w: int, h: int, area=None):
 def manifest_config():
     """Ajustes que, si cambian, invalidan todos los latentes ya cacheados."""
     return {
+        "target_area": TARGET_AREA,
         "multiple": MULTIPLE,
         "max_side": MAX_SIDE,
         "max_seq_len": MAX_SEQ_LEN,
@@ -385,12 +388,12 @@ def preprocess_krea2():
         repo_id="AcademiaSD/Krea-2-NF4-for-LoRA-Training"
     )
 
-    print("Loading VAE (Qwen-Image) and Text Encoder (Qwen3-VL-4B)... / Cargando VAE y Text Encoder de Krea-2...")
+    print("Loading Text Encoder (Qwen3-VL-4B) & VAE (Qwen-Image) on CPU... / Cargando en CPU...")
     pipe = DiffusionPipeline.from_pretrained(
         MODEL_ID,
         transformer=None,
         torch_dtype=torch.bfloat16,
-    ).to("cuda")
+    )
 
     if not hasattr(pipe.vae.config, "latents_mean") or not hasattr(pipe.vae.config, "latents_std"):
         raise RuntimeError("This VAE lacks latents_mean/latents_std configuration / Este VAE no tiene latents_mean/latents_std")
@@ -409,44 +412,144 @@ def preprocess_krea2():
     for out_dir, _ in targets:
         os.makedirs(out_dir, exist_ok=True)
 
-    def vae_latent(img_pil, area):
-        """Redimensiona/recorta al bucket de `area` y devuelve el latente normalizado."""
+    def prepare_image_tensor_cpu(img_pil, area):
+        """Resize/crop on CPU and return `(bw, bh, tensor_bf16_cpu)` ready for batched VAE encode."""
         bw, bh = bucket_size(img_pil.width, img_pil.height, area)
         ratio = max(bw / img_pil.width, bh / img_pil.height)
-        im = img_pil.resize((math.ceil(img_pil.width * ratio), math.ceil(img_pil.height * ratio)), Image.LANCZOS)
+        im = img_pil.resize(
+            (math.ceil(img_pil.width * ratio), math.ceil(img_pil.height * ratio)),
+            Image.LANCZOS,
+        )
         left = (im.width - bw) // 2
-        top  = (im.height - bh) // 2
-        im   = im.crop((left, top, left + bw, top + bh))
+        top = (im.height - bh) // 2
+        im = im.crop((left, top, left + bw, top + bh))
 
-        img_tensor = F_vision.pil_to_tensor(im).unsqueeze(0).unsqueeze(2)  # [1,3,1,H,W]
-        img_tensor = (img_tensor.float() / 127.5) - 1.0
-        img_tensor = img_tensor.to("cuda", dtype=torch.bfloat16)
+        img_tensor = F_vision.pil_to_tensor(im).unsqueeze(1)  # [3,1,H,W]
+        img_tensor = ((img_tensor.float() / 127.5) - 1.0).to(torch.bfloat16).contiguous()
+        if torch.cuda.is_available():
+            try:
+                img_tensor = img_tensor.pin_memory()
+            except Exception:
+                pass
+        return bw, bh, img_tensor
 
-        z = pipe.vae.encode(img_tensor).latent_dist.sample().float()
-        latent = (z - latents_mean) / latents_std
-        latent = latent[:, :, 0].to(torch.bfloat16).cpu()
-        # Sin free_vram aquí: no liberaba nada (img_tensor y z siguen vivos en
-        # este frame hasta el return) y costaba ~18 ms por llamada. Al salir de
-        # la función el refcount los suelta y el caching allocator reutiliza los
-        # bloques, que es justo lo que empty_cache impedía.
-        return bw, bh, latent
+    def _safe_tiled_encode_single(inp: torch.Tensor) -> torch.Tensor:
+        """Fallback OOM path: pad spatial dims so diffusers' tiled_encode never slices a <256px remainder tile."""
+        _, _, _, h_px, w_px = inp.shape
+        t_min_h = int(getattr(pipe.vae, "tile_sample_min_height", 256))
+        t_min_w = int(getattr(pipe.vae, "tile_sample_min_width", 256))
+        t_str_h = int(getattr(pipe.vae, "tile_sample_stride_height", 192))
+        t_str_w = int(getattr(pipe.vae, "tile_sample_stride_width", 192))
+
+        def _padded_dim(size: int, t_min: int, t_str: int) -> int:
+            if size <= t_min:
+                return t_min
+            steps = math.ceil((size - t_min) / t_str)
+            return t_min + steps * t_str
+
+        pad_h = _padded_dim(h_px, t_min_h, t_str_h) - h_px
+        pad_w = _padded_dim(w_px, t_min_w, t_str_w) - w_px
+        if pad_h > 0 or pad_w > 0:
+            inp_2d = torch.nn.functional.pad(inp[:, :, 0], (0, pad_w, 0, pad_h), mode="replicate")
+            inp = inp_2d.unsqueeze(2)
+
+        if hasattr(pipe.vae, "enable_tiling"):
+            pipe.vae.enable_tiling()
+        try:
+            z = pipe.vae.encode(inp).latent_dist.mode().float()
+        finally:
+            if hasattr(pipe.vae, "disable_tiling"):
+                pipe.vae.disable_tiling()
+        return z[:, :, :, : h_px // 8, : w_px // 8]
+
+    def encode_vae_batch(batch_tensors_cpu):
+        """Encode a same-resolution batch `[B,3,1,H,W]` on CUDA without tiling seams/bugs, falling back safely on OOM."""
+        if len(batch_tensors_cpu) > 1:
+            try:
+                stacked = torch.stack(batch_tensors_cpu, dim=0).to("cuda", dtype=torch.bfloat16, non_blocking=True)
+                z = pipe.vae.encode(stacked).latent_dist.mode().float()
+                lat = ((z - latents_mean) / latents_std)[:, :, 0].to(torch.bfloat16).cpu()
+                return [lat[i : i + 1].contiguous() for i in range(lat.shape[0])]
+            except (torch.cuda.OutOfMemoryError, RuntimeError):
+                torch.cuda.empty_cache()
+
+        results = []
+        for single_cpu in batch_tensors_cpu:
+            inp = single_cpu.unsqueeze(0).to("cuda", dtype=torch.bfloat16, non_blocking=True)
+            try:
+                z = pipe.vae.encode(inp).latent_dist.mode().float()
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                z = _safe_tiled_encode_single(inp)
+            lat = ((z - latents_mean) / latents_std)[:, :, 0].to(torch.bfloat16).cpu()
+            results.append(lat)
+        return results
+
+    def encode_prompt_batch(prompts_list):
+        """Encode a list of prompts in one batched call, falling back per-item if needed."""
+        if len(prompts_list) == 1:
+            e, m = pipe.encode_prompt(prompt=prompts_list[0], max_sequence_length=MAX_SEQ_LEN)
+            return [(e.cpu(), m.cpu())]
+        try:
+            e_b, m_b = pipe.encode_prompt(prompt=prompts_list, max_sequence_length=MAX_SEQ_LEN)
+            return [(e_b[i:i + 1].cpu(), m_b[i:i + 1].cpu()) for i in range(len(prompts_list))]
+        except Exception:
+            out = []
+            for p in prompts_list:
+                e, m = pipe.encode_prompt(prompt=p, max_sequence_length=MAX_SEQ_LEN)
+                out.append((e.cpu(), m.cpu()))
+            return out
 
     manifests = {out_dir: ({} if FORCE_RECACHE else load_manifest(out_dir))
                  for out_dir, _ in targets}
     reused = encoded = 0
 
+    # Scan dataset once to separate cached entries from pending ones before touching GPU.
+    pending_items = []
+    for idx, archivo in enumerate(archivos_img, 1):
+        nombre_base = os.path.splitext(archivo)[0]
+        ruta_texto  = os.path.join(DATASET_PATH, f"{nombre_base}.txt")
+        ruta_img    = os.path.join(DATASET_PATH, archivo)
+
+        prompt = ""
+        if os.path.exists(ruta_texto):
+            with open(ruta_texto, "r", encoding="utf-8") as f:
+                prompt = f.read().strip()
+        prompt = apply_trigger_word(prompt)
+
+        entry = dict(file_fingerprint(ruta_img))
+        entry["caption_sha1"] = caption_fingerprint(prompt)
+
+        def is_cached(out_dir):
+            previous = manifests[out_dir].get("entries", {}).get(nombre_base)
+            if previous is None:
+                return False
+            if {k: previous.get(k) for k in entry} != entry:
+                return False
+            names = [nombre_base] + ([f"{nombre_base}__flip"] if FLIP_X else [])
+            return all(os.path.exists(os.path.join(out_dir, f"{n}{suffix}"))
+                       for n in names for suffix in ("_latent.pt", "_embed.pt", "_mask.pt"))
+
+        pending = [(out_dir, area) for out_dir, area in targets if not is_cached(out_dir)]
+        if not pending:
+            reused += 1
+            print(f"[{idx}/{len(archivos_img)}] Up to date / Sin cambios: {archivo}")
+            for out_dir, _ in targets:
+                manifests[out_dir].setdefault("entries", {})[nombre_base] = entry
+            continue
+        pending_items.append((idx, archivo, nombre_base, ruta_img, prompt, entry, pending))
+
     with torch.inference_mode():
-        # El embed negativo es independiente de la resolución: se guarda en cada caché.
+        # ── Phase 1: Text Encoder on CUDA (VAE stays on CPU to fit comfortably in 12 GB VRAM) ──
+        print("\n--- Phase 1/2: Encoding prompts (Qwen3-VL-4B on CUDA) ---")
+        pipe.text_encoder.to("cuda")
+
         neg_embed, neg_mask = pipe.encode_prompt(prompt="", max_sequence_length=MAX_SEQ_LEN)
         for out_dir, _ in targets:
             torch.save(neg_embed.cpu(), os.path.join(out_dir, "_neg_embed.pt"))
             torch.save(neg_mask.cpu(),  os.path.join(out_dir, "_neg_mask.pt"))
         del neg_embed, neg_mask
 
-        # ── C5: prompts de preview ──────────────────────────────────────────
-        # El entrenador carga la pipeline con text_encoder=None y no puede
-        # codificar texto arbitrario, así que se pre-codifican aquí igual que el
-        # embed negativo. Coste cero de VRAM en el entrenamiento.
         for out_dir, _ in targets:
             for old in os.listdir(out_dir):
                 if old.startswith("_sample") and old.endswith((".pt", ".json")):
@@ -467,95 +570,115 @@ def preprocess_krea2():
             del s_emb, s_msk
             print(f"   [OK] Sample prompt {i} cached / cacheado: {text[:60]}")
 
-        for idx, archivo in enumerate(archivos_img, 1):
-            nombre_base = os.path.splitext(archivo)[0]
-            ruta_texto  = os.path.join(DATASET_PATH, f"{nombre_base}.txt")
-            ruta_img    = os.path.join(DATASET_PATH, archivo)
+        encoded_texts = {}
+        TEXT_BATCH_SIZE = 16
+        for start in range(0, len(pending_items), TEXT_BATCH_SIZE):
+            batch = pending_items[start:start + TEXT_BATCH_SIZE]
+            results = encode_prompt_batch([item[4] for item in batch])
+            for item, pair in zip(batch, results):
+                encoded_texts[item[2]] = pair
 
-            prompt = ""
-            if os.path.exists(ruta_texto):
-                with open(ruta_texto, "r", encoding="utf-8") as f:
-                    prompt = f.read().strip()
-            prompt = apply_trigger_word(prompt)
+        # Release Text Encoder VRAM before moving VAE to CUDA
+        pipe.text_encoder.to("cpu")
+        pipe.text_encoder = None
+        free_vram()
 
-            # ── D1: ¿se puede reutilizar lo ya cacheado? ────────────────────
-            entry = dict(file_fingerprint(ruta_img))
-            entry["caption_sha1"] = caption_fingerprint(prompt)
+        # ── Phase 2: Multithreaded CPU PIL/Lanczos prep (64 GB RAM) + Batched VAE on CUDA ──
+        # Tiling stays OFF by default here: Qwen3-VL has already been freed so all 12 GB VRAM
+        # are available (~1.5 GB needed for full 1024² encode), avoiding both tile-blending
+        # seams and diffusers' AutoencoderKLQwenImage.tiled_encode remainder-tile crash on
+        # dimensions like 784 or 1168 (192*k + 16 -> 16px sliver -> 2px < 3x3 conv kernel).
+        print("\n--- Phase 2/2: Encoding image latents (Parallel RAM Decode + Batched VAE on CUDA) ---")
+        pipe.vae.to("cuda")
+        if hasattr(pipe.vae, "disable_tiling"):
+            pipe.vae.disable_tiling()
+        if hasattr(pipe.vae, "enable_slicing"):
+            pipe.vae.enable_slicing()
 
-            def is_cached(out_dir):
-                previous = manifests[out_dir].get("entries", {}).get(nombre_base)
-                if previous is None:
-                    return False
-                if {k: previous.get(k) for k in entry} != entry:
-                    return False
-                names = [nombre_base] + ([f"{nombre_base}__flip"] if FLIP_X else [])
-                return all(os.path.exists(os.path.join(out_dir, f"{n}{suffix}"))
-                           for n in names for suffix in ("_latent.pt", "_embed.pt", "_mask.pt"))
-
-            pending = [(out_dir, area) for out_dir, area in targets if not is_cached(out_dir)]
-            if not pending:
-                reused += 1
-                print(f"[{idx}/{len(archivos_img)}] Up to date / Sin cambios: {archivo}")
-                for out_dir, _ in targets:
-                    manifests[out_dir].setdefault("entries", {})[nombre_base] = entry
-                continue
-
-            print(f"[{idx}/{len(archivos_img)}] Processing / Procesando: {archivo}")
+        def _decode_item_cpu(item_tuple):
+            idx, archivo, nombre_base, ruta_img, _prompt, entry, pending = item_tuple
             try:
-                img = Image.open(ruta_img).convert("RGB")
+                with Image.open(ruta_img) as raw_im:
+                    img = raw_im.convert("RGB")
             except Exception as err:
-                print(f"[!] Warning: Cannot open image / No se pudo abrir la imagen '{archivo}': {err}")
-                continue
+                return (idx, archivo, nombre_base, entry, None, err)
 
-            # ── 1. TEXTO → EMBEDDINGS (independiente de la resolución) ──────
-            embeds, mask = pipe.encode_prompt(prompt=prompt, max_sequence_length=MAX_SEQ_LEN)
-            embeds_cpu, mask_cpu = embeds.cpu(), mask.cpu()
-            del embeds, mask
-
-            # ── 2. IMAGEN → LATENTES (VAE), una vez por resolución ──────────
-            # D2: el espejado se cachea como una entrada más (`nombre__flip`). El
-            # entrenador la recoge en su escaneo de directorio sin cambio alguno,
-            # y el sampler por épocas garantiza que se vean original y espejo.
             variants = [("", img)]
             if FLIP_X:
                 variants.append(("__flip", img.transpose(Image.FLIP_LEFT_RIGHT)))
 
-            sizes = []
-            # embeds_cpu y mask_cpu se calculan una vez por imagen y no dependen
-            # de la resolución: el mismo fichero se escribía idéntico en cada
-            # subdir (~7.6 MB por imagen y resolución). Se escribe una vez y las
-            # demás resoluciones se enlazan al mismo inodo. El trainer no se
-            # entera: torch.load abre un hardlink igual que cualquier fichero.
-            #
-            # La clave incluye el sufijo a propósito, aunque el tensor de la
-            # variante __flip sea el mismo objeto: torch.save incrusta el nombre
-            # del fichero como prefijo dentro del zip ('an_12_embed/data.pkl'),
-            # así que enlazar entre nombres distintos daría el mismo tensor pero
-            # NO los mismos bytes que escribía el código anterior. Enlazando sólo
-            # entre resoluciones —donde el nombre base coincide— la caché queda
-            # byte a byte igual que antes.
-            first_written = {}
+            prepared = []
+            sizes_seen = []
             for out_dir, area in pending:
+                bw_last = bh_last = 0
                 for suffix, variant in variants:
-                    bw, bh, latent = vae_latent(variant, area)
-                    name = f"{nombre_base}{suffix}"
-                    save_tensor(latent, os.path.join(out_dir, f"{name}_latent.pt"))
-                    for kind, tensor in (("embed", embeds_cpu), ("mask", mask_cpu)):
-                        dest = os.path.join(out_dir, f"{name}_{kind}.pt")
-                        source = first_written.get((suffix, kind))
-                        if source is None:
-                            save_tensor(tensor, dest)
-                            first_written[(suffix, kind)] = dest
-                        else:
-                            link_or_copy(source, dest, tensor)
-                sizes.append(f"{bw}x{bh}")
+                    bw_last, bh_last, tensor_cpu = prepare_image_tensor_cpu(variant, area)
+                    prepared.append((out_dir, suffix, bw_last, bh_last, tensor_cpu))
+                sizes_seen.append(f"{bw_last}x{bh_last}")
+            return (idx, archivo, nombre_base, entry, (prepared, sizes_seen), None)
 
-            for out_dir, _ in targets:
-                manifests[out_dir].setdefault("entries", {})[nombre_base] = entry
-            encoded += 1
-            flip_note = " (+flip)" if FLIP_X else ""
-            print(f"   [OK] {' · '.join(sizes)}{flip_note} | Latents & Embeddings cached "
-                  f"/ Latentes y embeddings cacheados.")
+        cpu_workers = min(8, max(1, os.cpu_count() or 4))
+        io_workers = min(4, max(1, (os.cpu_count() or 4) // 2))
+        PREFETCH_WINDOW = 16
+
+        with ThreadPoolExecutor(max_workers=cpu_workers) as decode_pool, \
+             ThreadPoolExecutor(max_workers=io_workers) as io_pool:
+            io_futures = []
+            for win_start in range(0, len(pending_items), PREFETCH_WINDOW):
+                window = pending_items[win_start : win_start + PREFETCH_WINDOW]
+                decoded_window = list(decode_pool.map(_decode_item_cpu, window))
+
+                # Group prepared tensors by (bw, bh) across the window for batched GPU VAE execution
+                by_size = defaultdict(list)
+                valid_records = []
+                for idx, archivo, nombre_base, entry, payload, err in decoded_window:
+                    if err is not None or payload is None:
+                        print(f"[!] Warning: Cannot open image / No se pudo abrir la imagen '{archivo}': {err}")
+                        encoded_texts.pop(nombre_base, None)
+                        continue
+                    prepared, sizes_seen = payload
+                    embeds_cpu, mask_cpu = encoded_texts.pop(nombre_base)
+                    rec_idx = len(valid_records)
+                    valid_records.append((idx, archivo, nombre_base, entry, sizes_seen, embeds_cpu, mask_cpu, []))
+                    for out_dir, suffix, bw, bh, tensor_cpu in prepared:
+                        by_size[(bw, bh)].append((rec_idx, out_dir, suffix, tensor_cpu))
+
+                for (bw, bh), bucket_tasks in by_size.items():
+                    vae_bs = 4 if (bw * bh) <= (768 * 768) else 2
+                    for b_start in range(0, len(bucket_tasks), vae_bs):
+                        sub = bucket_tasks[b_start : b_start + vae_bs]
+                        latents_out = encode_vae_batch([t[3] for t in sub])
+                        for (rec_idx, out_dir, suffix, _t_cpu), lat_cpu in zip(sub, latents_out):
+                            valid_records[rec_idx][7].append((out_dir, suffix, lat_cpu))
+
+                def _write_record_files(nombre_base_w, embeds_w, mask_w, encoded_list):
+                    first_written = {}
+                    for out_dir_w, suffix_w, latent_w in encoded_list:
+                        name_w = f"{nombre_base_w}{suffix_w}"
+                        save_tensor(latent_w, os.path.join(out_dir_w, f"{name_w}_latent.pt"))
+                        for kind, tensor in (("embed", embeds_w), ("mask", mask_w)):
+                            dest = os.path.join(out_dir_w, f"{name_w}_{kind}.pt")
+                            source = first_written.get((suffix_w, kind))
+                            if source is None:
+                                save_tensor(tensor, dest)
+                                first_written[(suffix_w, kind)] = dest
+                            else:
+                                link_or_copy(source, dest, tensor)
+
+                for idx, archivo, nombre_base, entry, sizes_seen, embeds_cpu, mask_cpu, enc_list in valid_records:
+                    print(f"[{idx}/{len(archivos_img)}] Processing / Procesando: {archivo}")
+                    io_futures.append(
+                        io_pool.submit(_write_record_files, nombre_base, embeds_cpu, mask_cpu, enc_list)
+                    )
+                    for out_dir, _ in targets:
+                        manifests[out_dir].setdefault("entries", {})[nombre_base] = entry
+                    encoded += 1
+                    flip_note = " (+flip)" if FLIP_X else ""
+                    print(f"   [OK] {' · '.join(sizes_seen)}{flip_note} | Latents & Embeddings cached "
+                          f"/ Latentes y embeddings cacheados.")
+
+            for fut in io_futures:
+                fut.result()
 
     # El manifiesto se reconstruye a partir de las imágenes realmente presentes:
     # arrastrar las entradas antiguas haría que una imagen borrada o renombrada

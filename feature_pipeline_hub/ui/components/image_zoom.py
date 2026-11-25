@@ -99,6 +99,20 @@ def render_dialog(image_path: str, sample: DatasetSample | None = None, run_id: 
 
     state.render_original_image(image_path, actual_size=actual_size)
 
+    if sample is not None:
+        open_v = st.session_state.get(f"zoom_open_v_{run_id}_{sample.sample_id}", 0)
+        modal_caption_key = f"zoom_caption_{run_id}_{sample.sample_id}_v{open_v}"
+        st.text_area(
+            "Caption",
+            value=sample.caption,
+            key=modal_caption_key,
+            height=96,
+            on_change=state.persist_modal_caption,
+            args=(sample, modal_caption_key),
+            help="Edita el caption mientras ves la imagen en grande. Se guarda automáticamente al salir del campo, pulsar Ctrl/Cmd+Enter o cerrar la ventana.",
+        )
+        st.caption("Los cambios en el texto se guardan automáticamente al cerrar la ventana o salir del campo.")
+
 
 def _render_rotation_controls(sample: DatasetSample, run_id: str) -> str:
     """Left/right quarter-turn buttons. Returns the path to show after any rotation.
@@ -151,4 +165,7 @@ def clickable_thumbnail(
     with st.container(key=f"zoomframe_{key}", width="content" if hugs_image else "stretch"):
         state.render_thumbnail(image_path, **thumbnail_kwargs)
         if st.button("", key=f"zoomhit_{key}", help="Ver en tamaño grande"):
+            if sample is not None:
+                v_key = f"zoom_open_v_{run_id}_{sample.sample_id}"
+                st.session_state[v_key] = st.session_state.get(v_key, 0) + 1
             render_dialog(image_path, sample, run_id)

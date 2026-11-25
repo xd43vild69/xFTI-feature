@@ -7,6 +7,8 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Iterator
 
 import bitsandbytes as bnb
@@ -20,6 +22,12 @@ try:
 except Exception:
     _save_on_cpu_ctx = None
     SAVE_ON_CPU_AVAILABLE = False
+
+try:
+    _dynamo_disable = torch._dynamo.disable
+except Exception:
+    def _dynamo_disable(fn: Any = None, **_kwargs: Any) -> Any:  # type: ignore[misc]
+        return fn if fn is not None else (lambda f: f)
 
 
 def get_parent_module(root: torch.nn.Module, target_name: str) -> tuple[torch.nn.Module, str]:
@@ -59,53 +67,59 @@ def load_nf4_cache_(transformer: torch.nn.Module, cache_dir: str) -> torch.nn.Mo
 
     replaced = 0
 
+    def _read_quant_cpu(filepath: str, info: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor | None, dict[str, torch.Tensor]]:
+        with safe_open(filepath, framework="pt", device="cpu") as f:
+            weight_data = f.get_tensor("weight")
+            bias_data = f.get_tensor("bias") if info.get("bias", False) else None
+            packed_qs = {
+                key[len("quant_state."):]: f.get_tensor(key)
+                for key in f.keys()
+                if key.startswith("quant_state.")
+            }
+        return weight_data, bias_data, packed_qs
+
+    quant_jobs: list[tuple[str, str, dict[str, Any]]] = []
     for name, info in quantized.items():
         filepath = resolve_weight_path(cache_dir, info["file"])
         if not os.path.exists(filepath):
             raise FileNotFoundError(f"No existe peso NF4: {filepath}")
+        quant_jobs.append((name, filepath, info))
 
-        parent, child_name = get_parent_module(transformer, name)
+    max_workers = min(8, max(1, len(quant_jobs)), max(1, os.cpu_count() or 4))
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = [
+            (name, info, pool.submit(_read_quant_cpu, filepath, info))
+            for name, filepath, info in quant_jobs
+        ]
+        for name, info, fut in futures:
+            weight_data, bias_data, packed_qs = fut.result()
+            parent, child_name = get_parent_module(transformer, name)
 
-        with safe_open(filepath, framework="pt", device="cpu") as f:
-            weight_data = f.get_tensor("weight")
-
-            bias_data = None
-            if info.get("bias", False):
-                bias_data = f.get_tensor("bias")
-
-            qs_dict = {}
-            for key in f.keys():
-                if key.startswith("quant_state."):
-                    qs_dict[key[len("quant_state."):]] = f.get_tensor(key)
-
-            packed_qs = {k: v for k, v in qs_dict.items()}
-
-        new_layer = Linear4bit(
-            int(info["in_features"]),
-            int(info["out_features"]),
-            bias=info.get("bias", False),
-            quant_type="nf4",
-            compute_dtype=torch.bfloat16,
-        )
-
-        new_weight = Params4bit.from_prequantized(
-            data=weight_data,
-            quantized_stats=packed_qs,
-            requires_grad=False,
-            device="cuda",
-            module=new_layer,
-        )
-
-        new_layer.weight = new_weight
-
-        if bias_data is not None:
-            new_layer.bias = torch.nn.Parameter(
-                bias_data.to("cuda", dtype=torch.bfloat16),
-                requires_grad=False,
+            new_layer = Linear4bit(
+                int(info["in_features"]),
+                int(info["out_features"]),
+                bias=info.get("bias", False),
+                quant_type="nf4",
+                compute_dtype=torch.bfloat16,
             )
 
-        setattr(parent, child_name, new_layer)
-        replaced += 1
+            new_weight = Params4bit.from_prequantized(
+                data=weight_data,
+                quantized_stats=packed_qs,
+                requires_grad=False,
+                device="cuda",
+                module=new_layer,
+            )
+            new_layer.weight = new_weight
+
+            if bias_data is not None:
+                new_layer.bias = torch.nn.Parameter(
+                    bias_data.to(dtype=torch.bfloat16).pin_memory().to("cuda", non_blocking=True),
+                    requires_grad=False,
+                )
+
+            setattr(parent, child_name, new_layer)
+            replaced += 1
 
     for name, info in unquantized.items():
         filepath = resolve_weight_path(cache_dir, info["file"])

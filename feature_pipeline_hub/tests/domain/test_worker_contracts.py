@@ -43,21 +43,31 @@ VALID_TRAIN = {
     "optimizer": "adamw8bit",
     "optimizer_betas": [0.9, 0.999],
     "optimizer_eps": 1e-8,
+    "loraplus_lr_ratio": 4.0,
+    "timestep_sampling": "sigmoid",
     "timestep_weighting": "none",
     "content_or_style": "balanced",
     "noise_offset": 0.0,
     "caption_dropout_rate": 0.05,
+    "dop_weight": 0.25,
     "use_ema": False,
     "ema_decay": 0.99,
     "ema_device": "cuda",
     "gradient_checkpointing": True,
     "gradient_checkpointing_interval": 1,
+    "activation_offload": True,
     "compile_transformer": False,
 }
 
 
 def test_train_settings_accept_the_keys_the_worker_reads():
     assert TrainSettings(**VALID_TRAIN).model_dump() == VALID_TRAIN
+
+
+def test_train_settings_accept_modern_optimizers():
+    for opt in ("adamw8bit", "adamw_fused", "muon", "adamw8bit_paged", "adamw"):
+        parsed = TrainSettings(**(VALID_TRAIN | {"optimizer": opt}))
+        assert parsed.optimizer == opt
 
 
 def test_an_unknown_key_is_rejected_instead_of_silently_ignored():

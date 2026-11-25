@@ -113,6 +113,11 @@ def test_enum_values_are_normalized(tmp_path: Path) -> None:
     assert cfg.sampler == "epoch"
 
 
+def test_muon_and_fused_optimizers_are_valid_choices(tmp_path: Path) -> None:
+    assert build(tmp_path, settings={"optimizer": "muon"}).optimizer == "muon"
+    assert build(tmp_path, settings={"optimizer": "adamw_fused"}).optimizer == "adamw_fused"
+
+
 # ── warmup unit conversion ──────────────────────────────────────────────────
 
 @pytest.mark.parametrize("units,warmup,expected", [

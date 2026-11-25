@@ -54,6 +54,7 @@ DEFAULTS: dict[str, Any] = {
     "init_lora_from": "",
     "gradient_checkpointing": True,
     "gradient_checkpointing_interval": 1,  # 1 = every block, 2 = every 2nd block, etc.
+    "activation_offload": False,
     "compile_transformer": False,
 
     # ── A1/A10: precision ────────────────────────────────────────────────────
@@ -78,6 +79,7 @@ DEFAULTS: dict[str, Any] = {
     "optimizer": "adamw8bit_paged",    # | "adamw8bit" | "adamw"
     "optimizer_eps": 1e-8,
     "optimizer_betas": [0.9, 0.999],
+    "loraplus_lr_ratio": 1.0,          # >1.0 scales lora_B LR (LoRA+, e.g. 4.0)
 
     # ── B1: timesteps ────────────────────────────────────────────────────────
     "timestep_weighting": "none",      # "none" | "bell" | "half_bell"
@@ -118,8 +120,9 @@ DEFAULTS: dict[str, Any] = {
     "preview_source": "caption",       # "caption" | "prompts"
     "preview_walk_seed": False,
 
-    # ── D3: caption dropout ──────────────────────────────────────────────────
+    # ── D3: caption dropout & DOP ────────────────────────────────────────────
     "caption_dropout_rate": 0.0,
+    "dop_weight": 0.0,                 # Differential Output Preservation (0.0 = off)
 
     # ── Dataset curation ─────────────────────────────────────────────────────
     # 0_curate_dataset.py splits the dataset into two groups by facial identity;
@@ -145,8 +148,9 @@ PRESETS: dict[str, dict[str, Any]] = {
         "sampler": "epoch",
         "lora_dtype": "fp32",
         "optimizer": "adamw8bit",
-        "optimizer_eps": 1e-6,
-        "optimizer_betas": [0.9, 0.99],
+        "optimizer_eps": 1e-8,
+        "optimizer_betas": [0.9, 0.999],
+        "loraplus_lr_ratio": 4.0,
         "high_precision_targets": True,
         "ema_device": "cuda",
         "loss_display": "window",
@@ -164,7 +168,7 @@ CHOICES: dict[str, tuple[tuple[str, ...], str]] = {
     "sampler": (("epoch", "legacy"), "legacy"),
     "resume_on_corrupt": (("abort", "restart"), "abort"),
     "warmup_units": (("updates", "micro_steps", "ratio"), "updates"),
-    "optimizer": (("adamw8bit_paged", "adamw8bit", "adamw", "adamw_fused"), "adamw8bit_paged"),
+    "optimizer": (("adamw8bit_paged", "adamw8bit", "adamw", "adamw_fused", "muon"), "adamw8bit_paged"),
     "timestep_weighting": (("none", "bell", "half_bell"), "none"),
     "content_or_style": (("balanced", "content", "style"), "balanced"),
     "ema_device": (("cpu", "cuda"), "cpu"),
@@ -215,6 +219,7 @@ class TrainConfig:
     init_lora_from: str
     gradient_checkpointing: bool
     gradient_checkpointing_interval: int
+    activation_offload: bool
     compile_transformer: bool
 
     lora_dtype: str
@@ -232,6 +237,7 @@ class TrainConfig:
     optimizer: str
     optimizer_eps: float
     optimizer_betas: tuple[float, ...]
+    loraplus_lr_ratio: float
 
     timestep_weighting: str
     logit_normal_mu: float
@@ -266,6 +272,7 @@ class TrainConfig:
     preview_source: str
     preview_walk_seed: bool
     caption_dropout_rate: float
+    dop_weight: float
 
     dataset_path: str
     curation_weights: bool
@@ -515,6 +522,7 @@ def load_config(
         init_lora_from=init_lora_from,
         gradient_checkpointing=bool(r.get("gradient_checkpointing")),
         gradient_checkpointing_interval=max(1, int(r.get("gradient_checkpointing_interval"))),
+        activation_offload=bool(r.get("activation_offload")),
         compile_transformer=bool(r.get("compile_transformer")),
 
         lora_dtype=r.choice("lora_dtype"),
@@ -532,6 +540,7 @@ def load_config(
         optimizer=r.choice("optimizer"),
         optimizer_eps=float(r.get("optimizer_eps")),
         optimizer_betas=tuple(float(b) for b in r.get("optimizer_betas")),
+        loraplus_lr_ratio=max(1.0, float(r.get("loraplus_lr_ratio"))),
 
         timestep_weighting=r.choice("timestep_weighting"),
         logit_normal_mu=float(r.get("logit_normal_mu")),
@@ -566,6 +575,7 @@ def load_config(
         preview_source=r.choice("preview_source"),
         preview_walk_seed=bool(r.get("preview_walk_seed")),
         caption_dropout_rate=float(r.get("caption_dropout_rate")),
+        dop_weight=max(0.0, float(r.get("dop_weight"))),
 
         dataset_path=from_root(project_root, str(r.get("dataset_path")).strip()),
         curation_weights=bool(r.get("curation_weights")),

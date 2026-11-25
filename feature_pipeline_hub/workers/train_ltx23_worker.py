@@ -172,7 +172,9 @@ def main() -> None:
 
     train_log = TrainLog(cfg.output_dir)
     running_loss = 0.0
+    counted_steps = 0
     avg_step_sec = 0.0
+    window_losses_gpu: list[torch.Tensor] = []
 
     print()
     print(f"ARRANCANDO ENTRENAMIENTO LTX 2.3 ({len(dataset)} entradas cacheadas)...")
@@ -318,14 +320,19 @@ def main() -> None:
 
             scaled_loss = loss / cfg.grad_accum_steps
             scaled_loss.backward()
-
-            step_loss = loss.item()
-            running_loss += step_loss
+            window_losses_gpu.append(loss.detach())
 
             grad_norm = 0.0
             current_lr = lr_at(step)
 
-            if step % cfg.grad_accum_steps == 0:
+            if len(window_losses_gpu) >= cfg.grad_accum_steps:
+                window_vals = torch.stack(window_losses_gpu).tolist()
+                window_losses_gpu.clear()
+                for v in window_vals:
+                    running_loss += v
+                    counted_steps += 1
+                step_loss = sum(window_vals) / len(window_vals)
+
                 grad_norm = float(torch.nn.utils.clip_grad_norm_(trainable, cfg.max_grad_norm).item())
                 for group in optimizer.param_groups:
                     group["lr"] = current_lr
@@ -336,7 +343,7 @@ def main() -> None:
                     step=step,
                     update=step // cfg.grad_accum_steps,
                     loss=step_loss,
-                    loss_avg=running_loss / max(1, step - start_step),
+                    loss_avg=running_loss / max(1, counted_steps),
                     grad_norm=grad_norm,
                     lr=current_lr,
                     secs=time.time() - t0,
@@ -349,7 +356,7 @@ def main() -> None:
             line = format_progress(
                 step=step,
                 total_steps=cfg.total_steps,
-                avg_loss=running_loss / max(1, step - start_step),
+                avg_loss=running_loss / max(1, counted_steps),
                 grad_norm=grad_norm,
                 lr=current_lr,
                 seconds_per_step=avg_step_sec,
@@ -358,6 +365,19 @@ def main() -> None:
 
             if cfg.save_every > 0 and step % cfg.save_every == 0:
                 ckpt_mgr.save(model, optimizer, step, reason="periodic")
+
+        if window_losses_gpu:
+            for v in torch.stack(window_losses_gpu).tolist():
+                running_loss += v
+                counted_steps += 1
+            window_losses_gpu.clear()
+            gnorm = torch.nn.utils.clip_grad_norm_(trainable, cfg.max_grad_norm)
+            if torch.isfinite(gnorm):
+                final_lr = lr_at(cfg.total_steps)
+                for group in optimizer.param_groups:
+                    group["lr"] = final_lr
+                optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
 
         # Final Save
         print("\nGuardando checkpoint final...")

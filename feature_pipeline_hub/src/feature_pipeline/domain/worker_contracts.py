@@ -30,6 +30,8 @@ class PrecacheSettings(_StrictSettings):
     dataset_path: str
     cache_dir: str
     trigger_word: str = ""
+    target_area: int = 1024 * 1024
+    max_seq_len: int = 256
     prune_orphans: Literal["warn", "delete", "off"] = "delete"
 
 
@@ -63,12 +65,12 @@ class TrainSettings(_StrictSettings):
     lr: float = Field(gt=0)
     lora_rank: int = Field(gt=0)
     lora_alpha: int = Field(gt=0)
-    batch_size: int = Field(gt=0)
-    grad_accum_steps: int = Field(gt=0)
-    save_every: int = Field(gt=0)
-    seed: int = Field(ge=0)
-    warmup_steps: int = Field(default=100, ge=0)
-    warmup_units: Literal["updates", "micro_steps", "ratio"] = "updates"
+    batch_size: int = Field(default=1, gt=0)
+    grad_accum_steps: int = Field(default=2, gt=0)
+    save_every: int = Field(default=250, gt=0)
+    seed: int = Field(default=42, ge=0)
+    warmup_steps: int = Field(default=60, ge=0)
+    warmup_units: Literal["updates", "micro_steps", "ratio"] = "micro_steps"
     lr_scheduler: Literal["cosine", "constant", "linear", "cosine_with_restarts", "step"] = "cosine"
     lr_num_cycles: int = Field(default=3, gt=0)
     min_lr_ratio: float = Field(default=0.1, ge=0.0, le=1.0)
@@ -76,18 +78,22 @@ class TrainSettings(_StrictSettings):
     lora_dtype: Literal["bf16", "fp32"] = "fp32"
     high_precision_targets: bool = True
     lora_target: Literal["all", "attn", "attn+ff"] = "all"
-    optimizer: Literal["adamw8bit_paged", "adamw8bit", "adamw", "adamw_fused"] = "adamw8bit"
-    optimizer_betas: list[float] = Field(default_factory=lambda: [0.9, 0.99])
-    optimizer_eps: float = Field(default=1e-6, gt=0.0)
+    optimizer: Literal["adamw8bit_paged", "adamw8bit", "adamw", "adamw_fused", "muon"] = "adamw8bit_paged"
+    optimizer_betas: list[float] = Field(default_factory=lambda: [0.9, 0.999])
+    optimizer_eps: float = Field(default=1e-8, gt=0.0)
+    loraplus_lr_ratio: float = Field(default=2.0, ge=1.0, le=32.0)
+    timestep_sampling: Literal["sigmoid", "krea2_shift", "logit_normal"] = "sigmoid"
     timestep_weighting: Literal["none", "bell", "half_bell"] = "none"
     content_or_style: Literal["balanced", "content", "style"] = "balanced"
     noise_offset: float = Field(default=0.0, ge=0.0)
     caption_dropout_rate: float = Field(default=0.05, ge=0.0, le=1.0)
+    dop_weight: float = Field(default=0.0, ge=0.0, le=2.0)
     use_ema: bool = False
-    ema_decay: float = Field(default=0.99, gt=0.0, lt=1.0)
-    ema_device: Literal["cpu", "cuda"] = "cuda"
+    ema_decay: float = Field(default=0.98, gt=0.0, lt=1.0)
+    ema_device: Literal["cpu", "cuda"] = "cpu"
     gradient_checkpointing: bool = True
     gradient_checkpointing_interval: int = Field(default=1, ge=1, le=28)
+    activation_offload: bool = True
     compile_transformer: bool = False
 
 

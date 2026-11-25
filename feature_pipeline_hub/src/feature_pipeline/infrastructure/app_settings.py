@@ -146,9 +146,9 @@ def resolve_training_runtime_dir() -> Path:
     if settings.training_runtime_dir and Path(settings.training_runtime_dir).is_dir():
         return Path(settings.training_runtime_dir)
 
-    env_override = os.environ.get("FTI_TRAINING_RUNTIME_DIR")
-    if env_override and Path(env_override).is_dir():
-        return Path(env_override)
+    env_override = os.environ.get("FTI_TRAINING_RUNTIME_DIR", "").strip()
+    if env_override:
+        return Path(env_override).expanduser()
 
     default_base = Path(__file__).resolve().parents[3] / "training_runtime"
     default_base.mkdir(parents=True, exist_ok=True)

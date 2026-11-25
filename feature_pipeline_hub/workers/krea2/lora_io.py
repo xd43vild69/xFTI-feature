@@ -33,6 +33,13 @@ def lora_b_norm(model: torch.nn.Module) -> float:
     return total ** 0.5
 
 
+def mean_lora_b_norm(model: torch.nn.Module) -> float:
+    """Per-matrix mean L2 norm of all `lora_B` tensors (benchmark health indicator)."""
+    norms = [p.detach().float().norm().item()
+             for name, p in model.named_parameters() if "lora_B" in name]
+    return sum(norms) / len(norms) if norms else 0.0
+
+
 def load_lora_weights(model: torch.nn.Module, blob: bytes, src: str,
                       log: Logger = print) -> float:
     """Load LoRA weights into the adapter and verify the load actually took effect.
@@ -194,21 +201,57 @@ def fingerprint(cfg: TrainConfig) -> str:
 
 def build_optimizer(name: str, params: list[torch.nn.Parameter], lr: float,
                     betas: tuple[float, ...], eps: float,
-                    weight_decay: float) -> Any:
+                    weight_decay: float,
+                    *,
+                    named_params: list[tuple[str, torch.nn.Parameter]] | None = None,
+                    loraplus_lr_ratio: float = 1.0) -> Any:
     """Construct the optimizer named by `name`.
 
     The paged variant spills optimizer state to RAM under VRAM pressure instead of
     dying with an OOM at the peaks of the high-resolution phases; `adamw8bit` keeps
     8-bit state directly in VRAM without unified-memory paging overhead, and
     `adamw_fused` runs a single fused CUDA kernel when fp32 optimizer state fits.
+    When `loraplus_lr_ratio > 1.0` and `named_params` is provided, `lora_B` weights
+    receive `lr * loraplus_lr_ratio` (LoRA+ differential learning rate).
     """
     import bitsandbytes as bnb
 
+    param_groups: Any = params
+    if loraplus_lr_ratio > 1.0 and named_params:
+        group_a = [p for n, p in named_params if "lora_B" not in n]
+        group_b = [p for n, p in named_params if "lora_B" in n]
+        groups: list[dict[str, Any]] = []
+        if group_a:
+            groups.append({"params": group_a, "lr": lr, "lr_scale": 1.0})
+        if group_b:
+            groups.append({"params": group_b, "lr": lr * loraplus_lr_ratio, "lr_scale": loraplus_lr_ratio})
+        if groups:
+            param_groups = groups
+
     kwargs: dict[str, Any] = {"lr": lr, "betas": betas, "eps": eps, "weight_decay": weight_decay}
+    if name == "muon":
+        muon_cls = getattr(torch.optim, "Muon", None)
+        if muon_cls is not None:
+            import inspect
+
+            muon_sig = inspect.signature(muon_cls)
+            # Muon operates strictly on 2D matrices (which all standard lora_A/lora_B are).
+            # Any non-2D parameters (e.g. future 1D magnitude vectors) fall back to AdamW8bit
+            # or Muon's hybrid mode when supported.
+            all_2d = all(p.ndim == 2 for p in params)
+            if all_2d:
+                muon_kwargs: dict[str, Any] = {"lr": lr, "weight_decay": weight_decay}
+                if "momentum" in muon_sig.parameters and betas:
+                    muon_kwargs["momentum"] = float(betas[0])
+                if "adjust_lr_fn" in muon_sig.parameters:
+                    muon_kwargs["adjust_lr_fn"] = "match_rms_adamw"
+                return muon_cls(param_groups, **muon_kwargs)
+        print("[!] torch.optim.Muon unavailable (requires PyTorch >= 2.9 and 2D params); falling back to AdamW8bit.")
+        return bnb.optim.AdamW8bit(param_groups, **kwargs)
     if name == "adamw_fused":
-        return torch.optim.AdamW(params, fused=torch.cuda.is_available(), **kwargs)
+        return torch.optim.AdamW(param_groups, fused=torch.cuda.is_available(), **kwargs)
     if name == "adamw":
-        return torch.optim.AdamW(params, **kwargs)
+        return torch.optim.AdamW(param_groups, foreach=torch.cuda.is_available(), **kwargs)
     if name == "adamw8bit":
-        return bnb.optim.AdamW8bit(params, **kwargs)
-    return bnb.optim.PagedAdamW8bit(params, **kwargs)
+        return bnb.optim.AdamW8bit(param_groups, **kwargs)
+    return bnb.optim.PagedAdamW8bit(param_groups, **kwargs)

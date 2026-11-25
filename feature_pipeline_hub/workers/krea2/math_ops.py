@@ -55,8 +55,16 @@ def sample_sigma(
     `content_or_style` skews the underlying uniform before the shift is applied
     (arXiv 2302.08453 §3.4): `content` (u³) concentrates on low sigma — fine detail and
     likeness — while `style` (1−u³) concentrates on high sigma — composition and color.
-    Neither applies under `logit_normal` sampling, which draws its own distribution.
+    Neither applies under `logit_normal` or `sigmoid` sampling, which draw their own
+    distribution. `sigmoid` omits `calculate_shift` (matching ai-toolkit) so 1024×1024
+    stays centered around sigma 0.50 rather than shifting up to ~0.70.
     """
+    if sampling == "sigmoid":
+        sigma = torch.sigmoid(logit_normal_mu + logit_normal_sigma
+                              * torch.randn(batch_size, device=device))
+        lo = max(1e-4, sigma_min) if sigma_min > 0.0 else 1e-4
+        hi = min(1.0 - 1e-4, sigma_max) if sigma_max < 1.0 else 1.0 - 1e-4
+        return sigma.clamp(lo, hi)
     if sampling == "logit_normal":
         u = torch.sigmoid(logit_normal_mu + logit_normal_sigma
                           * torch.randn(batch_size, device=device))

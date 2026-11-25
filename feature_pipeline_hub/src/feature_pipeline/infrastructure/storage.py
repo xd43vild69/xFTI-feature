@@ -99,20 +99,30 @@ def _pair_uploads(uploaded_files: list) -> tuple[list[tuple], list]:
 
     Mirrors how ingestion looks up a caption: by stem, next to the image. A .txt
     with no image of that stem in the same batch has nothing to attach to, so it's
-    kept aside and written under its own name rather than silently dropped.
+    kept aside and written under its own name rather than silently dropped. Multiple
+    images sharing a stem (e.g. `photo.png` and `photo.jpg` dropped together) are all
+    preserved in upload order rather than overwriting each other.
     """
-    images: dict[str, object] = {}
+    images: list[tuple[str, object]] = []
     captions: dict[str, object] = {}
 
     for uploaded_file in uploaded_files:
         path = Path(uploaded_file.name)
         if path.suffix.lower() in IMAGE_EXTENSIONS:
-            images[path.stem] = uploaded_file
+            images.append((path.stem, uploaded_file))
         elif path.suffix.lower() == ".txt":
             captions[path.stem] = uploaded_file
 
-    pairs = [(image, captions.pop(stem, None)) for stem, image in images.items()]
-    return pairs, list(captions.values())
+    used_stems: set[str] = set()
+    pairs: list[tuple[object, object | None]] = []
+    for stem, image in images:
+        caption = captions.get(stem)
+        if caption is not None:
+            used_stems.add(stem)
+        pairs.append((image, caption))
+
+    orphan_captions = [cap for stem, cap in captions.items() if stem not in used_stems]
+    return pairs, orphan_captions
 
 
 def _write_standardized(

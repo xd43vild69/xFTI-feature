@@ -120,7 +120,13 @@ def append_images(run: IngestionRun, uploaded_files: list) -> list[DatasetSample
     their count, so it still lands on a free number for a run started before this
     naming scheme, or one that mixes standardized and non-standardized names.
     """
-    existing_stems = [Path(s.image_path).stem for s in run.concept.samples]
+    existing_stems = list(
+        {
+            stem
+            for s in run.concept.samples
+            for stem in (Path(s.image_path).stem, Path(s.origin_path).stem)
+        }
+    )
     start_index = next_standard_index(existing_stems, run.concept.concept_name)
 
     written = append_uploaded_files(
@@ -318,6 +324,15 @@ def caption_widget_key(run_id: str, sample_id: str) -> str:
 def persist_caption(sample_id: str, widget_key: str) -> None:
     """on_change callback: store whatever the user typed into a caption editor."""
     save_caption(sample_id, st.session_state[widget_key])
+
+
+def persist_modal_caption(sample: DatasetSample, widget_key: str) -> None:
+    """on_change callback for the zoom modal: save caption and sync the gallery card."""
+    new_caption = st.session_state[widget_key]
+    save_caption(sample.sample_id, new_caption)
+    sample.caption = new_caption
+    versions = st.session_state.setdefault(CAPTION_VERSIONS_KEY, {})
+    versions[sample.sample_id] = versions.get(sample.sample_id, 0) + 1
 
 
 def persist_description(sample_id: str, widget_key: str, trigger_word: str) -> None:

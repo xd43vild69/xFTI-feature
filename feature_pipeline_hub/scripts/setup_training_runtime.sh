@@ -45,22 +45,31 @@ if [[ ! -x "$RUNTIME_DIR/venv/bin/python" ]]; then
     "$VENV_PYTHON" -m venv "$RUNTIME_DIR/venv"
 fi
 
-echo "==> Installing pinned dependencies (versions matched to the LoRAlab venv this runtime replaces)"
+echo "==> Installing dependencies (targeted for RTX 4070 Ti 12GB / Ada Lovelace + 64GB RAM)"
+CUDA_TAG="${FTI_TORCH_CUDA_TAG:-cu128}"
 "$RUNTIME_DIR/venv/bin/pip" install --upgrade pip --quiet
 "$RUNTIME_DIR/venv/bin/pip" install --quiet \
-    torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
+    "torch>=2.9.0,<2.11.0" "torchvision>=0.24.0" --index-url "https://download.pytorch.org/whl/${CUDA_TAG}" || \
 "$RUNTIME_DIR/venv/bin/pip" install --quiet \
-    "diffusers==0.39.0" \
-    "accelerate==1.14.0" \
-    "bitsandbytes==0.49.2" \
-    "peft==0.19.1" \
-    "transformers==5.14.1" \
-    "safetensors==0.8.0" \
-    "insightface==1.0.1" \
-    "opencv-python==5.0.0.93" \
-    "onnxruntime==1.28.0" \
-    "numpy==2.4.4" \
-    "Pillow==12.2.0"
+    "torch>=2.7.1" "torchvision>=0.22.1" --index-url "https://download.pytorch.org/whl/cu126"
+"$RUNTIME_DIR/venv/bin/pip" install --quiet \
+    "diffusers>=0.39.0" \
+    "accelerate>=1.14.0" \
+    "bitsandbytes>=0.49.2" \
+    "peft>=0.19.1" \
+    "transformers>=5.14.1" \
+    "safetensors>=0.8.0" \
+    "torchao>=0.10.0" \
+    "insightface>=1.0.1" \
+    "opencv-python>=5.0.0.93" \
+    "onnxruntime>=1.28.0" \
+    "numpy>=2.4.4" \
+    "Pillow>=12.2.0"
+
+echo "==> Installing optional fast attention kernels (non-fatal if build tools are absent)"
+"$RUNTIME_DIR/venv/bin/pip" install --quiet "sageattention>=2.1.0" || \
+    "$RUNTIME_DIR/venv/bin/pip" install --quiet "sageattention" || \
+    echo "    [i] sageattention skipped (PyTorch native Flash/CuDNN SDPA will be used)"
 
 echo "==> Done."
 echo "    Model: $RUNTIME_DIR/model"

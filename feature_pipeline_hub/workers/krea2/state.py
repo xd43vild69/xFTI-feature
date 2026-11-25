@@ -308,7 +308,8 @@ class CheckpointManager:
             checkpoints.rotate(self.cfg.output_dir, self.cfg.max_checkpoints_to_keep,
                                self._checkpoint_prefix, log=self.log)
             self.log(f"✓ Checkpoint saved successfully at step / "
-                     f"Checkpoint guardado en paso {step}: {path}")
+                     f"Checkpoint guardado en paso {step}: {path} "
+                     f"(mean ‖lora_B‖ = {lora_io.mean_lora_b_norm(self.model):.5f})")
             if self._ckpt_log is not None:
                 self._ckpt_log.record(
                     step=step,

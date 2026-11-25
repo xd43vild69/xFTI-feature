@@ -28,11 +28,25 @@ BUCKET_MULTIPLE = 16
 class VaeHolder:
     """Lazy per-process singleton for the VAE, which only previews need.
 
-    Loading it costs seconds and ~300 MB, so it is created on first use and cached for
-    the rest of the run rather than reloaded per preview.
+    Loading it costs seconds and ~300 MB, so it is created on first use and cached in
+    pinned host RAM (64 GB) for fast non-blocking H2D transfers per preview.
     """
 
     vae: Any = None
+
+    @classmethod
+    def _pin_cpu_params(cls, module: torch.nn.Module) -> None:
+        if not torch.cuda.is_available():
+            return
+        try:
+            for p in module.parameters():
+                if p.device.type == "cpu" and not p.is_pinned():
+                    p.data = p.data.pin_memory()
+            for b in module.buffers():
+                if b.device.type == "cpu" and not b.is_pinned():
+                    b.data = b.data.pin_memory()
+        except Exception:
+            pass
 
     @classmethod
     def get(cls, model_id: str) -> Any:
@@ -40,7 +54,14 @@ class VaeHolder:
             from diffusers import AutoencoderKLQwenImage
             cls.vae = AutoencoderKLQwenImage.from_pretrained(
                 model_id, subfolder="vae", torch_dtype=torch.bfloat16)
+            cls._pin_cpu_params(cls.vae)
         return cls.vae
+
+    @classmethod
+    def offload_to_pinned_cpu(cls) -> None:
+        if cls.vae is not None:
+            cls.vae.to("cpu")
+            cls._pin_cpu_params(cls.vae)
 
     @classmethod
     def reset(cls) -> None:
@@ -119,7 +140,39 @@ def render(
     mu = calculate_shift(latents.shape[1], *shift_cfg)
     scheduler.set_timesteps(steps, device=device, sigmas=sigmas, mu=mu)
 
+    can_batch_cfg = (
+        negative is not None
+        and negative[0].shape[1] == embeds.shape[1]
+        and ((mask is None) == (negative[1] is None))
+    )
+    cat_embeds = torch.cat([embeds, negative[0]], dim=0) if (can_batch_cfg and negative is not None) else None
+    cat_masks = (
+        torch.cat([mask, negative[1]], dim=0)
+        if (can_batch_cfg and negative is not None and mask is not None and negative[1] is not None)
+        else None
+    )
+
     for t in scheduler.timesteps:
+        if can_batch_cfg and cat_embeds is not None:
+            try:
+                t_batch = (t / scheduler.config.num_train_timesteps).expand(2).to(torch.bfloat16)
+                lat_batch = torch.cat([latents, latents], dim=0)
+                out_batch = model(
+                    hidden_states=lat_batch,
+                    encoder_hidden_states=cat_embeds,
+                    timestep=t_batch,
+                    position_ids=pos_ids,
+                    encoder_attention_mask=cat_masks,
+                    return_dict=False,
+                )[0]
+                pred, uncond = out_batch.chunk(2, dim=0)
+                pred = pred + cfg_scale * (pred - uncond)
+                latents = scheduler.step(pred, t, latents, return_dict=False)[0]
+                continue
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                can_batch_cfg = False
+
         timestep = (t / scheduler.config.num_train_timesteps).expand(1).to(torch.bfloat16)
         pred = model(hidden_states=latents, encoder_hidden_states=embeds,
                      timestep=timestep, position_ids=pos_ids,
@@ -148,18 +201,43 @@ def _decode_and_save(latents: torch.Tensor, height: int, width: int, step: int,
     """
     from PIL import Image
 
-    vae = VaeHolder.get(model_id).to(device)
+    vae = VaeHolder.get(model_id).to(device, non_blocking=True)
+    if hasattr(vae, "enable_tiling"):
+        vae.enable_tiling()
+    if hasattr(vae, "enable_slicing"):
+        vae.enable_slicing()
     try:
-        lat = unpack_latents(latents, height // 8, width // 8).to(vae.dtype).unsqueeze(2)
+        h_lat, w_lat = height // 8, width // 8
+        lat = unpack_latents(latents, h_lat, w_lat).to(vae.dtype)
+        # Guard against diffusers' AutoencoderKLQwenImage.tiled_decode remainder-tile bug
+        # on dimensions like 784px (98 latent px = 24*4 + 2px sliver).
+        ratio = int(getattr(vae, "spatial_compression_ratio", 8))
+        t_min_h = int(getattr(vae, "tile_sample_min_height", 256)) // ratio
+        t_min_w = int(getattr(vae, "tile_sample_min_width", 256)) // ratio
+        t_str_h = int(getattr(vae, "tile_sample_stride_height", 192)) // ratio
+        t_str_w = int(getattr(vae, "tile_sample_stride_width", 192)) // ratio
+
+        def _pad_lat(sz: int, t_min: int, t_str: int) -> int:
+            if sz <= t_min:
+                return 0
+            rem = (sz - t_min) % t_str
+            return 0 if rem == 0 else (t_str - rem)
+
+        pad_h = _pad_lat(h_lat, t_min_h, t_str_h)
+        pad_w = _pad_lat(w_lat, t_min_w, t_str_w)
+        if pad_h > 0 or pad_w > 0:
+            lat = torch.nn.functional.pad(lat, (0, pad_w, 0, pad_h), mode="replicate")
+
+        lat = lat.unsqueeze(2)
         mean = torch.tensor(vae.config.latents_mean, device=device,
                             dtype=lat.dtype).view(1, -1, 1, 1, 1)
         std = torch.tensor(vae.config.latents_std, device=device,
                            dtype=lat.dtype).view(1, -1, 1, 1, 1)
-        decoded = vae.decode(lat * std + mean, return_dict=False)[0][:, :, 0]
+        decoded = vae.decode(lat * std + mean, return_dict=False)[0][:, :, 0, :height, :width]
         image = ((decoded.float() / 2 + 0.5).clamp(0, 1)[0]
                  .cpu().permute(1, 2, 0).numpy() * 255).astype("uint8")
     finally:
-        vae.to("cpu")
+        VaeHolder.offload_to_pinned_cpu()
 
     path = os.path.join(output_dir, f"preview_step_{step}.png")
     Image.fromarray(image).save(path)

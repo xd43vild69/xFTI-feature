@@ -31,7 +31,7 @@ import collections
 # Debe fijarse antes de que se inicialice el asignador CUDA. Reduce la
 # fragmentación de VRAM, que es el modo de fallo típico en GPUs de 12 GB al
 # entrenar a 768x768 o más.
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True,garbage_collection_threshold:0.8")
 
 import numpy as np
 import torch
@@ -103,6 +103,7 @@ COMPACT_TEXT       = CFG.compact_text
 INIT_LORA_FROM     = CFG.init_lora_from
 GRAD_CHECKPOINTING = CFG.gradient_checkpointing
 GRAD_CKPT_INTERVAL = CFG.gradient_checkpointing_interval
+ACTIVATION_OFFLOAD = CFG.activation_offload
 COMPILE_TRANSFORMER = CFG.compile_transformer
 RUN_ID             = CFG.run_id
 PHASE_INDEX        = CFG.phase_index
@@ -125,6 +126,7 @@ WARMUP_UNITS       = CFG.warmup_units
 OPTIMIZER_NAME     = CFG.optimizer
 OPTIMIZER_EPS      = CFG.optimizer_eps
 OPTIMIZER_BETAS    = CFG.optimizer_betas
+LORAPLUS_LR_RATIO  = CFG.loraplus_lr_ratio
 TIMESTEP_WEIGHTING = CFG.timestep_weighting
 LOGIT_NORMAL_MU    = CFG.logit_normal_mu
 LOGIT_NORMAL_SIGMA = CFG.logit_normal_sigma
@@ -153,6 +155,7 @@ EXPORT_ALPHA_TENSORS = CFG.export_alpha_tensors
 PREVIEW_SOURCE     = CFG.preview_source
 PREVIEW_WALK_SEED  = CFG.preview_walk_seed
 CAPTION_DROPOUT    = CFG.caption_dropout_rate
+DOP_WEIGHT         = CFG.dop_weight
 DATASET_PATH       = CFG.dataset_path
 CURATION_WEIGHTS   = CFG.curation_weights
 
@@ -199,7 +202,7 @@ def _print_effective_config():
         ("lora_target",          LORA_TARGET),
         ("lora_dtype",           LORA_DTYPE_NAME),
         ("optimizer",            f"{OPTIMIZER_NAME} betas={list(OPTIMIZER_BETAS)} eps={OPTIMIZER_EPS} "
-                                 f"wd={WEIGHT_DECAY}"),
+                                 f"wd={WEIGHT_DECAY} loraplus={LORAPLUS_LR_RATIO}x"),
         ("max_grad_norm",        MAX_GRAD_NORM),
         ("sampler",              SAMPLER_MODE),
         ("timestep_sampling",    TIMESTEP_SAMPLING),
@@ -209,10 +212,12 @@ def _print_effective_config():
         ("noise_offset",         NOISE_OFFSET),
         ("high_precision_targets", HIGH_PREC_TARGETS),
         ("caption_dropout_rate", CAPTION_DROPOUT),
+        ("dop_weight",           DOP_WEIGHT),
         ("curation_weights",     CURATION_WEIGHTS),
         ("use_ema",              f"{USE_EMA} (decay {EMA_DECAY}, {EMA_DEVICE})" if USE_EMA else False),
         ("compact_text",         COMPACT_TEXT),
         ("gradient_checkpointing", f"{GRAD_CHECKPOINTING} (interval {GRAD_CKPT_INTERVAL})" if GRAD_CHECKPOINTING else False),
+        ("activation_offload",   ACTIVATION_OFFLOAD),
         ("compile_transformer",  COMPILE_TRANSFORMER),
         ("nan_guard",            f"{NAN_GUARD} (abort after {NAN_ABORT_AFTER})" if NAN_GUARD else False),
         ("oom_guard",            f"{OOM_GUARD} (abort after {OOM_ABORT_AFTER})" if OOM_GUARD else False),
@@ -476,6 +481,17 @@ def train_krea2():
 
     if GRAD_CHECKPOINTING:
         transformer.enable_gradient_checkpointing()
+        if LORA_TARGET == "all" and hasattr(transformer, "text_fusion"):
+            _orig_tf_fwd = transformer.text_fusion.forward
+
+            def _ckpt_text_fusion_fwd(enc_states, attention_mask=None):
+                if torch.is_grad_enabled():
+                    return torch.utils.checkpoint.checkpoint(
+                        _orig_tf_fwd, enc_states, attention_mask, use_reentrant=False
+                    )
+                return _orig_tf_fwd(enc_states, attention_mask=attention_mask)
+
+            transformer.text_fusion.forward = _ckpt_text_fusion_fwd
         if GRAD_CKPT_INTERVAL > 1 and hasattr(transformer, "transformer_blocks"):
             blocks = transformer.transformer_blocks
             active_ckpt = 0
@@ -521,26 +537,39 @@ def train_krea2():
 
     if COMPILE_TRANSFORMER and hasattr(torch, "compile"):
         try:
+            if hasattr(torch, "_dynamo") and hasattr(torch._dynamo, "config"):
+                torch._dynamo.config.cache_size_limit = max(
+                    64, int(getattr(torch._dynamo.config, "cache_size_limit", 8))
+                )
+            if hasattr(torch, "_inductor") and hasattr(torch._inductor, "config"):
+                if hasattr(torch._inductor.config, "triton"):
+                    # Avoid per-bucket CUDA Graph private memory pools exhausting 12 GB VRAM
+                    torch._inductor.config.triton.cudagraphs = False
             if hasattr(transformer, "transformer_blocks"):
                 for idx, blk in enumerate(transformer.transformer_blocks):
                     transformer.transformer_blocks[idx] = torch.compile(
                         blk, mode="default", dynamic=True
                     )
-                print("[OK] Transformer blocks compiled with torch.compile(dynamic=True)")
+                print("[OK] Transformer blocks compiled with torch.compile(dynamic=True, cudagraphs=False)")
         except Exception as _comp_err:
             print(f"[!] torch.compile skipped ({_comp_err})")
 
-    trainable = [p for p in model.parameters() if p.requires_grad]
-    optimizer = _lora_io.build_optimizer(OPTIMIZER_NAME, trainable, LR, OPTIMIZER_BETAS,
-                                         OPTIMIZER_EPS, WEIGHT_DECAY)
+    named_trainable = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+    trainable = [p for _, p in named_trainable]
+    optimizer = _lora_io.build_optimizer(
+        OPTIMIZER_NAME, trainable, LR, OPTIMIZER_BETAS, OPTIMIZER_EPS, WEIGHT_DECAY,
+        named_params=named_trainable, loraplus_lr_ratio=LORAPLUS_LR_RATIO,
+    )
 
     ema = None
     if USE_EMA:
-        ema = EMA(trainable, decay=EMA_DECAY, device=EMA_DEVICE)
+        ema = EMA(trainable, decay=EMA_DECAY, device=EMA_DEVICE,
+                  start_update=int(WARMUP_UPDATES))
         warning = _ema.horizon_warning(EMA_DECAY, TOTAL_UPDATES)
         if warning:
             print(warning)
-        print(f"[OK] EMA enabled / activada: decay {EMA_DECAY} on {EMA_DEVICE}")
+        print(f"[OK] EMA enabled / activada: decay {EMA_DECAY} on {EMA_DEVICE} "
+              f"(starts after {int(WARMUP_UPDATES)} warmup updates)")
 
     def lr_at(step):
         """Learning rate for a given micro-step, after warmup and the configured decay."""
@@ -741,7 +770,8 @@ def train_krea2():
             # D3: caption dropout reutilizando el embedding de prompt vacío que el
             # pre-caché ya escribe para el CFG de los previews. get_pos_ids está
             # cacheado por (text_len, lh, lw), así que el neg obtiene los suyos.
-            if CAPTION_DROPOUT_ACTIVE > 0 and random.random() < CAPTION_DROPOUT_ACTIVE:
+            is_uncond_step = bool(CAPTION_DROPOUT_ACTIVE > 0 and random.random() < CAPTION_DROPOUT_ACTIVE)
+            if is_uncond_step:
                 # Los embeds son 4-D [B, T, 12, 2560]: se repite de forma agnóstica
                 # al rango, y sólo cuando el batch lo exige (con batch 1 no se copia).
                 neg_emb = neg[0].to("cuda", non_blocking=True)
@@ -776,14 +806,19 @@ def train_krea2():
 
                 pos_ids = get_pos_ids(embeds.shape[1], size[0], size[1])
 
-                pred = model(
-                    hidden_states=noisy,
-                    encoder_hidden_states=embeds,
-                    timestep=sigma,
-                    position_ids=pos_ids,
-                    encoder_attention_mask=masks,
-                    return_dict=False,
-                )[0]
+                # Keep LoRA master weights & optimizer updates in FP32 while running forward GEMMs
+                # on Ada BF16 Tensor Cores (avoids allocating 275 MB x_fp32 copies inside PEFT SwiGLU).
+                use_amp = torch.cuda.is_available() and LORA_DTYPE == torch.float32
+                with _quant.activation_offload_context(ACTIVATION_OFFLOAD), \
+                     torch.amp.autocast("cuda", dtype=MODEL_DTYPE, enabled=use_amp):
+                    pred = model(
+                        hidden_states=noisy,
+                        encoder_hidden_states=embeds,
+                        timestep=sigma,
+                        position_ids=pos_ids,
+                        encoder_attention_mask=masks,
+                        return_dict=False,
+                    )[0]
 
                 if TIMESTEP_WEIGHTING == "none" and curation_w is None:
                     raw_loss = F.mse_loss(pred.float(), target.float())
@@ -791,13 +826,12 @@ def train_krea2():
                 else:
                     per_sample = F.mse_loss(pred.float(), target.float(),
                                             reduction="none").mean(dim=(1, 2))
+                    # El guard de max_loss, el NaN guard y el CSV leen la loss SIN
+                    # ponderación de timestep ni peso de curaduría, para que la curva
+                    # del log siga siendo comparable con la referencia histórica.
+                    loss_value = per_sample.mean().detach()
                     if TIMESTEP_WEIGHTING != "none":
                         per_sample = per_sample * timestep_weight(sigma.float())
-                    # El guard de max_loss, el NaN guard y el CSV leen la loss SIN
-                    # el peso de curaduría, por dos motivos: atenuar una imagen la
-                    # volvería inmune al descarte de outliers, y la curva del log
-                    # dejaría de ser comparable con la de un run sin curar.
-                    loss_value = per_sample.mean().detach()
                     if curation_w is not None:
                         # Escalar la loss de una muestra ES un LR por imagen. No se
                         # renormaliza a media 1.0 por batch: eso anularía el efecto,
@@ -807,6 +841,18 @@ def train_krea2():
                                          device=per_sample.device, dtype=per_sample.dtype)
                         per_sample = per_sample * w
                     raw_loss = per_sample.mean()
+
+                if DOP_WEIGHT > 0 and is_uncond_step and hasattr(model, "disable_adapter"):
+                    with torch.no_grad(), model.disable_adapter():
+                        ref_pred = model(
+                            hidden_states=noisy,
+                            encoder_hidden_states=embeds,
+                            timestep=sigma,
+                            position_ids=pos_ids,
+                            encoder_attention_mask=masks,
+                            return_dict=False,
+                        )[0]
+                    raw_loss = raw_loss + DOP_WEIGHT * F.mse_loss(pred.float(), ref_pred.float())
             except torch.cuda.OutOfMemoryError:
                 if not OOM_GUARD or on_oom(step, size):
                     raise
@@ -875,7 +921,7 @@ def train_krea2():
                 for v in window_vals:
                     running_loss += v
                     loss_hist.append(v)
-                step_loss = window_vals[-1]
+                step_loss = sum(window_vals) / len(window_vals)
 
                 gnorm = torch.nn.utils.clip_grad_norm_(trainable, MAX_GRAD_NORM)
                 if NAN_GUARD and not torch.isfinite(gnorm):
@@ -888,8 +934,9 @@ def train_krea2():
                         return
                 else:
                     grad_norm = gnorm.item()
+                    step_lr = lr_at(step)
                     for gparam in optimizer.param_groups:
-                        gparam["lr"] = lr_at(step)
+                        gparam["lr"] = step_lr * gparam.get("lr_scale", 1.0)
                     optimizer.step()
                     did_update = True
                     if ema is not None:
@@ -980,8 +1027,9 @@ def train_krea2():
             window_losses_gpu.clear()
         gnorm = torch.nn.utils.clip_grad_norm_(trainable, MAX_GRAD_NORM)
         if torch.isfinite(gnorm):
+            final_lr = lr_at(TOTAL_STEPS)
             for gparam in optimizer.param_groups:
-                gparam["lr"] = lr_at(TOTAL_STEPS)
+                gparam["lr"] = final_lr * gparam.get("lr_scale", 1.0)
             optimizer.step()
             if ema is not None:
                 ema.update()

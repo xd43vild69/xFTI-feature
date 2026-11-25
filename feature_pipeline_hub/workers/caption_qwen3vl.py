@@ -92,8 +92,15 @@ def load_captioner(text_encoder_dir, device="cuda", dtype=torch.bfloat16,
         )
 
     config = Qwen3VLConfig.from_pretrained(text_encoder_dir)
+    try:
+        config._attn_implementation = "sdpa"
+    except Exception:
+        pass
     with init_empty_weights():
-        model = Qwen3VLForConditionalGeneration._from_config(config)
+        try:
+            model = Qwen3VLForConditionalGeneration._from_config(config, attn_implementation="sdpa")
+        except TypeError:
+            model = Qwen3VLForConditionalGeneration._from_config(config)
 
     sd = load_file(weights_path, device="cpu")
     sd = _convert_bare_state_dict(sd)
@@ -119,6 +126,8 @@ def load_captioner(text_encoder_dir, device="cuda", dtype=torch.bfloat16,
     model = model.eval().requires_grad_(False)
 
     processor = AutoProcessor.from_pretrained(processor_repo)
+    if hasattr(processor, "tokenizer") and processor.tokenizer is not None:
+        processor.tokenizer.padding_side = "left"
 
     return model, processor
 
@@ -185,3 +194,86 @@ def generate_caption(model, processor, image_path, *, max_new_tokens=120,
 
     text = processor.batch_decode(out[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True)[0]
     return " ".join(text.split()).strip()
+
+
+def generate_captions_batch(
+    model,
+    processor,
+    image_paths,
+    *,
+    max_new_tokens=120,
+    megapixels=1.0,
+    detailed=False,
+    seed=None,
+    instruction=None,
+    deterministic=False,
+):
+    """Batched VLM caption generation with multithreaded PIL pre-decoding in host RAM."""
+    if not image_paths:
+        return []
+    if len(image_paths) == 1:
+        return [
+            generate_caption(
+                model,
+                processor,
+                image_paths[0],
+                max_new_tokens=max_new_tokens,
+                megapixels=megapixels,
+                detailed=detailed,
+                seed=seed,
+                instruction=instruction,
+                deterministic=deterministic,
+            )
+        ]
+
+    import random as _random
+    from concurrent.futures import ThreadPoolExecutor
+    from PIL import Image
+
+    def _load_one(p):
+        with Image.open(p) as raw_im:
+            return _cap_image(raw_im, megapixels)
+
+    workers = min(len(image_paths), 4)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        images = list(pool.map(_load_one, image_paths))
+
+    if instruction is None:
+        instruction = DETAILED_CAPTION_INSTRUCTION if detailed else CAPTION_INSTRUCTION
+        if detailed:
+            max_new_tokens = max(max_new_tokens, 240)
+    else:
+        max_new_tokens = max(max_new_tokens, 200)
+
+    messages = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": instruction}]}]
+    prompt = processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+    if hasattr(processor, "tokenizer") and processor.tokenizer is not None:
+        processor.tokenizer.padding_side = "left"
+
+    inputs = processor(
+        text=[prompt] * len(images),
+        images=images,
+        padding=True,
+        return_tensors="pt",
+    ).to(model.device)
+
+    cpu_state = torch.random.get_rng_state()
+    cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    try:
+        torch.manual_seed(seed if seed is not None else _random.randint(1, 2**31 - 1))
+        with torch.inference_mode():
+            if deterministic:
+                out = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+            else:
+                out = model.generate(
+                    **inputs, max_new_tokens=max_new_tokens, do_sample=True, temperature=0.5, top_p=0.9
+                )
+    finally:
+        torch.random.set_rng_state(cpu_state)
+        if cuda_states is not None:
+            torch.cuda.set_rng_state_all(cuda_states)
+
+    decoded = processor.batch_decode(
+        out[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True
+    )
+    return [" ".join(t.split()).strip() for t in decoded]

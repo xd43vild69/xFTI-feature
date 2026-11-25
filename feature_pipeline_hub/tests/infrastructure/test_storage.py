@@ -320,3 +320,27 @@ def test_append_uploaded_files_writes_an_orphan_caption_under_its_own_name(tmp_p
     )
 
     assert (folder / "stray.txt").read_text() == "no image for this one"
+
+
+def test_append_uploaded_files_preserves_multiple_images_with_same_stem(tmp_path: Path):
+    """Dropping `photo.png` and `photo.jpg` (or duplicate clipboard names) keeps both."""
+    src_png = tmp_path / "src.png"
+    src_jpg = tmp_path / "src.jpg"
+    _make_image(src_png)
+    Image.new("RGB", (64, 64), color="blue").save(src_jpg)
+    folder = tmp_path / "run-1"
+
+    written = append_uploaded_files(
+        [
+            _FakeUpload("photo.png", src_png.read_bytes()),
+            _FakeUpload("photo.jpg", src_jpg.read_bytes()),
+            _FakeUpload("photo.txt", b"shared caption"),
+        ],
+        str(folder),
+        "concept",
+        start_index=1,
+    )
+
+    assert [Path(p).name for p in written] == ["concept_0001.png", "concept_0002.jpg"]
+    assert read_caption_for_image(str(folder / "concept_0001.png")) == "shared caption"
+    assert read_caption_for_image(str(folder / "concept_0002.jpg")) == "shared caption"

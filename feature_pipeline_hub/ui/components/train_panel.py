@@ -135,6 +135,87 @@ def _sync_json_to_fields(run_id: str, target_model: str = "krea2") -> None:
     _bump(f"train_launch_field_version_{run_id}_{target_model}")
 
 
+_KREA2_PRESETS: dict[str, dict[str, object]] = {
+    "1. Máxima Calidad (1024×1024)": {
+        "target_area": 1024 * 1024,
+        "total_steps": 1500,
+        "lr": 1.5e-4,
+        "lora_rank": 48,
+        "lora_alpha": 48,
+        "batch_size": 1,
+        "grad_accum_steps": 2,
+        "save_every": 250,
+        "warmup_steps": 60,
+        "warmup_units": "micro_steps",
+        "lr_scheduler": "cosine",
+        "min_lr_ratio": 0.1,
+        "timestep_sampling": "sigmoid",
+        "timestep_weighting": "none",
+        "content_or_style": "balanced",
+        "sampler": "epoch",
+        "lora_dtype": "fp32",
+        "lora_target": "all",
+        "optimizer": "adamw8bit_paged",
+        "optimizer_eps": 1e-8,
+        "optimizer_betas": [0.9, 0.999],
+        "loraplus_lr_ratio": 2.0,
+        "high_precision_targets": True,
+        "dop_weight": 0.0,
+        "use_ema": False,
+        "ema_device": "cpu",
+        "gradient_checkpointing": True,
+        "gradient_checkpointing_interval": 1,
+        "activation_offload": True,
+        "compile_transformer": False,
+    },
+    "2. Balance Calidad / Tiempo (768×768 Turbo)": {
+        "target_area": 768 * 768,
+        "total_steps": 1250,
+        "lr": 1.5e-4,
+        "lora_rank": 48,
+        "lora_alpha": 48,
+        "batch_size": 1,
+        "grad_accum_steps": 1,
+        "save_every": 250,
+        "warmup_steps": 60,
+        "warmup_units": "micro_steps",
+        "lr_scheduler": "cosine",
+        "min_lr_ratio": 0.1,
+        "timestep_sampling": "sigmoid",
+        "timestep_weighting": "none",
+        "content_or_style": "balanced",
+        "sampler": "epoch",
+        "lora_dtype": "fp32",
+        "lora_target": "attn+ff",
+        "optimizer": "adamw8bit",
+        "optimizer_eps": 1e-8,
+        "optimizer_betas": [0.9, 0.999],
+        "loraplus_lr_ratio": 3.0,
+        "high_precision_targets": True,
+        "dop_weight": 0.0,
+        "use_ema": False,
+        "ema_device": "cpu",
+        "gradient_checkpointing": True,
+        "gradient_checkpointing_interval": 1,
+        "activation_offload": False,
+        "compile_transformer": True,
+    },
+}
+
+
+def _apply_krea2_preset(run_id: str, target_model: str) -> None:
+    """Apply the selected Krea 2 preset into session config and remount all form/JSON widgets."""
+    preset_name = st.session_state.get(f"krea2_preset_select_{run_id}")
+    preset = _KREA2_PRESETS.get(str(preset_name))
+    if not preset:
+        return
+    config = _launch_config_state(run_id, target_model)
+    config.update(preset)
+    st.session_state[f"train_launch_json_error_{run_id}_{target_model}"] = None
+    _bump(f"train_launch_field_version_{run_id}_{target_model}")
+    _bump(f"train_launch_json_version_{run_id}_{target_model}")
+
+
 MODE_NEW = "New training"
 MODE_RESUME = "Resume"
 MODE_BRANCH = "Branch"
@@ -539,6 +620,20 @@ def _render_new_run_form(run: IngestionRun, *, busy: bool) -> None:
                     _bump(f"train_launch_json_version_{run.run_id}_{target_model}")
                     st.rerun()
 
+    if not is_ltx:
+        _preset_names = list(_KREA2_PRESETS)
+        st.selectbox(
+            "🎛️ Plantilla de configuración (RTX 4070 Ti 12 GB)",
+            _preset_names,
+            key=f"krea2_preset_select_{run.run_id}",
+            on_change=_apply_krea2_preset,
+            args=(run.run_id, target_model),
+            help=(
+                "Cambia automáticamente los hiperparámetros entre Máxima Calidad (1024×1024, "
+                "comprobado en av_bd) y Balance Calidad/Tiempo (768×768 Turbo, ~60% más rápido)."
+            ),
+        )
+
     form_tab, json_tab = st.tabs(["Form", "JSON"])
 
     with form_tab:
@@ -663,6 +758,15 @@ def _render_new_run_form(run: IngestionRun, *, busy: bool) -> None:
                         on_change=_sync_fields_to_json, args=(run.run_id, target_model),
                         help="Cantidad de ciclos con cosine_with_restarts.",
                     )
+                _ts_krea_opts = ["sigmoid", "krea2_shift", "logit_normal"]
+                _ts_krea_val = config.get("timestep_sampling", "sigmoid")
+                st.selectbox(
+                    "Timestep sampling", _ts_krea_opts,
+                    index=_ts_krea_opts.index(_ts_krea_val) if _ts_krea_val in _ts_krea_opts else 0,
+                    key=_field_key(run.run_id, "timestep_sampling", target_model),
+                    on_change=_sync_fields_to_json, args=(run.run_id, target_model),
+                    help="'sigmoid' (ai-toolkit) centra el muestreo en sigma=0.50 sin doble shift a 1024×1024; 'krea2_shift' desplaza hacia ruido alto.",
+                )
                 st.selectbox(
                     "Timestep weighting", ["none", "bell", "half_bell"],
                     index=["none", "bell", "half_bell"].index(config["timestep_weighting"]),
@@ -706,7 +810,7 @@ def _render_new_run_form(run: IngestionRun, *, busy: bool) -> None:
                     index=_cos_opts.index(_cos_val) if _cos_val in _cos_opts else 0,
                     key=_field_key(run.run_id, "content_or_style", target_model),
                     on_change=_sync_fields_to_json, args=(run.run_id, target_model),
-                    help="Sesgo de muestreo de sigma ('balanced' estándar, 'content' enfatiza detalle fino/identidad).",
+                    help="Sesgo de muestreo de sigma ('balanced' recomendado para identidad facial; 'content' usa u³ y concentra en sigma<0.2 perdiendo rasgos fisionómicos).",
                 )
 
             with st.container(horizontal=True):
@@ -723,6 +827,13 @@ def _render_new_run_form(run: IngestionRun, *, busy: bool) -> None:
                     on_change=_sync_fields_to_json, args=(run.run_id, target_model),
                     help="Probabilidad de usar prompt vacío en vez del caption.",
                 )
+                st.number_input(
+                    "DOP weight", min_value=0.0, max_value=2.0, step=0.05, format="%.2f",
+                    value=float(config.get("dop_weight", 0.25)),
+                    key=_field_key(run.run_id, "dop_weight", target_model),
+                    on_change=_sync_fields_to_json, args=(run.run_id, target_model),
+                    help="Differential Output Preservation (ai-toolkit): preserva el modelo base en prompts sin trigger durante caption dropout.",
+                )
                 st.checkbox(
                     "High precision targets (FP32)",
                     value=bool(config.get("high_precision_targets", True)),
@@ -732,28 +843,52 @@ def _render_new_run_form(run: IngestionRun, *, busy: bool) -> None:
                 )
                 st.checkbox(
                     "Use EMA",
-                    value=bool(config.get("use_ema", False)),
+                    value=bool(config.get("use_ema", True)),
                     key=_field_key(run.run_id, "use_ema", target_model),
                     on_change=_sync_fields_to_json, args=(run.run_id, target_model),
                     help="Media móvil exponencial de los pesos LoRA (ejecutada en GPU con kernels vectorizados).",
                 )
 
             with st.container(horizontal=True):
-                _opt_opts = ["adamw8bit", "adamw8bit_paged", "adamw_fused", "adamw"]
-                _opt_val = config.get("optimizer", "adamw8bit")
+                _res_opts = [1024 * 1024, 768 * 768]
+                _res_val = int(config.get("target_area", 1024 * 1024))
+                st.selectbox(
+                    "Training resolution", _res_opts,
+                    index=_res_opts.index(_res_val) if _res_val in _res_opts else 0,
+                    format_func=lambda area: "1024×1024 (Máximo detalle)" if area == 1024 * 1024 else "768×768 (Seguro 12 GB VRAM)",
+                    key=_field_key(run.run_id, "target_area", target_model),
+                    on_change=_sync_fields_to_json, args=(run.run_id, target_model),
+                    help="Resolución del pre-caché VAE y del entrenamiento. 1024×1024 usa adamw8bit_paged + EMA en CPU para ajustarse a 12 GB.",
+                )
+                _opt_opts = ["adamw8bit_paged", "adamw8bit", "muon", "adamw_fused", "adamw"]
+                _opt_val = config.get("optimizer", "adamw8bit_paged")
                 st.selectbox(
                     "Optimizer", _opt_opts,
                     index=_opt_opts.index(_opt_val) if _opt_val in _opt_opts else 0,
                     key=_field_key(run.run_id, "optimizer", target_model),
                     on_change=_sync_fields_to_json, args=(run.run_id, target_model),
-                    help="'adamw8bit' evita la sobrecarga de paginación CUDA de 'adamw8bit_paged'; 'adamw_fused' usa un solo kernel FP32 si sobra VRAM.",
+                    help="A 1024×1024 (rank 48 = 176M params) usa 'adamw8bit_paged' para paginar los ~360 MB de estado a tus 64 GB de RAM y evitar OOM en 12 GB; usa 'adamw8bit' o 'muon' a 768×768.",
+                )
+                st.number_input(
+                    "LoRA+ LR ratio", min_value=1.0, max_value=32.0, step=1.0, format="%.1f",
+                    value=float(config.get("loraplus_lr_ratio", 4.0)),
+                    key=_field_key(run.run_id, "loraplus_lr_ratio", target_model),
+                    on_change=_sync_fields_to_json, args=(run.run_id, target_model),
+                    help="Multiplica el LR de lora_B (LoRA+). 4.0 acelera la convergencia sin costo extra de VRAM.",
                 )
                 st.number_input(
                     "Grad checkpointing interval", min_value=1, max_value=28, step=1,
                     value=int(config.get("gradient_checkpointing_interval", 1)),
                     key=_field_key(run.run_id, "gradient_checkpointing_interval", target_model),
                     on_change=_sync_fields_to_json, args=(run.run_id, target_model),
-                    help="1 = todos los bloques (mínima VRAM). 2 = cada 2 bloques (~20% más rápido en resoluciones medias si sobran 2-3 GB de VRAM).",
+                    help="RTX 4070 Ti (12 GB): usa 2 a 512px (~15% más rápido); usa 1 a 768px+ para evitar OOM.",
+                )
+                st.checkbox(
+                    "Activation offload (CPU)",
+                    value=bool(config.get("activation_offload", True)),
+                    key=_field_key(run.run_id, "activation_offload", target_model),
+                    on_change=_sync_fields_to_json, args=(run.run_id, target_model),
+                    help="Descarga a RAM las activaciones retenidas por gradient checkpointing (~1.4 GB menos VRAM). Indispensable para 1024×1024 en RTX 4070 Ti (12 GB).",
                 )
                 st.checkbox(
                     "Compile transformer (torch.compile)",

@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -119,10 +120,18 @@ def load(
             f"/ Omitiendo {len(orphans)} entradas huérfanas del entrenamiento.")
         all_names = [n for n in all_names if n not in orphan_set]
 
-    for name in all_names:
-        sample = load_sample(cache_dir, name, compact=compact, pin=pin)
-        dataset.samples[name] = sample
-        buckets[bucket_of(sample)].append(name)
+    if all_names:
+        workers = min(8, len(all_names), max(1, os.cpu_count() or 4))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            loaded_samples = list(
+                pool.map(
+                    lambda n: load_sample(cache_dir, n, compact=compact, pin=pin),
+                    all_names,
+                )
+            )
+        for name, sample in zip(all_names, loaded_samples):
+            dataset.samples[name] = sample
+            buckets[bucket_of(sample)].append(name)
 
     if val_cache_dir and os.path.isdir(val_cache_dir):
         for name in entry_names(val_cache_dir):

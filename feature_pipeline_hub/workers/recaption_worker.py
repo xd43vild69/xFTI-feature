@@ -53,7 +53,7 @@ def main() -> int:
     _run_id = str(job.get("run_id", ""))
 
     import torch
-    from caption_qwen3vl import generate_caption, load_captioner
+    from caption_qwen3vl import generate_caption, generate_captions_batch, load_captioner
 
     started = time.time()
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -94,8 +94,15 @@ def main() -> int:
     # turns a baffling symptom into a stated cause.
     try:
         with torch.no_grad():
-            corrupt = [name for name, p in model.named_parameters() if not torch.isfinite(p).all().item()]
-            if corrupt:
+            params = list(model.named_parameters())
+            # Vectorize finite check into a single GPU->CPU sync instead of ~400 .item() stalls
+            all_finite = (
+                torch.stack([torch.isfinite(p).all() for _, p in params]).all().item()
+                if params
+                else True
+            )
+            if not all_finite:
+                corrupt = [name for name, p in params if not torch.isfinite(p).all().item()]
                 raise RuntimeError(
                     f"Model weights loaded with non-finite values in {len(corrupt)} tensor(s), "
                     f"first: {corrupt[0]}. Generation would return garbage. Retry — this is "
@@ -108,26 +115,44 @@ def main() -> int:
     _emit(event="loaded", device=device, seconds=round(time.time() - started, 1))
 
     captioned = failed = 0
-    for path in images:
-        image_started = time.time()
-        try:
-            # deterministic=True: the reply has to parse as JSON, and sampling is
-            # what turns a well-formed object into a stray token now and then.
-            caption = generate_caption(
-                model, processor, path, instruction=instruction, deterministic=True
-            )
-        except Exception as exc:  # one bad image must not abort the batch
-            failed += 1
-            _emit(event="error", path=path, message=f"{type(exc).__name__}: {exc}")
-            continue
+    batch_size = int(job.get("batch_size", 4 if device == "cuda" else 1))
+    batch_size = max(1, batch_size)
 
-        captioned += 1
-        _emit(
-            event="caption",
-            path=path,
-            caption=caption,
-            seconds=round(time.time() - image_started, 1),
-        )
+    for b_start in range(0, len(images), batch_size):
+        chunk = images[b_start : b_start + batch_size]
+        if len(chunk) > 1:
+            chunk_started = time.time()
+            try:
+                replies = generate_captions_batch(
+                    model, processor, chunk, instruction=instruction, deterministic=True
+                )
+                per_img_sec = round((time.time() - chunk_started) / len(chunk), 2)
+                for path, caption in zip(chunk, replies):
+                    captioned += 1
+                    _emit(event="caption", path=path, caption=caption, seconds=per_img_sec)
+                continue
+            except Exception:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+        for path in chunk:
+            image_started = time.time()
+            try:
+                caption = generate_caption(
+                    model, processor, path, instruction=instruction, deterministic=True
+                )
+            except Exception as exc:  # one bad image must not abort the batch
+                failed += 1
+                _emit(event="error", path=path, message=f"{type(exc).__name__}: {exc}")
+                continue
+
+            captioned += 1
+            _emit(
+                event="caption",
+                path=path,
+                caption=caption,
+                seconds=round(time.time() - image_started, 1),
+            )
 
     _emit(event="done", captioned=captioned, failed=failed)
 

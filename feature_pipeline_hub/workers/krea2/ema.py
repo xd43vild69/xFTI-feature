@@ -23,14 +23,16 @@ class EMA:
     """
 
     def __init__(self, params: Iterable[torch.nn.Parameter], decay: float = 0.99,
-                 device: str | torch.device = "cpu") -> None:
+                 device: str | torch.device = "cpu", start_update: int = 0) -> None:
         self.decay = float(decay)
         self.params = list(params)
         self.device = torch.device(device)
+        self.start_update = max(0, int(start_update))
         self.shadow = [p.detach().to(self.device, torch.float32).clone()
                        for p in self.params]
         self.backup: list[torch.Tensor] | None = None
         self.updates = 0
+        self._seen_updates = 0
 
     @torch.no_grad()
     def update(self) -> None:
@@ -39,12 +41,17 @@ class EMA:
         Calling it per micro-batch instead would make the effective decay
         `decay ** grad_accum_steps` — a silent, and badly wrong, horizon.
 
-        The decay is warmed up over the first updates; without that the initialization
-        dominates the shadow for hundreds of steps and the EMA starts biased toward it.
-        When the shadow and live parameters share the same device and dtype (e.g.
-        fp32 LoRA master weights with `ema_device="cuda"`), uses fused `_foreach`
-        kernels to avoid per-parameter Python loops and host-device transfers.
+        When `start_update > 0` (e.g. set to `warmup_updates`), `shadow` mirrors
+        live weights until `start_update` is reached so step-0 zeros (`lora_B = 0`)
+        never pollute the moving average. When shadow and live parameters share the
+        same device and float32 dtype, uses fused `_foreach` kernels.
         """
+        self._seen_updates += 1
+        if self._seen_updates <= self.start_update:
+            for shadow, param in zip(self.shadow, self.params):
+                shadow.copy_(param.detach().to(self.device, torch.float32))
+            return
+
         self.updates += 1
         decay = min(self.decay, (1 + self.updates) / (10 + self.updates))
         if (
@@ -78,6 +85,7 @@ class EMA:
 
     def state_dict(self) -> dict[str, Any]:
         return {"decay": self.decay, "updates": self.updates,
+                "seen_updates": self._seen_updates,
                 "shadow": [s.cpu() for s in self.shadow]}
 
     def load_state_dict(self, state: Mapping[str, Any], log: Logger = print) -> None:
@@ -88,6 +96,7 @@ class EMA:
         partially applied.
         """
         self.updates = int(state.get("updates", 0))
+        self._seen_updates = int(state.get("seen_updates", self.updates + self.start_update))
         loaded = state.get("shadow") or []
         if len(loaded) != len(self.shadow):
             log("[!] EMA state size mismatch; reinitializing from current weights / "

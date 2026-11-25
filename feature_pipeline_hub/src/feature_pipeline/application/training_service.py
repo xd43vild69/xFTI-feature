@@ -84,16 +84,17 @@ class TrainingConfig(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     checkpoint_name: str = ""
+    target_area: int = Field(default=1024 * 1024, gt=0)
     total_steps: int = Field(default=1500, gt=0)
     lr: float = Field(default=1.5e-4, gt=0)
-    lora_rank: int = Field(default=32, gt=0)
-    lora_alpha: int = Field(default=16, gt=0)
+    lora_rank: int = Field(default=48, gt=0)
+    lora_alpha: int = Field(default=48, gt=0)
     batch_size: int = Field(default=1, gt=0)
-    grad_accum_steps: int = Field(default=4, gt=0)
+    grad_accum_steps: int = Field(default=2, gt=0)
     save_every: int = Field(default=250, gt=0)
     seed: int = Field(default=42, ge=0)
-    warmup_steps: int = Field(default=100, ge=0)
-    warmup_units: Literal["updates", "micro_steps", "ratio"] = "updates"
+    warmup_steps: int = Field(default=60, ge=0)
+    warmup_units: Literal["updates", "micro_steps", "ratio"] = "micro_steps"
     lr_scheduler: Literal["cosine", "constant", "linear", "cosine_with_restarts", "step"] = "cosine"
     lr_num_cycles: int = Field(default=3, gt=0)
     min_lr_ratio: float = Field(default=0.1, ge=0.0, le=1.0)
@@ -101,18 +102,22 @@ class TrainingConfig(BaseModel):
     lora_dtype: Literal["bf16", "fp32"] = "fp32"
     high_precision_targets: bool = True
     lora_target: Literal["all", "attn", "attn+ff"] = "all"
-    optimizer: Literal["adamw8bit_paged", "adamw8bit", "adamw", "adamw_fused"] = "adamw8bit"
-    optimizer_betas: list[float] = Field(default_factory=lambda: [0.9, 0.99])
-    optimizer_eps: float = Field(default=1e-6, gt=0.0)
+    optimizer: Literal["adamw8bit_paged", "adamw8bit", "adamw", "adamw_fused", "muon"] = "adamw8bit_paged"
+    optimizer_betas: list[float] = Field(default_factory=lambda: [0.9, 0.999])
+    optimizer_eps: float = Field(default=1e-8, gt=0.0)
+    loraplus_lr_ratio: float = Field(default=2.0, ge=1.0, le=32.0)
+    timestep_sampling: Literal["sigmoid", "krea2_shift", "logit_normal"] = "sigmoid"
     timestep_weighting: Literal["none", "bell", "half_bell"] = "none"
     content_or_style: Literal["balanced", "content", "style"] = "balanced"
     noise_offset: float = Field(default=0.0, ge=0.0)
     caption_dropout_rate: float = Field(default=0.05, ge=0.0, le=1.0)
+    dop_weight: float = Field(default=0.0, ge=0.0, le=2.0)
     use_ema: bool = False
-    ema_decay: float = Field(default=0.99, gt=0.0, lt=1.0)
-    ema_device: Literal["cpu", "cuda"] = "cuda"
+    ema_decay: float = Field(default=0.98, gt=0.0, lt=1.0)
+    ema_device: Literal["cpu", "cuda"] = "cpu"
     gradient_checkpointing: bool = True
     gradient_checkpointing_interval: int = Field(default=1, ge=1, le=28)
+    activation_offload: bool = True
     compile_transformer: bool = False
 
 
@@ -540,6 +545,7 @@ def start_training(
         cache_dir=cache_dir,
         trigger_word=trigger_word,
         target_model=target_model,
+        target_area=config.target_area if isinstance(config, TrainingConfig) else None,
     )
 
     return _launch_train(
@@ -671,6 +677,7 @@ def _launch_precache(
     cache_dir: Path,
     trigger_word: str,
     target_model: ModelArch = "krea2",
+    target_area: int | None = None,
 ) -> str:
     precache_run_id = str(uuid.uuid4())
     run_dir = training_runtime_dir() / "runs" / f"precache-{precache_run_id}"
@@ -684,12 +691,15 @@ def _launch_precache(
             trigger_word=trigger_word,
         ).model_dump()
     else:
-        settings = PrecacheSettings(
-            model_id=str(model_dir),
-            dataset_path=str(dataset_path),
-            cache_dir=str(cache_dir),
-            trigger_word=trigger_word,
-        ).model_dump()
+        precache_kwargs: dict[str, object] = {
+            "model_id": str(model_dir),
+            "dataset_path": str(dataset_path),
+            "cache_dir": str(cache_dir),
+            "trigger_word": trigger_word,
+        }
+        if target_area is not None:
+            precache_kwargs["target_area"] = target_area
+        settings = PrecacheSettings(**precache_kwargs).model_dump()  # type: ignore[arg-type]
 
     pid, log_path = training_runner.launch(
         script,
@@ -717,6 +727,7 @@ def _run_precache_blocking(
     cache_dir: Path,
     trigger_word: str,
     target_model: ModelArch = "krea2",
+    target_area: int | None = None,
 ) -> None:
     training_run_id = _launch_precache(
         conn,
@@ -726,6 +737,7 @@ def _run_precache_blocking(
         cache_dir=cache_dir,
         trigger_word=trigger_word,
         target_model=target_model,
+        target_area=target_area,
     )
     run = repo.get_training_run(conn, training_run_id)
     assert run is not None
@@ -956,10 +968,10 @@ _FORK_PINNED_KEYS = (
     "model_id", "lr", "lr_scheduler", "lr_num_cycles", "min_lr_ratio",
     "warmup_steps", "warmup_units", "lora_rank", "lora_alpha", "lora_target",
     "lora_dtype", "high_precision_targets", "sampler", "seed",
-    "batch_size", "grad_accum_steps", "optimizer", "optimizer_betas", "optimizer_eps",
-    "timestep_weighting", "content_or_style", "noise_offset", "caption_dropout_rate",
+    "batch_size", "grad_accum_steps", "optimizer", "optimizer_betas", "optimizer_eps", "loraplus_lr_ratio",
+    "timestep_sampling", "timestep_weighting", "content_or_style", "noise_offset", "caption_dropout_rate", "dop_weight",
     "use_ema", "ema_decay", "ema_device",
-    "gradient_checkpointing", "gradient_checkpointing_interval", "compile_transformer",
+    "gradient_checkpointing", "gradient_checkpointing_interval", "activation_offload", "compile_transformer",
 )
 
 
@@ -1191,7 +1203,7 @@ def _launch_train(
             output_dir=str(output_dir),
             trigger_word=trigger_word,
             checkpoint_prefix=config.checkpoint_name or dataset_name,
-            **config.model_dump(exclude={"checkpoint_name"}),
+            **config.model_dump(exclude={"checkpoint_name", "target_area"}),
         ).model_dump()
 
     pid, log_path = training_runner.launch(
