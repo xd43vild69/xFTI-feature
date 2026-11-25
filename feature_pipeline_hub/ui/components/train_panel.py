@@ -139,11 +139,11 @@ _KREA2_PRESETS: dict[str, dict[str, object]] = {
     "1. Máxima Calidad (1024×1024)": {
         "target_area": 1024 * 1024,
         "total_steps": 1500,
-        "lr": 1.5e-4,
+        "lr": 1.0e-4,
         "lora_rank": 48,
         "lora_alpha": 48,
         "batch_size": 1,
-        "grad_accum_steps": 2,
+        "grad_accum_steps": 1,
         "save_every": 250,
         "warmup_steps": 60,
         "warmup_units": "micro_steps",
@@ -166,7 +166,7 @@ _KREA2_PRESETS: dict[str, dict[str, object]] = {
         "gradient_checkpointing": True,
         "gradient_checkpointing_interval": 1,
         "activation_offload": True,
-        "compile_transformer": False,
+        "compile_transformer": True,
     },
     "2. Balance Calidad / Tiempo (768×768 Turbo)": {
         "target_area": 768 * 768,
@@ -892,7 +892,7 @@ def _render_new_run_form(run: IngestionRun, *, busy: bool) -> None:
                 )
                 st.checkbox(
                     "Compile transformer (torch.compile)",
-                    value=bool(config.get("compile_transformer", False)),
+                    value=bool(config.get("compile_transformer", True)),
                     key=_field_key(run.run_id, "compile_transformer", target_model),
                     on_change=_sync_fields_to_json, args=(run.run_id, target_model),
                     help="Fusiona kernels de bloques y adaptadores LoRA con torch.compile(dynamic=True). Añade ~45s al primer paso pero acelera entrenamientos largos.",

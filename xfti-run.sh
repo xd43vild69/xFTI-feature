@@ -33,16 +33,28 @@ echo " Directorio: ${HUB_DIR}"
 echo " Entorno:    ${UV_PROJECT_ENVIRONMENT}"
 echo "=================================================="
 
-if command -v uv >/dev/null 2>&1; then
-    # Verificar que el entorno virtual tenga streamlit operable; si no, sincronizar
-    if [[ ! -x "${UV_PROJECT_ENVIRONMENT}/bin/python" ]] || ! "${UV_PROJECT_ENVIRONMENT}/bin/python" -c "import streamlit" >/dev/null 2>&1; then
-        echo "Sincronizando entorno virtual con uv..."
-        uv sync
+PYTHON_BIN="${UV_PROJECT_ENVIRONMENT}/bin/python"
+PIP_BIN="${UV_PROJECT_ENVIRONMENT}/bin/pip"
+STREAMLIT_BIN="${UV_PROJECT_ENVIRONMENT}/bin/streamlit"
+
+# Verificar salud completa del entorno virtual; si falta cualquier dependencia o está corrupto, reconstruir limpio
+if [[ ! -x "${PYTHON_BIN}" ]] || ! "${PYTHON_BIN}" -c "import streamlit, urllib3, requests, pandas, pydantic, pydantic_core, PIL, imagehash, numpy, mcp, huggingface_hub; assert int(pandas.__version__.split('.')[0]) < 3" >/dev/null 2>&1; then
+    echo "==> Entorno virtual incompleto o corrupto. Reconstruyendo limpiamente ${UV_PROJECT_ENVIRONMENT}..."
+    rm -rf "${UV_PROJECT_ENVIRONMENT}"
+    if command -v uv >/dev/null 2>&1; then
+        uv sync --link-mode=copy
+    else
+        python3 -m venv "${UV_PROJECT_ENVIRONMENT}"
+        "${UV_PROJECT_ENVIRONMENT}/bin/pip" install --upgrade pip --quiet
+        "${UV_PROJECT_ENVIRONMENT}/bin/pip" install -e "${HUB_DIR}"
     fi
-    exec uv run --no-sync streamlit run ui/app.py "$@"
-elif [[ -x "${UV_PROJECT_ENVIRONMENT}/bin/streamlit" ]]; then
+fi
+
+if command -v uv >/dev/null 2>&1; then
+    exec uv run --no-sync streamlit run ui/app.py --browser.gatherUsageStats=false "$@"
+elif [[ -x "${STREAMLIT_BIN}" ]]; then
     source "${UV_PROJECT_ENVIRONMENT}/bin/activate"
-    exec "${UV_PROJECT_ENVIRONMENT}/bin/streamlit" run ui/app.py "$@"
+    exec "${STREAMLIT_BIN}" run ui/app.py --browser.gatherUsageStats=false "$@"
 else
-    exec python3 -m streamlit run ui/app.py "$@"
+    exec python3 -m streamlit run ui/app.py --browser.gatherUsageStats=false "$@"
 fi

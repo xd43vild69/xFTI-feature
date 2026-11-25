@@ -67,9 +67,12 @@ CUDA_TAG="${FTI_TORCH_CUDA_TAG:-cu128}"
     "Pillow>=12.2.0"
 
 echo "==> Installing optional fast attention kernels (non-fatal if build tools are absent)"
-"$RUNTIME_DIR/venv/bin/pip" install --quiet "sageattention>=2.1.0" || \
-    "$RUNTIME_DIR/venv/bin/pip" install --quiet "sageattention" || \
+set +e
+if ! "$RUNTIME_DIR/venv/bin/pip" install --quiet "sageattention" 2>/dev/null; then
+    "$RUNTIME_DIR/venv/bin/pip" install --quiet "git+https://github.com/thu-ml/SageAttention.git" 2>/dev/null || \
     echo "    [i] sageattention skipped (PyTorch native Flash/CuDNN SDPA will be used)"
+fi
+set -e
 
 echo "==> Done."
 echo "    Model: $RUNTIME_DIR/model"

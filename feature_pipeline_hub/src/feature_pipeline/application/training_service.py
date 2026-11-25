@@ -86,11 +86,11 @@ class TrainingConfig(BaseModel):
     checkpoint_name: str = ""
     target_area: int = Field(default=1024 * 1024, gt=0)
     total_steps: int = Field(default=1500, gt=0)
-    lr: float = Field(default=1.5e-4, gt=0)
+    lr: float = Field(default=1.0e-4, gt=0)
     lora_rank: int = Field(default=48, gt=0)
     lora_alpha: int = Field(default=48, gt=0)
     batch_size: int = Field(default=1, gt=0)
-    grad_accum_steps: int = Field(default=2, gt=0)
+    grad_accum_steps: int = Field(default=1, gt=0)
     save_every: int = Field(default=250, gt=0)
     seed: int = Field(default=42, ge=0)
     warmup_steps: int = Field(default=60, ge=0)
@@ -118,7 +118,7 @@ class TrainingConfig(BaseModel):
     gradient_checkpointing: bool = True
     gradient_checkpointing_interval: int = Field(default=1, ge=1, le=28)
     activation_offload: bool = True
-    compile_transformer: bool = False
+    compile_transformer: bool = True
 
 
 class LTX23TrainingConfig(BaseModel):

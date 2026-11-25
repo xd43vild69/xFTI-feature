@@ -8,6 +8,7 @@ dependencies = [
     "pillow>=10.0",
     "imagehash>=4.3",
     "numpy>=1.26",
+    "pandas>=2.2.2,<3.0",
     "streamlit>=1.35",
     "mcp>=1.9,<2.0",
     "huggingface_hub>=0.23.0",

@@ -52,7 +52,12 @@ def load_lora_weights(model: torch.nn.Module, blob: bytes, src: str,
     progressive orchestrator's pipeline. Deliberate: a traceback here would bury the
     one line that says which setting to fix.
     """
-    result = set_peft_model_state_dict(model, load(blob))
+    raw_state = load(blob)
+    cleaned_state = {
+        k.replace("._orig_mod.", ".").replace("_orig_mod.", ""): v
+        for k, v in raw_state.items()
+    }
+    result = set_peft_model_state_dict(model, cleaned_state)
     unexpected = list(getattr(result, "unexpected_keys", []) or [])
     if unexpected:
         log(f"[!] {len(unexpected)} unexpected keys loading / claves inesperadas al cargar {src}")
@@ -123,7 +128,12 @@ def export_lora(model: torch.nn.Module, path: str, cfg: TrainConfig,
     for key, value in model.state_dict().items():
         if "lora_" not in key:
             continue
-        new_key = "transformer." + key.replace("base_model.model.", "")
+        new_key = (
+            "transformer."
+            + key.replace("base_model.model.", "")
+            .replace("._orig_mod.", ".")
+            .replace("_orig_mod.", "")
+        )
         clean[new_key] = value.to(torch.bfloat16).cpu().contiguous()
 
     if cfg.export_alpha_tensors:
