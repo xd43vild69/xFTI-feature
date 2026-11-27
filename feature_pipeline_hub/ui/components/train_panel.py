@@ -21,6 +21,7 @@ from feature_pipeline.application import dataset_service, export_service, traini
 from feature_pipeline.domain import naming
 from feature_pipeline.domain.curation_report import Tier, WeightProfile, tier_counts
 from feature_pipeline.domain.models import DatasetSample, IngestionRun
+from feature_pipeline.infrastructure import checkpoint_files
 from feature_pipeline.infrastructure import training_repository as training_repo
 from feature_pipeline.infrastructure import training_runner
 from feature_pipeline.infrastructure.database import get_connection
@@ -332,6 +333,25 @@ def _render_status_strip(
     if train_runs:
         latest = train_runs[0]  # newest first
         st.caption(f"Last run: {latest.status} · {latest.finished_at or 'in progress'}")
+        if latest.status == "completed":
+            _, latest_loras = _list_run_loras(latest)
+            if latest_loras:
+                col_sel, col_btn = st.columns([3, 2], vertical_alignment="bottom")
+                with col_sel:
+                    chosen = st.selectbox(
+                        "LoRA a descargar",
+                        latest_loras,
+                        index=0,
+                        format_func=_format_lora_option,
+                        key=f"header_lora_select_{latest.training_run_id}",
+                    )
+                with col_btn:
+                    if chosen is not None:
+                        _render_lora_download_control(
+                            chosen.path,
+                            key_prefix=f"header_lora_{latest.training_run_id}",
+                            label=f"Descargar {chosen.path.name}",
+                        )
 
 
 def _render_mode_selector(
@@ -1927,11 +1947,87 @@ def _render_run_body(run: training_repo.TrainingRun) -> None:
     log_text = _tail_log(run.log_path)
     st.code(log_text or "Waiting for output…", language=None, height=240)
 
+    _render_generated_loras(run)
+
     if run.status == "running":
         if st.button("Stop training", icon=":material/stop:"):
             with _db() as conn:
                 training_service.stop_training(conn, run.training_run_id)
             st.rerun()
+
+
+def _list_run_loras(
+    run: training_repo.TrainingRun,
+) -> tuple[Path | None, list[checkpoint_files.CheckpointFileInfo]]:
+    raw_output_dir = run.config.get("output_dir")
+    if not raw_output_dir:
+        return None, []
+    output_dir = Path(str(raw_output_dir))
+    if not output_dir.is_dir():
+        return output_dir, []
+    files = checkpoint_files.list_checkpoint_files(output_dir)
+    # Put FINAL first, then newest steps first.
+    files.sort(key=lambda info: (info.is_final, info.step), reverse=True)
+    return output_dir, files
+
+
+def _format_lora_option(info: checkpoint_files.CheckpointFileInfo) -> str:
+    try:
+        size_mb = info.path.stat().st_size / (1024 * 1024)
+        size_str = f"{size_mb:.1f} MB"
+    except OSError:
+        size_str = "—"
+    tag = "FINAL" if info.is_final else f"step {info.step}"
+    return f"{info.path.name} ({tag} · {size_str})"
+
+
+def _render_lora_download_control(path: Path, key_prefix: str, label: str) -> None:
+    """Two-step download so Streamlit only reads the .safetensors bytes on demand."""
+    ready_key = f"{key_prefix}_ready"
+    if st.session_state.get(ready_key) == str(path) and path.is_file():
+        st.download_button(
+            label,
+            data=path.read_bytes(),
+            file_name=path.name,
+            mime="application/octet-stream",
+            type="primary",
+            icon=":material/download:",
+            key=f"{key_prefix}_dl_{path.name}",
+        )
+    elif st.button(
+        f"Preparar descarga · {path.name}",
+        icon=":material/download:",
+        key=f"{key_prefix}_prep_{path.name}",
+    ):
+        st.session_state[ready_key] = str(path)
+        st.rerun()
+
+
+def _render_generated_loras(run: training_repo.TrainingRun) -> None:
+    output_dir, files = _list_run_loras(run)
+    if not files:
+        if run.status == "completed" and output_dir is not None:
+            st.caption(f"No se encontraron archivos `.safetensors` en `{output_dir}`.")
+        return
+
+    with st.container(border=True):
+        st.markdown("#### LoRAs generados")
+        if output_dir is not None:
+            st.caption(f"Ruta en disco: `{output_dir}`")
+
+        selected = st.selectbox(
+            "Archivo LoRA",
+            files,
+            index=0,
+            format_func=_format_lora_option,
+            key=f"lora_select_{run.training_run_id}",
+        )
+        if selected is not None:
+            _render_lora_download_control(
+                selected.path,
+                key_prefix=f"monitor_lora_{run.training_run_id}",
+                label=f"Descargar {selected.path.name}",
+            )
 
 
 def _tail_log(log_path: str) -> str:

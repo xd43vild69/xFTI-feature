@@ -43,7 +43,7 @@ from typing import Literal
 
 from pydantic import BaseModel, field_validator
 
-CaptionMode = Literal["subject", "location"]
+CaptionMode = Literal["subject", "scenery", "location"]
 
 SUBJECT_INSTRUCTION = """Analyze this photo of a person for AI training captioning.
 Return ONLY a JSON object with these exact keys:
@@ -55,6 +55,15 @@ Return ONLY a JSON object with these exact keys:
 - "tattoos_visible": true or false
 - "asymmetric_marks": short phrase naming each tattoo, scar or birthmark that is on one side of the body and the side it is on from the subject's own point of view, not the viewer's, e.g. "tattoo on their left forearm", "scar above their right eyebrow", or "none"
 Do NOT describe facial features, hair, body type, or tattoo designs — say where a mark is and on which side, never what it depicts. No extra text."""
+
+SCENERY_INSTRUCTION = """Analyze this photo focusing on the scenery, environment, and place for AI training captioning.
+Return ONLY a JSON object with these exact keys:
+- "perspective": short phrase, e.g. "wide angle shot", "eye-level architectural view", "low angle shot"
+- "setting": descriptive phrase naming the place or environment, e.g. "historic cobblestone street", "modern minimalist living room", "dense pine forest"
+- "architecture": detailed phrase describing buildings, walls, ceilings, surfaces, materials, and structural style, e.g. "weathered brick facades with arched windows and wrought-iron balconies", or "none"
+- "objects": detailed phrase listing key objects, furniture, props, vegetation, and environmental elements, e.g. "wooden dining table, ceramic vases, pendant lamps, potted monstera plant", or "none"
+- "lighting": descriptive phrase for light, time of day, and atmosphere, e.g. "warm afternoon sunlight casting long shadows", "moody neon reflections on wet pavement"
+Do NOT focus on any person or character in the scene — omit facial features, hair, clothing, poses, and body details; if a person is present, omit them or mention them only as minor background context. No extra text."""
 
 LOCATION_INSTRUCTION = """Analyze this photo of a location for AI training captioning.
 Return ONLY a JSON object with these exact keys:
@@ -124,6 +133,16 @@ class SubjectSlots(_Slots):
         return str(value).strip().lower() in {"true", "yes", "1", "y"}
 
 
+class ScenerySlots(_Slots):
+    """Detailed place, architecture, and objects caption, downplaying any person."""
+
+    perspective: str = ""
+    setting: str = ""
+    architecture: str = ""
+    objects: str = ""
+    lighting: str = ""
+
+
 class LocationSlots(_Slots):
     """What a place LoRA's caption may say — everything except the place itself."""
 
@@ -134,12 +153,24 @@ class LocationSlots(_Slots):
     transient_objects: str = ""
 
 
-Slots = SubjectSlots | LocationSlots
+Slots = SubjectSlots | ScenerySlots | LocationSlots
+
+_INSTRUCTIONS: dict[CaptionMode, str] = {
+    "subject": SUBJECT_INSTRUCTION,
+    "scenery": SCENERY_INSTRUCTION,
+    "location": LOCATION_INSTRUCTION,
+}
+
+_SLOT_MODELS: dict[CaptionMode, type[Slots]] = {
+    "subject": SubjectSlots,
+    "scenery": ScenerySlots,
+    "location": LocationSlots,
+}
 
 
 def instruction_for(mode: CaptionMode) -> str:
     """The prompt to send the VLM for `mode`."""
-    return SUBJECT_INSTRUCTION if mode == "subject" else LOCATION_INSTRUCTION
+    return _INSTRUCTIONS[mode]
 
 
 def parse_slots(raw: str, mode: CaptionMode) -> Slots:
@@ -163,7 +194,7 @@ def parse_slots(raw: str, mode: CaptionMode) -> Slots:
     if not isinstance(payload, dict):
         raise CaptionSchemaError(f"Expected a JSON object, got {type(payload).__name__}")
 
-    model = SubjectSlots if mode == "subject" else LocationSlots
+    model = _SLOT_MODELS[mode]
     return model.model_validate(payload)
 
 
@@ -191,6 +222,14 @@ def assemble_caption(slots: Slots) -> str:
             parts.append(marks)
         elif slots.tattoos_visible:
             parts.append("visible tattoos")
+    elif isinstance(slots, ScenerySlots):
+        parts = [
+            slots.perspective,
+            slots.setting,
+            slots.architecture,
+            slots.objects,
+            slots.lighting,
+        ]
     else:
         parts = [slots.time_of_day, slots.weather, slots.lighting, slots.perspective]
         # Last, because it is the one slot whose content is incidental to the place.

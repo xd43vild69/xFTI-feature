@@ -19,11 +19,19 @@ from feature_pipeline.infrastructure import recaption_runner
 
 MODE_KEY = "recaption_mode"
 
+MODE_LABELS = {
+    "subject": "Subject (Character)",
+    "scenery": "Scenery",
+    "location": "Location (LoRA)",
+}
+
 # What each mode leaves *out* is the point — that is what the trigger word ends up
-# carrying. See domain/caption_schema.py.
+# carrying (except `scenery`, which describes the environment in detail). See domain/caption_schema.py.
 MODE_HELP = {
     "subject": "Shot, pose, clothing, background and light. Says nothing about the "
     "face, hair or build, so the trigger word learns those.",
+    "scenery": "Detailed place elements, architecture, materials, objects and light. "
+    "Downplays or omits any person in the scene.",
     "location": "Time of day, weather, light and whatever is passing through. Says "
     "nothing about the architecture or style, so the trigger word learns those.",
 }
@@ -65,22 +73,38 @@ def render_toolbar(
         if training_active:
             st.caption(":material/info: GPU busy training — recaption is paused until it finishes.")
 
-        with st.popover("", icon=":material/tune:", help="Recaption settings"):
-            st.radio(
-                "Caption mode",
-                list(MODE_HELP),
-                key=MODE_KEY,
-                format_func=lambda mode: mode.capitalize(),
-                captions=list(MODE_HELP.values()),
-            )
-
         if st.button(
             f"Recaption {len(selected)}",
             icon=":material/auto_awesome:",
             disabled=not selected or training_active,
-            help="Select images above, then click to regenerate captions with Qwen3-VL. ~2s per image on GPU.",
+            help="Select images above, then click to choose focus mode and regenerate captions with Qwen3-VL.",
         ):
-            _run_batch(run, selected)
+            st.session_state.pop(MODE_KEY, None)
+            _render_recaption_dialog(run, selected)
+
+
+@st.dialog("Recaption")
+def _render_recaption_dialog(run: IngestionRun, samples: list[DatasetSample]) -> None:
+    """Ask the user which caption focus mode to use, then run the batch."""
+    st.caption(f"{len(samples)} image(s) selected · ~2s per image on GPU.")
+    chosen = st.radio(
+        "Select focus mode",
+        list(MODE_HELP),
+        index=None,
+        key=MODE_KEY,
+        format_func=lambda mode: MODE_LABELS[mode],
+        captions=list(MODE_HELP.values()),
+    )
+
+    if st.button(
+        f"Start recaption ({len(samples)})",
+        type="primary",
+        icon=":material/auto_awesome:",
+        disabled=chosen is None,
+        use_container_width=True,
+        key=f"btn_recaption_start_{run.run_id}",
+    ):
+        _run_batch(run, samples)
 
 
 def _run_batch(run: IngestionRun, samples: list[DatasetSample]) -> None:

@@ -124,6 +124,35 @@ def test_a_malformed_reply_is_reported_as_an_error_for_that_sample(monkeypatch):
     assert results[1].sample_id == "s2"
 
 
+def test_scenery_mode_assembles_the_scenery_schema(monkeypatch):
+    reply = json.dumps(
+        {
+            "perspective": "wide angle shot",
+            "setting": "modern minimalist living room",
+            "architecture": "exposed concrete walls and wooden ceiling beams",
+            "objects": "low linen sofa, ceramic vase, floor lamp",
+            "lighting": "soft morning light",
+        }
+    )
+    monkeypatch.setattr(
+        recaption_service.recaption_runner,
+        "run_recaption",
+        _fake_runner([{"event": "caption", "path": "/data/a.png", "caption": reply}]),
+    )
+
+    results = list(
+        recaption_service.recaption_samples(
+            [_sample("s1", "/data/a.png")], trigger_word="", mode="scenery"
+        )
+    )
+
+    assert results[0].caption == (
+        "wide angle shot, modern minimalist living room, "
+        "exposed concrete walls and wooden ceiling beams, "
+        "low linen sofa, ceramic vase, floor lamp, soft morning light"
+    )
+
+
 def test_location_mode_assembles_the_location_schema(monkeypatch):
     reply = json.dumps(
         {
