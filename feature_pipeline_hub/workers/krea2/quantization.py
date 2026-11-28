@@ -363,8 +363,13 @@ def activation_offload_context(active: bool = True) -> Iterator[None]:
     """Offload saved forward boundary activations to PyTorch's C++ CachingHostAllocator (`pin_memory=True`).
 
     In PyTorch, `save_on_cpu(pin_memory=True)` reuses pinned host blocks via the native
-    CachingHostAllocator and deduplicates repeated unpacks under non-reentrant gradient
-    checkpointing without leaking duplicate GPU tensors.
+    CachingHostAllocator.
+
+    Under gradient checkpointing this reaches only what is saved *outside* the
+    checkpointed blocks: the checkpoint's own hooks shadow it inside each block, and the
+    block inputs are held by reference, never through a hook. Those inputs are offloaded
+    by `krea2.offload.offloaded_checkpoint` instead, which the trainer installs when this
+    flag is on.
     """
     if active and _SAVE_ON_CPU_AVAILABLE and _save_on_cpu_ctx is not None:
         with _save_on_cpu_ctx(pin_memory=True):

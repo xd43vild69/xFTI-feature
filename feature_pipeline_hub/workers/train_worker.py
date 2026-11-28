@@ -61,6 +61,8 @@ from krea2 import ema as _ema                   # noqa: E402
 from krea2 import lora_io as _lora_io           # noqa: E402
 from krea2 import math_ops as _math             # noqa: E402
 from krea2 import metrics as _metrics           # noqa: E402
+from krea2 import offload as _offload           # noqa: E402
+from krea2 import chunking as _chunking         # noqa: E402
 from krea2 import preview as _preview           # noqa: E402
 from krea2 import quantization as _quant        # noqa: E402
 from krea2 import sampling as _sampling         # noqa: E402
@@ -104,6 +106,7 @@ INIT_LORA_FROM     = CFG.init_lora_from
 GRAD_CHECKPOINTING = CFG.gradient_checkpointing
 GRAD_CKPT_INTERVAL = CFG.gradient_checkpointing_interval
 ACTIVATION_OFFLOAD = CFG.activation_offload
+FFN_CHUNKS         = CFG.ffn_chunks
 COMPILE_TRANSFORMER = CFG.compile_transformer
 RUN_ID             = CFG.run_id
 PHASE_INDEX        = CFG.phase_index
@@ -218,6 +221,7 @@ def _print_effective_config():
         ("compact_text",         COMPACT_TEXT),
         ("gradient_checkpointing", f"{GRAD_CHECKPOINTING} (interval {GRAD_CKPT_INTERVAL})" if GRAD_CHECKPOINTING else False),
         ("activation_offload",   ACTIVATION_OFFLOAD),
+        ("ffn_chunks",           FFN_CHUNKS if FFN_CHUNKS > 1 else "off"),
         ("compile_transformer",  COMPILE_TRANSFORMER),
         ("nan_guard",            f"{NAN_GUARD} (abort after {NAN_ABORT_AFTER})" if NAN_GUARD else False),
         ("oom_guard",            f"{OOM_GUARD} (abort after {OOM_ABORT_AFTER})" if OOM_GUARD else False),
@@ -480,6 +484,15 @@ def train_krea2():
     )
 
     if GRAD_CHECKPOINTING:
+        # With checkpointing on, `save_on_cpu` alone leaves the per-block inputs (the
+        # bulk of what the backward keeps, ~2.2 GB at 1280²) in VRAM; see krea2/offload.py.
+        if ACTIVATION_OFFLOAD:
+            def _ckpt_block(module, *args):
+                return _offload.offloaded_checkpoint(module, *args)
+        else:
+            def _ckpt_block(module, *args):
+                return torch.utils.checkpoint.checkpoint(module.__call__, *args, use_reentrant=False)
+
         if GRAD_CKPT_INTERVAL > 1 and hasattr(transformer, "transformer_blocks"):
             # diffusers reads one model-wide flag, so per-block flags are never consulted;
             # the choice has to happen in the checkpoint func it calls for every block.
@@ -490,13 +503,22 @@ def train_krea2():
                 idx = next((i for i, b in enumerate(_blocks) if b is module), 0)
                 if idx % GRAD_CKPT_INTERVAL != 0:
                     return module(*args)
-                return torch.utils.checkpoint.checkpoint(module.__call__, *args, use_reentrant=False)
+                return _ckpt_block(module, *args)
 
             transformer.enable_gradient_checkpointing(_selective_ckpt)
             _active = sum(1 for i in range(len(_blocks)) if i % GRAD_CKPT_INTERVAL == 0)
             print(f"Selective gradient checkpointing: {_active}/{len(_blocks)} blocks (interval={GRAD_CKPT_INTERVAL})")
+        elif ACTIVATION_OFFLOAD:
+            transformer.enable_gradient_checkpointing(_ckpt_block)
         else:
+            # Default path left exactly as it was, so the smoke baseline still covers it.
             transformer.enable_gradient_checkpointing()
+        if ACTIVATION_OFFLOAD:
+            print("Gradient checkpointing with block inputs offloaded to pinned host RAM")
+        if FFN_CHUNKS > 1 and hasattr(transformer, "transformer_blocks"):
+            # Before torch.compile below, which traces whatever `ff.forward` is then.
+            _n = _chunking.chunk_feed_forward(transformer.transformer_blocks, FFN_CHUNKS)
+            print(f"FFN split into {FFN_CHUNKS} sequence chunks in {_n} blocks")
         if LORA_TARGET == "all" and hasattr(transformer, "text_fusion"):
             _orig_tf_fwd = transformer.text_fusion.forward
 

@@ -43,7 +43,7 @@ Streamlit app for curating LoRA training datasets (Krea 2 / Qwen3-VL), structure
 - **`workers/`** — standalone scripts run as **separate processes in a different Python environment** (`training_runtime/venv`, not the hub's own env): `precache_worker.py` is byte-for-byte upstream and must stay that way — don't add instrumentation inside its body. `train_worker.py` has diverged deliberately: it is being split into the `krea2/` package (see below), so it no longer diffs against upstream at all. `_telemetry.py` wraps their `__main__` entrypoints from the outside to emit structured JSON-lines lifecycle events without touching the vendored code. `recaption_worker.py` / `caption_qwen3vl.py` run Qwen3-VL captioning the same way.
 - **`workers/krea2/`** — the trainer, split out of `train_worker.py` (2264 → 935 lines). `train_worker.py` stays put as the entrypoint: `training_service.py` launches it by path, and running it as a *script* is what puts `workers/` on `sys.path` so `krea2` and `_telemetry` resolve — don't turn it into a module or move it.
 
-  The package splits by **whether a module imports torch**, not by theme. Torch-free (`config`, `cache_index`, `curation`, `sampling`, `schedule`, `metrics`, `checkpoints`) are listed individually in mypy's `files` and tested by `tests/workers/`; the rest (`dataset`, `math_ops`, `quantization`, `lora_io`, `ema`, `preview`, `state`) need the training runtime. Keep that line — it is the only reason any of this is reachable from CI.
+  The package splits by **whether a module imports torch**, not by theme. Torch-free (`config`, `cache_index`, `curation`, `sampling`, `schedule`, `metrics`, `checkpoints`) are listed individually in mypy's `files` and tested by `tests/workers/`; the rest (`dataset`, `math_ops`, `quantization`, `lora_io`, `ema`, `preview`, `state`, `offload`, `chunking`) need the training runtime. Keep that line — it is the only reason any of this is reachable from CI.
 
   `config.load_config()` returns a **frozen** `TrainConfig`; pass it explicitly rather than reintroducing module globals. The original reassigned 21 of them after first definition, so any `from ... import COMPACT_TEXT` captured whichever value existed at import time with nothing failing loudly — the dataclass makes that unrepresentable. `train_worker.py` still keeps read-only aliases onto it for the loop's benefit.
 
@@ -68,6 +68,24 @@ A fourth, needed only when touching the warm-start path (see *Forking mid-run* b
 ```bash
 training_runtime/venv/bin/python tests/workers/golden/verify_warm_start.py
 ```
+
+Two more cover the VRAM paths the smoke run never reaches, because both default off. Run them when touching `krea2/offload.py`, `krea2/chunking.py` or the checkpointing setup in `train_worker.py`. Both need a GPU.
+
+```bash
+training_runtime/venv/bin/python tests/workers/golden/verify_offload_checkpoint.py
+```
+```bash
+training_runtime/venv/bin/python tests/workers/golden/verify_ffn_chunking.py
+```
+
+### Training at 1280² on 12 GB: `activation_offload` + `ffn_chunks`
+
+Measured on a 4070 Ti (rank 48, attn+ff, fp32 LoRA): 1280² OOMs with either setting alone and runs with both. Peak is 11.21 GB at `ffn_chunks: 4` (~13.9 s/step) and 11.47 GB at `ffn_chunks: 2` (~12.8 s/step).
+
+- **`activation_offload`** routes block checkpointing through `krea2.offload.offloaded_checkpoint`. `save_on_cpu` by itself never reaches the per-block inputs, because non-reentrant checkpointing holds them by reference, and without them offloaded the forward alone OOMs. Gradients are bit-identical to standard checkpointing.
+- **The peak is not where it looks.** It lands at the *end* of the backward: the fp32 LoRA grads are complete (~0.7 GB) and the last block's recompute plus backward adds ~3.2 GB on top. By then, standard checkpointing has already released nearly every input, so offloading alone does not move the peak.
+- **`ffn_chunks`** (`krea2.chunking`) attacks that transient. It splits the SwiGLU along the sequence, with a nested checkpoint per chunk. The split runs outside `torch.compile`, because dynamo 2.14 asserts on the nested checkpoint. It is not bit-identical, but it stays within the noise bf16 already adds; the measurements are in `verify_ffn_chunking.py`.
+- **Only the worker reads `ffn_chunks` so far.** `TrainSettings`, `TrainingConfig` and the UI do not carry it yet.
 
 The smoke run compares by tolerance, not diff: the loop is **not bit-reproducible against itself** (`cudnn.benchmark` picks kernels by timing, TF32 is on, reductions are unordered). Measured drift on unchanged code is ~3e-4 on loss and ~2% on grad_norm. See `tests/workers/golden/compare_smoke.py`.
 - **`mcp_server/`** (hub root, not under `src/`) — a `FastMCP` server exposing the pipeline as tools for autonomous agents (LangGraph etc.), stdio transport, no auth (the app has none anywhere). `server.py` tools are thin wrappers over `application/`/`infrastructure/` — never reimplement business logic here. Runs as its own process against the same SQLite DB, same per-operation-connection convention as `ui/state.py`.

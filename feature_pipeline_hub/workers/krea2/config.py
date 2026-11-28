@@ -55,6 +55,7 @@ DEFAULTS: dict[str, Any] = {
     "gradient_checkpointing": True,
     "gradient_checkpointing_interval": 1,  # 1 = every block, 2 = every 2nd block, etc.
     "activation_offload": False,
+    "ffn_chunks": 1,  # split each block's FFN along the sequence; 1 = off (see krea2/offload.py)
     "compile_transformer": False,
 
     # ── A1/A10: precision ────────────────────────────────────────────────────
@@ -220,6 +221,7 @@ class TrainConfig:
     gradient_checkpointing: bool
     gradient_checkpointing_interval: int
     activation_offload: bool
+    ffn_chunks: int
     compile_transformer: bool
 
     lora_dtype: str
@@ -523,6 +525,7 @@ def load_config(
         gradient_checkpointing=bool(r.get("gradient_checkpointing")),
         gradient_checkpointing_interval=max(1, int(r.get("gradient_checkpointing_interval"))),
         activation_offload=bool(r.get("activation_offload")),
+        ffn_chunks=max(1, int(r.get("ffn_chunks"))),
         compile_transformer=bool(r.get("compile_transformer")),
 
         lora_dtype=r.choice("lora_dtype"),
