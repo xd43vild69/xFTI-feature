@@ -3,6 +3,7 @@
 Renders whichever dataset is active in the context bar.
 """
 
+import hashlib
 from pathlib import Path
 
 import streamlit as st
@@ -230,8 +231,27 @@ def _dropzone_version_key(run_id: str) -> str:
     return f"curate_drop_version_{run_id}"
 
 
+def _distinct_uploads(uploaded_files: list) -> list:
+    """Drop repeats of the same file within one batch.
+
+    The page-wide drop handler below hands a drop to the uploader twice (a synthetic
+    `drop` event, then a fallback that assigns the input's files), and the uploader
+    appends both. The two copies are the same name, size and bytes, so keying on that
+    removes exactly them without needing to know which path fired.
+    """
+    seen: set[tuple[str, str]] = set()
+    distinct = []
+    for f in uploaded_files:
+        key = (f.name, hashlib.sha1(f.getvalue()).hexdigest())
+        if key not in seen:
+            seen.add(key)
+            distinct.append(f)
+    return distinct
+
+
 def _ingest_dropped_files(run: IngestionRun, uploaded_files: list) -> None:
     """Immediately integrate dropped/selected files into `run` just like Import, then rerun."""
+    uploaded_files = _distinct_uploads(uploaded_files)
     st.session_state[_dropzone_version_key(run.run_id)] = (
         st.session_state.get(_dropzone_version_key(run.run_id), 0) + 1
     )
@@ -490,7 +510,7 @@ def render() -> None:
         )
         with st.popover("", icon=":material/tune:", help="View options"):
             columns_per_row = st.select_slider(
-                "Columns", options=[2, 3, 4, 5, 6], value=6, key=f"gallery_cols_{run.run_id}"
+                "Columns", options=[2, 3, 4, 5, 6], value=4, key=f"gallery_cols_{run.run_id}"
             )
 
     trigger = run.concept.trigger_word
@@ -563,6 +583,7 @@ def _render_card(sample: DatasetSample, run: IngestionRun, thumbnail_size: int) 
         f"gallery_{run.run_id}_{sample.sample_id}",
         sample=sample,
         run_id=run.run_id,
+        tooltip=Path(sample.image_path).name,
         size=thumbnail_size,
     )
 
@@ -573,7 +594,7 @@ def _render_card(sample: DatasetSample, run: IngestionRun, thumbnail_size: int) 
             help="Select for batch recaptioning",
             label_visibility="collapsed",
         )
-        st.caption(f"{Path(sample.image_path).name} · {_status(sample)}")
+        st.caption(_status(sample))
 
         excluded = sample.is_excluded
         if st.button(

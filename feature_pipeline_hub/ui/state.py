@@ -86,9 +86,11 @@ def update_concept_trigger_word(run_id: str, trigger_word: str) -> None:
 
 
 def rename_dataset_base(run_id: str, new_name: str) -> None:
+    """Rename a dataset; its trigger word and captions follow the new name."""
     new_name = new_name.strip()
     with _db() as conn:
-        old_name, new_name = repo.rename_concept_and_run(conn, run_id, new_name)
+        result = dataset_service.rename_dataset(conn, run_id, new_name)
+    old_name = result.old_name
     if old_name and old_name != new_name:
         dataset_old = training_service.dataset_dir_for(old_name)
         dataset_new = training_service.dataset_dir_for(new_name)
@@ -102,6 +104,14 @@ def rename_dataset_base(run_id: str, new_name: str) -> None:
         cache_krea_new = training_service.cache_dir_for(new_name, "krea2")
         if cache_krea_old.is_dir() and not cache_krea_new.exists():
             cache_krea_old.rename(cache_krea_new)
+
+    # The exported folder carries its own copy of every caption as a .txt sidecar.
+    if result.old_trigger != result.new_trigger:
+        training_service.sync_dataset_captions_with_trigger_word(
+            training_service.dataset_dir_for(new_name),
+            result.new_trigger,
+            old_trigger_word=result.old_trigger or None,
+        )
 
 
 def append_images(run: IngestionRun, uploaded_files: list) -> list[DatasetSample]:
@@ -577,6 +587,25 @@ def delete_run(run_id: str) -> None:
 
     if st.session_state.get(ACTIVE_RUN_KEY) == run_id:
         st.session_state.pop(ACTIVE_RUN_KEY, None)
+
+
+def plan_lora_cleanup(run_id: str) -> training_service.LoraCleanupPlan:
+    with _db() as conn:
+        return training_service.plan_lora_cleanup(conn, run_id)
+
+
+def clean_up_dataset(run_id: str) -> tuple[int, int, list[str]]:
+    """Delete a dataset's trained LoRAs, then the dataset itself.
+
+    The weights go first and the dataset only if that went cleanly: the training rows
+    are what say where the weights are, so removing the dataset first and failing
+    halfway would leave files nothing in the UI can find again.
+    """
+    plan = plan_lora_cleanup(run_id)
+    deleted, freed, errors = training_service.delete_lora_files(plan)
+    if not errors:
+        delete_run(run_id)
+    return deleted, freed, errors
 
 
 def set_active_run(run_id: str) -> None:

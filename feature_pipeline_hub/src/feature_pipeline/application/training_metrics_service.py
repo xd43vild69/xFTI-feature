@@ -211,3 +211,39 @@ def _total(values: Iterable[float | None]) -> float | None:
     """Sum what is present, or None if nothing is."""
     present = [value for value in values if value is not None]
     return sum(present) if present else None
+
+
+def freeze_checkpoint_history(conn: sqlite3.Connection) -> int:
+    """Store, for every lineage that only has it reconstructed, the checkpoint spans.
+
+    A run launched before the trainer logged its saves has no `checkpoint_log.csv`;
+    its Checkpoints tab is inferred from the `.safetensors` mtimes and headers. Delete
+    those files and the tab goes blank. This writes that inference into the same
+    column a live log would have filled, so `_resolve_checkpoint_summary` finds it
+    before it falls back to files that no longer exist. Returns how many lineages
+    were stored.
+
+    A lineage is skipped when it already has a live log or a stored snapshot, so
+    running this twice changes nothing.
+    """
+    stored = 0
+    for group in group_training_lineages(repo.list_training_runs(conn)):
+        latest = group[-1]
+        if training_service.read_checkpoint_log_summary(latest) is not None:
+            continue
+        if any(run.checkpoint_metrics for run in group):
+            continue
+        summary = training_service.reconstruct_checkpoint_log_summary(group)
+        if summary is None:
+            continue
+        # record_train_log_metrics overwrites all three columns, so hand back the
+        # two this run already had instead of blanking them.
+        repo.record_train_log_metrics(
+            conn,
+            latest.training_run_id,
+            steps_executed=latest.steps_executed,
+            metrics=latest.metrics,
+            checkpoint_metrics=summary.model_dump(mode="json"),
+        )
+        stored += 1
+    return stored

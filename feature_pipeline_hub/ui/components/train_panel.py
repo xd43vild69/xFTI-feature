@@ -36,6 +36,18 @@ from feature_pipeline.infrastructure.model_prerequisites import (
 LOG_TAIL_BYTES = 8000
 
 
+# Type scale for the hand-written HTML cards below. They bypass Streamlit's theme,
+# so these rem values (relative to the theme's baseFontSize) are the only thing
+# keeping them in step with the rest of the UI. Nothing here goes under 0.82rem.
+_FS_LABEL = "0.82rem"    # uppercase micro-labels
+_FS_SUB = "0.85rem"      # secondary text beside a value
+_FS_BODY = "0.92rem"     # descriptions, badges, recommendations
+_FS_VALUE = "1rem"       # headline numbers
+_FS_TITLE = "1.05rem"    # card title
+_FS_TRIGGER = "1.15rem"  # trigger word
+_FS_ICON = "1.35rem"
+
+
 @contextmanager
 def _db():
     conn = get_connection()
@@ -901,7 +913,7 @@ def _render_new_run_form(run: IngestionRun, *, busy: bool) -> None:
                     value=int(config.get("gradient_checkpointing_interval", 1)),
                     key=_field_key(run.run_id, "gradient_checkpointing_interval", target_model),
                     on_change=_sync_fields_to_json, args=(run.run_id, target_model),
-                    help="RTX 4070 Ti (12 GB): usa 2 a 512px (~15% más rápido); usa 1 a 768px+ para evitar OOM.",
+                    help="1 = recalcula todos los bloques (menos VRAM). 2+ salta bloques: más rápido, más VRAM. RTX 4070 Ti (12 GB): a 768px+ con 2 no cabe; usa 1. Con Activation offload + compile, solo 1 (2+ falla en el backward).",
                 )
                 st.checkbox(
                     "Activation offload (CPU)",
@@ -1145,10 +1157,10 @@ def _render_resume_form(
         st.markdown(
             f"""
             <div style="background: rgba(168, 85, 247, 0.12); border: 1px solid rgba(168, 85, 247, 0.4); border-radius: 8px; padding: 6px 12px; margin-bottom: 2px;">
-                <div style="font-size: 0.70rem; color: #cbd5e1; text-transform: uppercase; font-weight: 600; letter-spacing: 0.5px; display: flex; align-items: center; gap: 4px;">
+                <div style="font-size: {_FS_LABEL}; color: #cbd5e1; text-transform: uppercase; font-weight: 600; letter-spacing: 0.5px; display: flex; align-items: center; gap: 4px;">
                     🏷️ <span>Trigger Word / Palabra Clave</span>
                 </div>
-                <div style="font-size: 1.05rem; font-weight: 700; color: #c084fc; font-family: monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
+                <div style="font-size: {_FS_TRIGGER}; font-weight: 700; color: #c084fc; font-family: monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
                     {trigger_text}
                 </div>
             </div>
@@ -1437,10 +1449,10 @@ def _render_fork_form(
         st.markdown(
             f"""
             <div style="background: rgba(168, 85, 247, 0.12); border: 1px solid rgba(168, 85, 247, 0.4); border-radius: 8px; padding: 6px 12px; margin-bottom: 2px;">
-                <div style="font-size: 0.70rem; color: #cbd5e1; text-transform: uppercase; font-weight: 600; letter-spacing: 0.5px; display: flex; align-items: center; gap: 4px;">
+                <div style="font-size: {_FS_LABEL}; color: #cbd5e1; text-transform: uppercase; font-weight: 600; letter-spacing: 0.5px; display: flex; align-items: center; gap: 4px;">
                     🏷️ <span>Trigger Word / Palabra Clave</span>
                 </div>
-                <div style="font-size: 1.05rem; font-weight: 700; color: #c084fc; font-family: monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
+                <div style="font-size: {_FS_TRIGGER}; font-weight: 700; color: #c084fc; font-family: monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
                     {trigger_text}
                 </div>
             </div>
@@ -1864,53 +1876,53 @@ def _render_likeness_health_card(run: training_repo.TrainingRun, df: pd.DataFram
     <div style="background: {phase_bg}; border: 1px solid {phase_border}; border-radius: 10px; padding: 12px 16px; margin-bottom: 14px;">
         <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid rgba(255,255,255,0.08); padding-bottom: 8px; margin-bottom: 10px;">
             <div style="display: flex; align-items: center; gap: 8px;">
-                <span style="font-size: 1.25rem;">{phase_icon}</span>
-                <span style="font-size: 0.95rem; font-weight: 700; color: {phase_color}; letter-spacing: 0.3px;">
+                <span style="font-size: {_FS_ICON};">{phase_icon}</span>
+                <span style="font-size: {_FS_TITLE}; font-weight: 700; color: {phase_color}; letter-spacing: 0.3px;">
                     {phase_title}
                 </span>
             </div>
-            <div style="font-size: 0.80rem; font-weight: 600; color: #cbd5e1; background: rgba(0,0,0,0.3); padding: 3px 10px; border-radius: 6px;">
+            <div style="font-size: {_FS_BODY}; font-weight: 600; color: #cbd5e1; background: rgba(0,0,0,0.3); padding: 3px 10px; border-radius: 6px;">
                 Paso {current_step:,} / {total_steps:,} ({progress * 100:.1f}%)
             </div>
         </div>
-        <div style="font-size: 0.83rem; color: #e2e8f0; margin-bottom: 10px; line-height: 1.4;">
+        <div style="font-size: {_FS_BODY}; color: #e2e8f0; margin-bottom: 10px; line-height: 1.4;">
             {phase_desc}
         </div>
         <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 8px; margin-bottom: 12px;">
             <div style="background: rgba(0,0,0,0.25); padding: 6px 10px; border-radius: 6px;">
-                <span style="font-size: 0.70rem; color: #94a3b8; display: block; text-transform: uppercase; font-weight: 600;">🔄 Épocas Efectivas</span>
-                <span style="font-size: 0.90rem; font-weight: 700; color: #f8fafc;">{effective_epochs:.1f} pasadas / img <span style="font-size:0.75rem; color:#94a3b8;">({num_images} imgs)</span></span>
+                <span style="font-size: {_FS_LABEL}; color: #94a3b8; display: block; text-transform: uppercase; font-weight: 600;">🔄 Épocas Efectivas</span>
+                <span style="font-size: 0.90rem; font-weight: 700; color: #f8fafc;">{effective_epochs:.1f} pasadas / img <span style="font-size:{_FS_SUB}; color:#94a3b8;">({num_images} imgs)</span></span>
             </div>
             <div style="background: rgba(0,0,0,0.25); padding: 6px 10px; border-radius: 6px;">
-                <span style="font-size: 0.70rem; color: #94a3b8; display: block; text-transform: uppercase; font-weight: 600;">⚡ Loss Reciente (Tail vs Inicio)</span>
-                <span style="font-size: 0.90rem; font-weight: 700; color: #38bdf8;">{tail_loss:.4f} <span style="font-size:0.75rem; color:#94a3b8;">(inicio {head_loss:.4f} · avg {recent_loss:.4f})</span></span>
+                <span style="font-size: {_FS_LABEL}; color: #94a3b8; display: block; text-transform: uppercase; font-weight: 600;">⚡ Loss Reciente (Tail vs Inicio)</span>
+                <span style="font-size: 0.90rem; font-weight: 700; color: #38bdf8;">{tail_loss:.4f} <span style="font-size:{_FS_SUB}; color:#94a3b8;">(inicio {head_loss:.4f} · avg {recent_loss:.4f})</span></span>
             </div>
             <div style="background: rgba(0,0,0,0.25); padding: 6px 10px; border-radius: 6px;">
-                <span style="font-size: 0.70rem; color: #94a3b8; display: block; text-transform: uppercase; font-weight: 600;">🎯 Meta Agosto (vu_bd_v1)</span>
-                <span style="font-size: 0.90rem; font-weight: 700; color: {bench_color};">{dynamic_target_tail:.4f} <span style="font-size:0.75rem; color:#cbd5e1;">(faltan -{remaining_to_target:.4f})</span></span>
+                <span style="font-size: {_FS_LABEL}; color: #94a3b8; display: block; text-transform: uppercase; font-weight: 600;">🎯 Meta Agosto (vu_bd_v1)</span>
+                <span style="font-size: 0.90rem; font-weight: 700; color: {bench_color};">{dynamic_target_tail:.4f} <span style="font-size:{_FS_SUB}; color:#cbd5e1;">(faltan -{remaining_to_target:.4f})</span></span>
             </div>
             <div style="background: rgba(0,0,0,0.25); padding: 6px 10px; border-radius: 6px;">
-                <span style="font-size: 0.70rem; color: #94a3b8; display: block; text-transform: uppercase; font-weight: 600;">📉 Caída Δ Loss / Grad Norm</span>
-                <span style="font-size: 0.84rem; font-weight: 700; color: {gnorm_color};">Δ {-loss_drop:+.4f} <span style="font-size:0.73rem; color:#cbd5e1;">(meta -0.045) · {gnorm_status}</span></span>
+                <span style="font-size: {_FS_LABEL}; color: #94a3b8; display: block; text-transform: uppercase; font-weight: 600;">📉 Caída Δ Loss / Grad Norm</span>
+                <span style="font-size: 0.84rem; font-weight: 700; color: {gnorm_color};">Δ {-loss_drop:+.4f} <span style="font-size:{_FS_SUB}; color:#cbd5e1;">(meta -0.045) · {gnorm_status}</span></span>
             </div>
         </div>
         <div style="background: rgba(0,0,0,0.32); border: 1px solid rgba(255,255,255,0.10); border-radius: 8px; padding: 10px 12px; margin-bottom: 10px;">
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
-                <span style="font-size: 0.78rem; font-weight: 700; color: {bench_color}; letter-spacing: 0.2px;">
+                <span style="font-size: {_FS_BODY}; font-weight: 700; color: {bench_color}; letter-spacing: 0.2px;">
                     {bench_badge}
                 </span>
-                <span style="font-size: 0.78rem; font-weight: 700; color: #f8fafc;">
+                <span style="font-size: {_FS_BODY}; font-weight: 700; color: #f8fafc;">
                     Progreso hacia Loss de Agosto: {convergence_pct:.1f}%
                 </span>
             </div>
             <div style="width: 100%; height: 10px; background: rgba(255,255,255,0.08); border-radius: 999px; overflow: hidden; margin-bottom: 6px;">
                 <div style="width: {bar_fill_pct:.1f}%; height: 100%; background: linear-gradient(90deg, #ef4444 0%, #f59e0b 55%, #10b981 85%, #38bdf8 100%); border-radius: 999px;"></div>
             </div>
-            <div style="font-size: 0.78rem; color: #e2e8f0; line-height: 1.35;">
+            <div style="font-size: {_FS_BODY}; color: #e2e8f0; line-height: 1.35;">
                 {bench_msg}
             </div>
         </div>
-        <div style="font-size: 0.78rem; color: #cbd5e1; background: rgba(0,0,0,0.2); padding: 6px 10px; border-radius: 6px; border-left: 3px solid {phase_color};">
+        <div style="font-size: {_FS_BODY}; color: #cbd5e1; background: rgba(0,0,0,0.2); padding: 6px 10px; border-radius: 6px; border-left: 3px solid {phase_color};">
             💡 <b>Recomendación:</b> {target_eval} · <span style="color:{trend_color};">{trend_icon} {trend_text}</span>
         </div>
     </div>

@@ -474,3 +474,51 @@ def build_manifest(concept: ConceptGroup, version: str, dataset_name: str) -> Da
         caption_word_stats=quality_service.caption_length_stats(samples),
         content_hash=compute_content_hash(samples),
     )
+
+
+@dataclass(frozen=True)
+class RenameResult:
+    old_name: str
+    old_trigger: str
+    new_trigger: str
+    captions_changed: int
+
+
+def rename_dataset(conn: sqlite3.Connection, run_id: str, new_name: str) -> RenameResult:
+    """Rename a dataset and keep its trigger word equal to the new name.
+
+    The trigger word follows the name: the concept's `trigger_word` becomes the new
+    name, and every caption carrying the old trigger is re-triggered with it, so the
+    database never says one thing while the captions teach another. Raises ValueError,
+    before changing anything, when another dataset already uses the new name as its
+    trigger word — two datasets sharing a trigger would train into each other.
+
+    Captions are rewritten with `swap_trigger_word`; the ones that already read right
+    are not written at all. Files on disk (the exported folder and its sidecars) are
+    the caller's, since they depend on the training runtime this layer does not know.
+    """
+    new_name = new_name.strip()
+    run = repo.load_ingestion_run(conn, run_id)
+    if run is None:
+        raise ValueError(f"Unknown dataset run: {run_id}")
+
+    collision = repo.find_trigger_word_collision(conn, run_id, new_name)
+    if collision:
+        raise ValueError(
+            f"'{new_name}' ya es la palabra clave del dataset '{collision}'. "
+            "Elige otro nombre."
+        )
+
+    old_name = run.concept.concept_name
+    old_trigger = run.concept.trigger_word
+    changed = 0
+    if old_trigger != new_name:
+        for sample in run.concept.samples:
+            caption = swap_trigger_word(sample.caption, old_trigger, new_name)
+            if caption != sample.caption:
+                repo.update_sample_caption(conn, sample.sample_id, caption)
+                changed += 1
+
+    repo.rename_concept_and_run(conn, run_id, new_name)
+    repo.update_run_trigger_word(conn, run_id, new_name)
+    return RenameResult(old_name, old_trigger, new_name, changed)

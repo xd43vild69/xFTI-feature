@@ -480,7 +480,23 @@ def train_krea2():
     )
 
     if GRAD_CHECKPOINTING:
-        transformer.enable_gradient_checkpointing()
+        if GRAD_CKPT_INTERVAL > 1 and hasattr(transformer, "transformer_blocks"):
+            # diffusers reads one model-wide flag, so per-block flags are never consulted;
+            # the choice has to happen in the checkpoint func it calls for every block.
+            # Resolved by position at call time: torch.compile swaps the list entries later.
+            _blocks = transformer.transformer_blocks
+
+            def _selective_ckpt(module, *args):
+                idx = next((i for i, b in enumerate(_blocks) if b is module), 0)
+                if idx % GRAD_CKPT_INTERVAL != 0:
+                    return module(*args)
+                return torch.utils.checkpoint.checkpoint(module.__call__, *args, use_reentrant=False)
+
+            transformer.enable_gradient_checkpointing(_selective_ckpt)
+            _active = sum(1 for i in range(len(_blocks)) if i % GRAD_CKPT_INTERVAL == 0)
+            print(f"Selective gradient checkpointing: {_active}/{len(_blocks)} blocks (interval={GRAD_CKPT_INTERVAL})")
+        else:
+            transformer.enable_gradient_checkpointing()
         if LORA_TARGET == "all" and hasattr(transformer, "text_fusion"):
             _orig_tf_fwd = transformer.text_fusion.forward
 
@@ -492,18 +508,6 @@ def train_krea2():
                 return _orig_tf_fwd(enc_states, attention_mask=attention_mask)
 
             transformer.text_fusion.forward = _ckpt_text_fusion_fwd
-        if GRAD_CKPT_INTERVAL > 1 and hasattr(transformer, "transformer_blocks"):
-            blocks = transformer.transformer_blocks
-            active_ckpt = 0
-            for idx, blk in enumerate(blocks):
-                keep = (idx % GRAD_CKPT_INTERVAL == 0)
-                if hasattr(blk, "gradient_checkpointing"):
-                    blk.gradient_checkpointing = keep
-                elif not keep:
-                    blk._gradient_checkpointing_off = True
-                if keep:
-                    active_ckpt += 1
-            print(f"Selective gradient checkpointing: {active_ckpt}/{len(blocks)} blocks (interval={GRAD_CKPT_INTERVAL})")
     else:
         # Sin recompute: más rápido pero más VRAM de activaciones. Sólo apto en las
         # fases de baja resolución donde la VRAM sobra (lo decide el orquestador).

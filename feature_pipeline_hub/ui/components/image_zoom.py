@@ -149,13 +149,14 @@ def clickable_thumbnail(
     key: str,
     sample: DatasetSample | None = None,
     run_id: str = "",
+    tooltip: str = "Ver en tamaño grande",
     **thumbnail_kwargs,
 ) -> None:
     """A `state.render_thumbnail` that opens the full-size modal when clicked.
 
     `thumbnail_kwargs` are passed straight through, so callers swap one call for
     the other and keep their sizing. Pass `sample` and `run_id` to offer rotation
-    inside the modal.
+    inside the modal. `tooltip` is what the hover shows over the image.
     """
     # A pixel-width thumbnail does not fill its column, and the overlay covers the
     # frame rather than the image — so hug the image, or the empty space beside it
@@ -164,7 +165,7 @@ def clickable_thumbnail(
 
     with st.container(key=f"zoomframe_{key}", width="content" if hugs_image else "stretch"):
         state.render_thumbnail(image_path, **thumbnail_kwargs)
-        if st.button("", key=f"zoomhit_{key}", help="Ver en tamaño grande"):
+        if st.button("", key=f"zoomhit_{key}", help=tooltip):
             if sample is not None:
                 v_key = f"zoom_open_v_{run_id}_{sample.sample_id}"
                 st.session_state[v_key] = st.session_state.get(v_key, 0) + 1

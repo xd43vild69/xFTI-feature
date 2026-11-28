@@ -27,6 +27,22 @@ st.set_page_config(
     },
 )
 
+# Streamlit's wide layout pads the page with `wideSidePadding` (5rem) per side, 8rem
+# on top under a top nav, and 10rem below. All of it is rem, so raising baseFontSize
+# in config.toml grew those margins along with the text: at 20px that is 100px of
+# dead space each side. There is no theme option for it, hence the override.
+_LAYOUT_CSS = """
+<style>
+[data-testid="stMainBlockContainer"] {
+    padding-left: 1.25rem !important;
+    padding-right: 1.25rem !important;
+    padding-top: 4.5rem !important;
+    padding-bottom: 3rem !important;
+}
+</style>
+"""
+st.html(_LAYOUT_CSS)
+
 context_bar.render()
 
 st.navigation(

@@ -1386,3 +1386,88 @@ def _persist_train_log_metrics(
             checkpoints.model_dump(mode="json") if checkpoints is not None else {}
         ),
     )
+
+
+@dataclass(frozen=True)
+class LoraCleanupPlan:
+    """What deleting a dataset's trained LoRAs would remove, computed without removing it.
+
+    `blocked_reason` is set when a training of this dataset is still running; the
+    caller must not delete in that case (the trainer is writing into those folders).
+    """
+
+    files: tuple[Path, ...] = ()
+    total_bytes: int = 0
+    blocked_reason: str = ""
+
+
+def plan_lora_cleanup(conn: sqlite3.Connection, dataset_run_id: str) -> LoraCleanupPlan:
+    """Every `.safetensors` a dataset's trainings left on disk.
+
+    Per training run's `output_dir`: the per-step exports and FINAL at its top level,
+    plus the PEFT adapter under `resume_checkpoint/`. Nothing else — logs, CSVs and the
+    optimizer state stay, since only the weights are what costs real disk.
+
+    Only folders under `<training_runtime>/runs/` are considered. `output_dir` is read
+    from stored settings, which could name anywhere; a cleanup must never follow one
+    out of the folders the hub created itself. Symlinks are skipped, never followed.
+    """
+    runs = repo.list_training_runs(conn, dataset_run_id=dataset_run_id)
+    for run in runs:
+        if run.status == "running" and training_runner.is_process_alive(run.pid):
+            return LoraCleanupPlan(
+                blocked_reason="A training of this dataset is still running. Stop it first."
+            )
+
+    runs_root = (training_runtime_dir() / "runs").resolve()
+    output_dirs: dict[Path, None] = {}
+    for run in runs:
+        raw = run.config.get("output_dir")
+        if not raw:
+            continue
+        resolved = Path(raw).resolve()
+        if runs_root in resolved.parents:
+            output_dirs[resolved] = None
+
+    files: list[Path] = []
+    for output_dir in output_dirs:
+        for folder in (output_dir, output_dir / "resume_checkpoint"):
+            try:
+                entries = sorted(folder.iterdir())
+            except OSError:
+                continue
+            files.extend(
+                p
+                for p in entries
+                if p.suffix == ".safetensors" and p.is_file() and not p.is_symlink()
+            )
+
+    total = 0
+    for path in files:
+        try:
+            total += path.stat().st_size
+        except OSError:
+            pass
+    return LoraCleanupPlan(files=tuple(files), total_bytes=total)
+
+
+def delete_lora_files(plan: LoraCleanupPlan) -> tuple[int, int, list[str]]:
+    """Delete a plan's files. Returns (files deleted, bytes freed, error messages)."""
+    if plan.blocked_reason:
+        return 0, 0, [plan.blocked_reason]
+
+    deleted = 0
+    freed = 0
+    errors: list[str] = []
+    for path in plan.files:
+        try:
+            size = path.stat().st_size
+            path.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            errors.append(f"{path.name}: {exc}")
+            continue
+        deleted += 1
+        freed += size
+    return deleted, freed, errors
